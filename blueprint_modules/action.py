@@ -26,7 +26,7 @@ class Action:
 class ActionSpace:
     """Manages valid actions for a given neural architecture"""
     
-    def __init__(self, max_neurons: int = 500):
+    def __init__(self, max_neurons: int = 1000):
         self.max_neurons = max_neurons
     
     def get_valid_actions(self, architecture: NeuralArchitecture) -> List[Action]:

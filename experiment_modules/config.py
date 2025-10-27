@@ -123,7 +123,7 @@ class SelfPlayConfig(TrainingStageConfig):
 class ArchitectureSearchConfig:
     """Configuration for architecture search process"""
     # Search constraints
-    max_neurons: int = 500
+    max_neurons: int = 1000
     max_connections: int = 10000
     max_steps_per_episode: int = 50
     
