@@ -3,6 +3,7 @@ from typing import List
 from .network import NeuralArchitecture, Neuron, Connection
 from .action import Action, ActionSpace
 import numpy as np
+import copy
 
 class MCTSNode:
     """Node in the Monte Carlo Tree Search"""
@@ -58,21 +59,34 @@ class MCTSNode:
     
     def _copy_architecture(self) -> NeuralArchitecture:
         """Create a deep copy of the architecture"""
-        # Simple deep copy implementation
-        new_arch = NeuralArchitecture()
-        new_arch.neurons = {nid: Neuron(
-            neuron.id, neuron.neuron_type, neuron.activation, 
-            neuron.layer_position, neuron.bias
-        ) for nid, neuron in self.architecture.neurons.items()}
-        
-        new_arch.connections = [Connection(
-            conn.source_id, conn.target_id, conn.weight, conn.enabled
-        ) for conn in self.architecture.connections]
-        
-        new_arch.next_neuron_id = self.architecture.next_neuron_id
-        new_arch.performance_metrics = self.architecture.performance_metrics.copy()
-        
-        return new_arch
+        # Use the standard library deepcopy for a robust copy of the architecture.
+        # deepcopy will guarantee that nested mutable objects (neurons, connections,
+        # performance metrics, etc.) are duplicated and that the returned object is
+        # independent of the original.
+        try:
+            return copy.deepcopy(self.architecture)
+        except Exception:
+            # Defensive fallback: manual construction mirroring the previous logic.
+            new_arch = NeuralArchitecture()
+            # Recreate neuron objects
+            new_arch.neurons = {nid: Neuron(
+                neuron.id, neuron.neuron_type, neuron.activation,
+                neuron.layer_position, neuron.bias
+            ) for nid, neuron in self.architecture.neurons.items()}
+
+            # Recreate connections
+            new_arch.connections = [Connection(
+                conn.source_id, conn.target_id, conn.weight, conn.enabled
+            ) for conn in self.architecture.connections]
+
+            new_arch.next_neuron_id = self.architecture.next_neuron_id
+            # Shallow-copy performance metrics dict as a best-effort
+            try:
+                new_arch.performance_metrics = self.architecture.performance_metrics.copy()
+            except Exception:
+                new_arch.performance_metrics = {}
+
+            return new_arch
 
 class MCTS:
     """Monte Carlo Tree Search for architecture exploration"""

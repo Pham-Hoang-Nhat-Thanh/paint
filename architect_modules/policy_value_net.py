@@ -284,23 +284,34 @@ class ActionManager:
                     target_logits = target_logits_full[:, :tensor_size]
                 target_logits = target_logits + masks['target_neurons'].to(target_logits.device).unsqueeze(0)
             
-            # Additional masking: cannot connect neuron to itself
-            # target_logits may be 1D ([features]) or 2D ([batch, features]).
-            # We always want to penalize selecting the same index (diagonal)
-            if target_logits.dim() == 1:
-                # Already padded/truncated to tensor_size, safe to slice
-                target_logits[:tensor_size] -= 1e9
-            else:
-                # Apply penalty across the batch for each feature index
-                target_logits[:, :tensor_size] -= 1e9
-            
+            # Sample source first, then mask only the corresponding target index
+            # (prevents globally penalizing all targets and allows diverse connections)
             if exploration:
                 source_idx = Categorical(logits=source_logits).sample().item()
-                target_idx = Categorical(logits=target_logits).sample().item()
             else:
                 source_idx = source_logits.argmax().item()
+
+            # Prevent self-connection by penalizing the chosen source index in target logits
+            # target_logits may be 1D ([features]) or 2D ([batch, features]).
+            try:
+                if target_logits.dim() == 1:
+                    if 0 <= source_idx < target_logits.shape[0]:
+                        target_logits[source_idx] -= 1e9
+                else:
+                    if 0 <= source_idx < target_logits.shape[1]:
+                        target_logits[:, source_idx] -= 1e9
+            except Exception:
+                # Defensive: if shapes are unexpected, fall back to masking all indices
+                if target_logits.dim() == 1:
+                    target_logits[:tensor_size] -= 1e9
+                else:
+                    target_logits[:, :tensor_size] -= 1e9
+
+            if exploration:
+                target_idx = Categorical(logits=target_logits).sample().item()
+            else:
                 target_idx = target_logits.argmax().item()
-            
+
             return Action(
                 action_type=action_type,
                 source_neuron=source_idx,
@@ -308,18 +319,64 @@ class ActionManager:
             )
         
         elif action_type == ActionType.REMOVE_CONNECTION:
-            # For remove connection, we need to select from existing connections
+            # Select a connection to remove using the learned source/target logits.
             existing_connections = list(architecture.connections)
             if not existing_connections:
                 # Fallback to add connection if no connections to remove
                 return self.select_action(policy_output, architecture, exploration)
-            
-            # Simple strategy: choose random connection for now
-            conn = np.random.choice(existing_connections)
+
+            # Prepare 1D source and target logits (prefer first batch row if batched)
+            source_logits_full = policy_output.get('source_logits')
+            target_logits_full = policy_output.get('target_logits')
+
+            # If batched, use the first entry as a proxy for scoring
+            if source_logits_full.dim() > 1:
+                source_logits_full = source_logits_full[0]
+            if target_logits_full.dim() > 1:
+                target_logits_full = target_logits_full[0]
+
+            # Pad/truncate to tensor_size similar to other branches
+            if source_logits_full.shape[0] < tensor_size:
+                pad = torch.full((tensor_size - source_logits_full.shape[0],), -1e9, device=source_logits_full.device)
+                source_logits = torch.cat([source_logits_full, pad])
+            else:
+                source_logits = source_logits_full[:tensor_size]
+            source_logits = source_logits + masks['source_neurons'].to(source_logits.device)
+
+            if target_logits_full.shape[0] < tensor_size:
+                pad = torch.full((tensor_size - target_logits_full.shape[0],), -1e9, device=target_logits_full.device)
+                target_logits = torch.cat([target_logits_full, pad])
+            else:
+                target_logits = target_logits_full[:tensor_size]
+            target_logits = target_logits + masks['target_neurons'].to(target_logits.device)
+
+            # Build combined logits for each existing connection (source_logit + target_logit)
+            combined = []
+            for conn in existing_connections:
+                s_id = conn.source_id
+                t_id = conn.target_id
+                # Defensive bounds check
+                if s_id < 0 or s_id >= source_logits.shape[0] or t_id < 0 or t_id >= target_logits.shape[0]:
+                    combined.append(-1e9)
+                else:
+                    combined.append((source_logits[s_id] + target_logits[t_id]).item())
+
+            combined_logits = torch.tensor(combined, device=source_logits.device)
+
+            if exploration:
+                try:
+                    sel_idx = Categorical(logits=combined_logits).sample().item()
+                except Exception:
+                    # Fallback: pick highest-scoring connection
+                    sel_idx = int(combined_logits.argmax().item())
+            else:
+                sel_idx = int(combined_logits.argmax().item())
+
+            sel_conn = existing_connections[sel_idx]
             return Action(
                 action_type=action_type,
-                source_neuron=conn.source_id,
-                target_neuron=conn.target_id
+                source_neuron=sel_conn.source_id,
+                target_neuron=sel_conn.target_id
             )
         
         else:
