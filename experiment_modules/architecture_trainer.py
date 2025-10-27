@@ -6,6 +6,8 @@ import time
 import os
 from typing import Dict, List, Any, Optional
 import torch.nn.functional as F
+import json
+import logging
 
 from blueprint_modules.network import NeuralArchitecture
 from blueprint_modules.action import ActionSpace, Action
@@ -82,12 +84,27 @@ class ArchitectureTrainer:
         # Create directories
         os.makedirs(config.log_dir, exist_ok=True)
         os.makedirs(config.checkpoint_dir, exist_ok=True)
-        
+        # File logger + JSONL metrics
+        self.log_path = os.path.join(config.log_dir, "training.log")
+        self.metrics_path = os.path.join(config.log_dir, "training_metrics.jsonl")
+
+        # Configure logger (avoid duplicate handlers)
+        self.logger = logging.getLogger(f"ArchitectureTrainer")
+        self.logger.setLevel(logging.INFO)
+        # Add file handler if not present
+        abs_log_path = os.path.abspath(self.log_path)
+        if not any(isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, 'baseFilename', '')) == abs_log_path
+                   for h in self.logger.handlers):
+            fh = logging.FileHandler(self.log_path, mode='a', encoding='utf-8')
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+            self.logger.addHandler(fh)
+
         print(f"ArchitectureTrainer initialized on {self.device}")
         print(f"Total episodes: {self.curriculum.total_episodes}")
     
     def run_training_episode(self) -> Dict[str, Any]:
         """Run one complete training episode"""
+        print(f"Starting episode {self.episode} (stage: {self.curriculum.get_stage()})")
         # Initialize architecture
         current_arch = NeuralArchitecture()
         
@@ -102,7 +119,9 @@ class ArchitectureTrainer:
         for step in range(self.config.search.max_steps_per_episode):
             # Decide whether to use policy network or MCTS
             use_policy = np.random.random() < train_params["policy_mix_ratio"]
-            
+            if step % 10 == 0:
+                print(f"  Episode {self.episode} step {step}: using {'policy' if use_policy and train_params['stage'] != 'supervised' else 'MCTS'}")
+
             if use_policy and train_params["stage"] != "supervised":
                 # Use policy network directly
                 next_action = self._get_policy_action(current_arch, train_params["temperature"])
@@ -124,6 +143,7 @@ class ArchitectureTrainer:
                 break
                 
             reward = self._evaluate_architecture(new_arch)
+            print(f"    Applied action {next_action.action_type} -> reward={reward:.4f} (neurons={len(new_arch.neurons)}, connections={len(new_arch.connections)})")
             
             # Store experience
             experience = self._create_experience(
@@ -149,6 +169,7 @@ class ArchitectureTrainer:
         for exp in episode_experiences:
             priority = self._compute_experience_priority(exp, episode_metrics)
             self.experience_buffer.add(exp, priority)
+        print(f"Episode {self.episode} finished: steps={episode_steps}, experiences={len(episode_experiences)}, avg_reward={np.mean(episode_rewards) if episode_rewards else 0.0:.4f}")
         
         return episode_metrics
     
@@ -202,6 +223,7 @@ class ArchitectureTrainer:
         try:
             # Use quick training for evaluation
             accuracy = self.quick_trainer.train_and_evaluate(architecture)
+            print(f"      Evaluation returned accuracy={accuracy:.4f}")
             return accuracy
         except Exception as e:
             print(f"Evaluation error: {e}")
@@ -350,11 +372,13 @@ class ArchitectureTrainer:
         new_priorities = [abs(exp['reward']) for exp in experiences]
         self.experience_buffer.update_priorities(indices, new_priorities)
         
-        return {
+        out = {
             'total_loss': total_loss.item() / len(experiences),
             'policy_loss': policy_loss.item() / len(experiences),
             'value_loss': value_loss.item() / len(experiences)
         }
+        print(f"Train on batch: total_loss={out['total_loss']:.6f}, policy_loss={out['policy_loss']:.6f}, value_loss={out['value_loss']:.6f}")
+        return out
     
     def _create_targets(self, experience: Dict) -> Dict:
         """Create training targets from experience"""
@@ -384,10 +408,25 @@ class ArchitectureTrainer:
             episode_metrics = self.run_training_episode()
             
             # Train on batch if we have enough experiences
-            if self.episode > 0 and self.episode % self.config.train_interval == 0:
+            # Use supervised.train_interval (per-stage) rather than a nonexistent top-level alias
+            train_interval = getattr(self.config, 'train_interval', None)
+            if train_interval is None:
+                train_interval = self.config.supervised.train_interval
+
+            if self.episode > 0 and self.episode % train_interval == 0:
                 train_metrics = self.train_on_batch(self.config.supervised.batch_size)
                 if train_metrics:
                     episode_metrics.update(train_metrics)
+
+            # Immediate logging and checkpoint on improvement so artifacts appear promptly
+            try:
+                # Log this episode right away (helps for debugging short runs)
+                self._log_episode(episode_metrics)
+                # If this episode produced a new best architecture, save a checkpoint immediately
+                if episode_metrics.get('is_best'):
+                    self._save_checkpoint()
+            except Exception as e:
+                print(f"Immediate log/checkpoint failed: {e}")
             
             # Update curriculum
             self.curriculum.step()
@@ -425,6 +464,17 @@ class ArchitectureTrainer:
             print(f"Episode {self.episode} ({stage}): "
                   f"Accuracy={accuracy:.4f}, Neurons={neurons}, "
                   f"Connections={connections}, Best={self.best_accuracy:.4f}")
+
+            # Structured file logging
+            try:
+                self.logger.info(f"Episode {self.episode} ({stage}) Accuracy={accuracy:.4f} "
+                                 f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}")
+                # Append JSONL metrics
+                with open(self.metrics_path, 'a', encoding='utf-8') as mf:
+                    mf.write(json.dumps(metrics) + "\n")
+            except Exception as e:
+                # Fall back to console error if file write fails
+                print(f"Failed to write logs: {e}")
     
     def _save_checkpoint(self):
         """Save training checkpoint"""

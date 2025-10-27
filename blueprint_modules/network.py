@@ -122,7 +122,50 @@ class NeuralArchitecture:
         
         # Node features
         for node_id in node_ids:
-            node_features.append(self.neurons[node_id].to_feature_vector())
+            neuron_obj = self.neurons[node_id]
+
+            # If the neuron already provides a feature conversion, use it.
+            if hasattr(neuron_obj, 'to_feature_vector') and callable(getattr(neuron_obj, 'to_feature_vector')):
+                node_features.append(neuron_obj.to_feature_vector())
+                continue
+
+            # Fallback: the neuron may be a plain dict (e.g. after deserialization).
+            # Try to create a temporary Neuron instance to reuse the canonical conversion.
+            try:
+                # Extract fields with some tolerance for strings/enums
+                n_type = neuron_obj.get('neuron_type') if isinstance(neuron_obj, dict) else None
+                activation = neuron_obj.get('activation') if isinstance(neuron_obj, dict) else None
+                layer_pos = neuron_obj.get('layer_position', 0.0) if isinstance(neuron_obj, dict) else getattr(neuron_obj, 'layer_position', 0.0)
+                bias = neuron_obj.get('bias', 0.0) if isinstance(neuron_obj, dict) else getattr(neuron_obj, 'bias', 0.0)
+
+                # Normalize enum inputs (accept enum members or strings)
+                if isinstance(n_type, str):
+                    try:
+                        n_type_enum = NeuronType(n_type)
+                    except Exception:
+                        n_type_enum = NeuronType[n_type]
+                elif isinstance(n_type, NeuronType):
+                    n_type_enum = n_type
+                else:
+                    # Last resort: assume INPUT for unknown
+                    n_type_enum = NeuronType.INPUT
+
+                if isinstance(activation, str):
+                    try:
+                        activation_enum = ActivationType(activation)
+                    except Exception:
+                        activation_enum = ActivationType[activation]
+                elif isinstance(activation, ActivationType):
+                    activation_enum = activation
+                else:
+                    activation_enum = ActivationType.LINEAR
+
+                temp_neuron = Neuron(node_id, n_type_enum, activation_enum, layer_pos, bias)
+                node_features.append(temp_neuron.to_feature_vector())
+            except Exception:
+                # As a last fallback, create a minimal numeric vector [0]*node_feature_length-ish
+                # Keep length 9 to match expected encoder (type(3)+activation(4)+pos+bias)
+                node_features.append([0.0] * 9)
         
         # Edge indices (connections)
         edge_index = [[], []]

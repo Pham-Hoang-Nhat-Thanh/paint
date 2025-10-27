@@ -51,7 +51,6 @@ def main():
     trainer = ArchitectureTrainer(config, train_loader, test_loader)
     
     # Run training
-    print("Starting architecture search training...")
     history = trainer.run_training()
     
     # Print final results

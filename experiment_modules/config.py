@@ -175,3 +175,5 @@ class OverallConfig:
     eval_interval: int = 10
     checkpoint_interval: int = 50
     log_interval: int = 5
+    # Global training interval (how often to run training steps across episodes)
+    train_interval: int = 1
