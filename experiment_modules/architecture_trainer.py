@@ -38,7 +38,11 @@ class ArchitectureTrainer:
             num_activations=config.model.num_activations
         ).to(self.device)
         
-        self.action_space = ActionSpace(max_neurons=config.search.max_neurons)
+        self.action_space = ActionSpace(
+            max_neurons=config.search.max_neurons,
+            max_connections=config.search.max_connections,
+            max_steps_per_episode=config.search.max_steps_per_episode
+        )
         self.action_manager = ActionManager(max_neurons=config.model.max_neurons)
         self.quick_trainer = QuickTrainer(
             train_loader, test_loader, 

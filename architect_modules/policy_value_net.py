@@ -10,8 +10,8 @@ from blueprint_modules.action import ActionType, Action
 class UnifiedPolicyValueNetwork(nn.Module):
     """Unified network that outputs both policy and value predictions"""
     
-    def __init__(self, node_feature_dim: int, hidden_dim: int = 128, 
-                 max_neurons: int = 1000, num_actions: int = 6, 
+    def __init__(self, node_feature_dim: int, hidden_dim: int = 128,
+                 max_neurons: int = 1000, num_actions: int = 5,
                  num_activations: int = 4):
         super().__init__()
         self.hidden_dim = hidden_dim
@@ -114,7 +114,7 @@ class ActionManager:
         tensor_size = max(max_neuron_id + 1, self.max_neurons)
         
         # Action type mask
-        action_mask = torch.zeros(6) - 1e9  # 6 action types
+        action_mask = torch.zeros(5) - 1e9  # 5 action types
         
         if len(neurons) < self.max_neurons:
             action_mask[ActionType.ADD_NEURON.value] = 0

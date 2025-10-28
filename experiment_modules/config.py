@@ -15,7 +15,7 @@ class ModelConfig:
     
     # Policy-Value Network
     max_neurons: int = 1000  # Accommodate MNIST inputs
-    num_actions: int = 6
+    num_actions: int = 5
     num_activations: int = 4
     
     # Shared Backbone

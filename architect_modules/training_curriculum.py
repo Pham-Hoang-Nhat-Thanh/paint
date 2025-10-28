@@ -120,110 +120,32 @@ class TrainingCurriculum:
 
 class PolicyValueLoss(nn.Module):
     """Combined loss for policy and value networks"""
-    
-    def __init__(self, value_weight: float = 1.0, entropy_weight: float = 0.01):
-        super().__init__()
-        self.value_weight = value_weight
-        self.entropy_weight = entropy_weight
-        
-    def forward(self, predictions: Dict, targets: Dict) -> torch.Tensor:
-        """
-        predictions: output from policy_value_net
-        targets: {
-            'action_type': target action type,
-            'source_neuron': target source neuron, 
-            'target_neuron': target target neuron,
-            'activation': target activation,
-            'value': target value
-        }
-        """
-        total_loss = 0.0
-        
-        # Action type loss
-        action_loss = F.cross_entropy(
-            predictions['action_type'], 
-            targets['action_type']
-        )
-        total_loss += action_loss
-        
-        # Source neuron loss (only if applicable)
-        if targets.get('source_neuron') is not None:
-            source_loss = F.cross_entropy(
-                predictions['source_logits'],
-                targets['source_neuron']
-            )
-            total_loss += source_loss
-        
-        # Target neuron loss (only if applicable)
-        if targets.get('target_neuron') is not None:
-            target_loss = F.cross_entropy(
-                predictions['target_logits'],
-                targets['target_neuron']
-            )
-            total_loss += target_loss
-        
-        # Activation loss (only if applicable)
-        if targets.get('activation') is not None:
-            activation_loss = F.cross_entropy(
-                predictions['activation_logits'],
-                targets['activation']
-            )
-            total_loss += activation_loss
-        
-        # Value loss
-        value_loss = F.mse_loss(
-            predictions['value'].squeeze(),
-            targets['value']
-        )
-        total_loss += self.value_weight * value_loss
-        
-        # Entropy regularization
-        entropy = self._compute_entropy(predictions)
-        total_loss -= self.entropy_weight * entropy
-        
-        return total_loss
-    
-    def _compute_entropy(self, predictions: Dict) -> torch.Tensor:
-        """Compute entropy of policy distribution for regularization"""
-        entropy = 0.0
-        
-        # Action type entropy
-        action_probs = F.softmax(predictions['action_type'], dim=-1)
-        action_entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-8))
-        entropy += action_entropy
-        
-        # Add entropy for other heads if needed
-        
-        return entropy
 
-class PolicyValueLoss(nn.Module):
-    """Combined loss for policy and value networks"""
-    
     def __init__(self, value_weight: float = 1.0, entropy_weight: float = 0.01):
         super().__init__()
         self.value_weight = value_weight
         self.entropy_weight = entropy_weight
-        
+
     def forward(self, predictions: Dict, targets: Dict) -> torch.Tensor:
         """
         predictions: output from policy_value_net
         targets: {
             'action_type': target action type,
-            'source_neuron': target source neuron, 
+            'source_neuron': target source neuron,
             'target_neuron': target target neuron,
             'activation': target activation,
             'value': target value
         }
         """
         total_loss = 0.0
-        
+
         # Action type loss
         action_loss = F.cross_entropy(
-            predictions['action_type'], 
+            predictions['action_type'],
             targets['action_type']
         )
         total_loss += action_loss
-        
+
         # Source neuron loss (only if applicable)
         if targets.get('source_neuron') is not None:
             source_loss = F.cross_entropy(
@@ -231,7 +153,7 @@ class PolicyValueLoss(nn.Module):
                 targets['source_neuron']
             )
             total_loss += source_loss
-        
+
         # Target neuron loss (only if applicable)
         if targets.get('target_neuron') is not None:
             target_loss = F.cross_entropy(
@@ -239,7 +161,7 @@ class PolicyValueLoss(nn.Module):
                 targets['target_neuron']
             )
             total_loss += target_loss
-        
+
         # Activation loss (only if applicable)
         if targets.get('activation') is not None:
             activation_loss = F.cross_entropy(
@@ -247,29 +169,29 @@ class PolicyValueLoss(nn.Module):
                 targets['activation']
             )
             total_loss += activation_loss
-        
+
         # Value loss
         value_loss = F.mse_loss(
             predictions['value'].squeeze(),
             targets['value']
         )
         total_loss += self.value_weight * value_loss
-        
+
         # Entropy regularization
         entropy = self._compute_entropy(predictions)
         total_loss -= self.entropy_weight * entropy
-        
+
         return total_loss
-    
+
     def _compute_entropy(self, predictions: Dict) -> torch.Tensor:
         """Compute entropy of policy distribution for regularization"""
         entropy = 0.0
-        
+
         # Action type entropy
         action_probs = F.softmax(predictions['action_type'], dim=-1)
         action_entropy = -torch.sum(action_probs * torch.log(action_probs + 1e-8))
         entropy += action_entropy
-        
+
         # Add entropy for other heads if needed
-        
+
         return entropy
