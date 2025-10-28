@@ -1,5 +1,5 @@
 from blueprint_modules.mcts import MCTS, MCTSNode
-from blueprint_modules.network import NeuralArchitecture
+from blueprint_modules.network import NeuralArchitecture, ActivationType
 from blueprint_modules.action import Action, ActionSpace
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
 from torch.distributions import Categorical
@@ -11,12 +11,13 @@ import numpy as np
 
 class NeuralMCTSNode(MCTSNode):
     """MCTS node enhanced with neural network predictions"""
-    
-    def __init__(self, architecture: NeuralArchitecture, policy_value: Dict = None, 
-                 parent=None, action: Action = None):
+
+    def __init__(self, architecture: NeuralArchitecture, policy_value: Dict = None,
+                 parent=None, action: Action = None, curriculum=None):
         super().__init__(architecture, parent, action)
         self.policy_value = policy_value  # Neural network predictions
         self.prior_prob = 0.0  # Prior probability from policy network
+        self.curriculum = curriculum
     
     def best_child(self, exploration_weight: float = 1.0) -> 'NeuralMCTSNode':
         """Select best child using PUCT formula (AlphaZero style)"""
@@ -64,12 +65,13 @@ class NeuralMCTSNode(MCTSNode):
 
 class NeuralMCTS(MCTS):
     """MCTS enhanced with neural network guidance"""
-    
+
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
-                 device: str = 'cpu', exploration_weight: float = 1.0):
+                 device: str = 'cpu', exploration_weight: float = 1.0, curriculum=None):
         super().__init__(action_space, None, exploration_weight)
         self.policy_value_net = policy_value_net
         self.device = device
+        self.curriculum = curriculum
         
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
         """Convert architecture to graph data for neural network"""
@@ -83,7 +85,7 @@ class NeuralMCTS(MCTS):
         # Create layer positions tensor
         layer_positions = []
         for neuron_id in sorted(architecture.neurons.keys()):
-            layer_positions.append(architecture.neurons[neuron_id].layer_position)
+            layer_positions.append(float(architecture.neurons[neuron_id].layer_position))
         graph_data['layer_positions'] = torch.FloatTensor([layer_positions]).to(self.device)
         
         return graph_data
@@ -204,11 +206,17 @@ class NeuralMCTS(MCTS):
                 node.policy_value = self.policy_value_net(graph_data)
 
         # Use action manager to get valid actions
-        action_manager = ActionManager()
+        action_manager = ActionManager(action_space=self.action_space)
 
-        # Sample action using policy network
+        # Determine whether to use policy or random based on curriculum
+        if self.curriculum:
+            train_params = self.curriculum.get_training_parameters()
+            use_policy = train_params['policy_mix_ratio'] > 0.0
+        else:
+            use_policy = False  # Default to random if no curriculum
+
         action = action_manager.select_action(
-            node.policy_value, node.architecture, exploration=True
+            node.policy_value, node.architecture, exploration=True, use_policy=use_policy
         )
 
         # Apply action to create new architecture
@@ -267,7 +275,8 @@ class NeuralMCTS(MCTS):
         if action.activation is not None:
             activation_logits = policy_output['activation_logits']
             activation_probs = F.softmax(activation_logits, dim=-1)
-            prior_prob *= activation_probs[0, action.activation.value].item()
+            activation_idx = list(ActivationType).index(action.activation)
+            prior_prob *= activation_probs[0, activation_idx].item()
 
         return prior_prob
 

@@ -62,10 +62,23 @@ class NeuralArchitecture:
         # Input neurons (784)
         for i in range(784):
             self.add_neuron(NeuronType.INPUT, ActivationType.LINEAR, layer_position=0.0)
-        
-        # Output neurons (10)  
+
+        # Output neurons (10)
         for i in range(10):
             self.add_neuron(NeuronType.OUTPUT, ActivationType.LINEAR, layer_position=1.0)
+
+        # Add initial random connections to enable basic functionality
+        # Connect each output to a random subset of inputs
+        import random
+        random.seed(42)  # For reproducibility
+        input_ids = list(range(784))
+        for output_id in range(784, 794):  # Output neurons are 784-793
+            # Connect to ~10% of inputs randomly
+            num_connections = max(1, 784 // 10)  # At least 1 connection per output
+            selected_inputs = random.sample(input_ids, num_connections)
+            for input_id in selected_inputs:
+                weight = random.uniform(-0.1, 0.1)  # Small random weights
+                self.add_connection(input_id, output_id, weight)
     
     def add_neuron(self, neuron_type: NeuronType, activation: ActivationType, layer_position: float) -> int:
         """Add a new neuron and return its ID"""

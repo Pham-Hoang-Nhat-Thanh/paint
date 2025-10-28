@@ -5,7 +5,7 @@ from torch.distributions import Categorical
 from .graph_transformer import GraphTransformer
 from typing import Dict
 from blueprint_modules.network import NeuralArchitecture, NeuronType, ActivationType
-from blueprint_modules.action import ActionType, Action
+from blueprint_modules.action import ActionType, Action, ActionSpace
 
 class UnifiedPolicyValueNetwork(nn.Module):
     """Unified network that outputs both policy and value predictions"""
@@ -98,9 +98,10 @@ class UnifiedPolicyValueNetwork(nn.Module):
 
 class ActionManager:
     """Manages action selection with masking and validation"""
-    
-    def __init__(self, max_neurons: int = 100):
+
+    def __init__(self, max_neurons: int = 100, action_space: ActionSpace = None):
         self.max_neurons = max_neurons
+        self.action_space = action_space
     
     def get_action_masks(self, architecture: NeuralArchitecture) -> Dict[str, torch.Tensor]:
         """Get masks for invalid actions"""
@@ -147,23 +148,34 @@ class ActionManager:
         
         return masks
     
-    def select_action(self, policy_output: Dict, architecture: NeuralArchitecture, 
-                     exploration: bool = True) -> Action:
-        """Select action using policy output with masking"""
+    def select_action(self, policy_output: Dict, architecture: NeuralArchitecture,
+                     exploration: bool = True, use_policy: bool = True) -> Action:
+        """Select action using policy output with masking, or random if use_policy=False"""
+        if not use_policy:
+            # Use random action selection from action space
+            if self.action_space is None:
+                raise ValueError("ActionSpace must be provided to ActionManager for random action selection")
+            valid_actions = self.action_space.get_valid_actions(architecture)
+            if valid_actions:
+                return np.random.choice(valid_actions)
+            else:
+                # Fallback to a default action if no valid actions
+                return Action(action_type=ActionType.ADD_CONNECTION, source_neuron=0, target_neuron=1)
+
         masks = self.get_action_masks(architecture)
-        
+
         # Get the actual tensor size needed
         max_neuron_id = max(architecture.neurons.keys()) if architecture.neurons else 0
         tensor_size = max(max_neuron_id + 1, self.max_neurons)
-        
+
         # Sample action type
         action_logits = policy_output['action_type'] + masks['action_type']
-        
+
         if exploration:
             action_type_idx = Categorical(logits=action_logits).sample().item()
         else:
             action_type_idx = action_logits.argmax().item()
-        
+
         action_type = ActionType(action_type_idx)
         
         # Select parameters based on action type
@@ -257,7 +269,7 @@ class ActionManager:
                     source_logits = torch.cat([source_logits_full, padding])
                 else:
                     source_logits = source_logits_full[:tensor_size]
-                source_logits = source_logits + masks['source_neurons'].to(source_logits.device)
+                source_logits = source_logits + masks['target_neurons'].to(source_logits.device)
             else:
                 batch_size = source_logits_full.shape[0]
                 if source_logits_full.shape[1] < tensor_size:
@@ -265,7 +277,7 @@ class ActionManager:
                     source_logits = torch.cat([source_logits_full, padding], dim=1)
                 else:
                     source_logits = source_logits_full[:, :tensor_size]
-                source_logits = source_logits + masks['source_neurons'].to(source_logits.device).unsqueeze(0)
+                source_logits = source_logits + masks['target_neurons'].to(source_logits.device).unsqueeze(0)
 
             # Handle target logits
             if target_logits_full.dim() == 1:
@@ -335,20 +347,18 @@ class ActionManager:
             if target_logits_full.dim() > 1:
                 target_logits_full = target_logits_full[0]
 
-            # Pad/truncate to tensor_size similar to other branches
+            # Pad/truncate to tensor_size, using 0.0 for padding since we don't mask for remove
             if source_logits_full.shape[0] < tensor_size:
-                pad = torch.full((tensor_size - source_logits_full.shape[0],), -1e9, device=source_logits_full.device)
+                pad = torch.full((tensor_size - source_logits_full.shape[0],), 0.0, device=source_logits_full.device)
                 source_logits = torch.cat([source_logits_full, pad])
             else:
                 source_logits = source_logits_full[:tensor_size]
-            source_logits = source_logits + masks['source_neurons'].to(source_logits.device)
 
             if target_logits_full.shape[0] < tensor_size:
-                pad = torch.full((tensor_size - target_logits_full.shape[0],), -1e9, device=target_logits_full.device)
+                pad = torch.full((tensor_size - target_logits_full.shape[0],), 0.0, device=target_logits_full.device)
                 target_logits = torch.cat([target_logits_full, pad])
             else:
                 target_logits = target_logits_full[:tensor_size]
-            target_logits = target_logits + masks['target_neurons'].to(target_logits.device)
 
             # Build combined logits for each existing connection (source_logit + target_logit)
             combined = []
