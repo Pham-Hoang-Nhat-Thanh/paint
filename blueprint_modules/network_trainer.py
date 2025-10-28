@@ -5,7 +5,7 @@ import torch.nn as nn
 class QuickTrainer:
     """Proper training and evaluation using the graph-based networks"""
     
-    def __init__(self, train_loader, test_loader, device='cpu', max_epochs=5):
+    def __init__(self, train_loader, test_loader, device='cpu', max_epochs=10):
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = device

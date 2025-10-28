@@ -200,35 +200,69 @@ class NeuralArchitecture:
 class GraphNeuralNetwork(nn.Module):
     """
     A dynamic neural network that can be built from our graph architecture representation.
-    This converts the graph structure into an executable PyTorch model.
+    This implements proper sparse message passing over the graph connections.
     """
-    
+
     def __init__(self, architecture: NeuralArchitecture):
         super().__init__()
         self.architecture = architecture
-        self.layers = nn.ModuleDict()
-        self.activation_functions = nn.ModuleDict()
-        self.connection_matrices = {}
-        
-        self._build_network()
-    
-    def _build_network(self):
-        """Convert graph architecture to executable layers"""
-        graph_data = self.architecture.to_graph_representation()
-        edge_index = graph_data['edge_index']
-        edge_weights = graph_data['edge_weights']
-        
-        # Group neurons by approximate layer position
-        neurons_by_layer = self._group_neurons_by_layer()
-        
-        # Build computational graph
-        self._build_computational_graph(neurons_by_layer, edge_index, edge_weights)
-    
+
+        # Build sparse adjacency structure
+        self._build_sparse_network()
+
+    def _build_sparse_network(self):
+        """Build sparse adjacency lists and layer structure"""
+        # Group neurons by layer position
+        self.neurons_by_layer = self._group_neurons_by_layer()
+        self.layer_positions = sorted(self.neurons_by_layer.keys())
+
+        # Create neuron ID to layer index mapping
+        self.neuron_to_layer = {}
+        for layer_idx, layer_pos in enumerate(self.layer_positions):
+            for neuron in self.neurons_by_layer[layer_pos]:
+                self.neuron_to_layer[neuron.id] = layer_idx
+
+        # Build adjacency lists: target_id -> [(source_id, weight), ...]
+        self.adjacency = {neuron_id: [] for neuron_id in self.architecture.neurons.keys()}
+        for conn in self.architecture.connections:
+            if conn.enabled:
+                self.adjacency[conn.target_id].append((conn.source_id, conn.weight))
+
+        # Set up activation functions per layer
+        self.activation_functions = {}
+        for layer_idx, neurons in enumerate(self.neurons_by_layer.values()):
+            # Use most common activation in layer
+            activations = [neuron.activation for neuron in neurons]
+            most_common_activation = max(set(activations), key=activations.count)
+            self.activation_functions[layer_idx] = self._get_activation_module(most_common_activation)
+
+        # Create neuron index mappings within layers for output extraction
+        self.layer_neuron_indices = {}
+        for layer_pos, neurons in self.neurons_by_layer.items():
+            layer_idx = self.layer_positions.index(layer_pos)
+            neuron_ids = [n.id for n in neurons]
+            self.layer_neuron_indices[layer_idx] = neuron_ids
+
+        # Create trainable parameters for connection weights and neuron biases
+        self.connection_weights = nn.ParameterDict()
+        self.neuron_biases = nn.ParameterDict()
+
+        # Initialize connection weights as trainable parameters
+        for conn in self.architecture.connections:
+            if conn.enabled:
+                weight_param = nn.Parameter(torch.tensor(conn.weight, dtype=torch.float32))
+                self.connection_weights[str(conn.source_id) + '_' + str(conn.target_id)] = weight_param
+
+        # Initialize neuron biases as trainable parameters
+        for neuron in self.architecture.neurons.values():
+            bias_param = nn.Parameter(torch.tensor(neuron.bias, dtype=torch.float32))
+            self.neuron_biases[str(neuron.id)] = bias_param
+
     def _group_neurons_by_layer(self) -> Dict[float, List[Neuron]]:
         """Group neurons by their layer_position for sequential processing"""
         layers = {}
         tolerance = 0.1  # Group neurons within this position range
-        
+
         for neuron in self.architecture.neurons.values():
             # Find existing layer group or create new one
             found_layer = False
@@ -237,81 +271,13 @@ class GraphNeuralNetwork(nn.Module):
                     layers[layer_pos].append(neuron)
                     found_layer = True
                     break
-            
+
             if not found_layer:
                 layers[neuron.layer_position] = [neuron]
-        
+
         # Sort layers by position
         return {pos: layers[pos] for pos in sorted(layers.keys())}
-    
-    def _build_computational_graph(self, neurons_by_layer, edge_index, edge_weights):
-        """Build the actual computational graph from the architecture"""
-        layer_positions = sorted(neurons_by_layer.keys())
-        
-        # Create mapping from neuron ID to layer index
-        neuron_to_layer = {}
-        for layer_idx, layer_pos in enumerate(layer_positions):
-            for neuron in neurons_by_layer[layer_pos]:
-                neuron_to_layer[neuron.id] = layer_idx
-        
-        # Build connection matrices between layers
-        for i in range(len(layer_positions) - 1):
-            current_layer_pos = layer_positions[i]
-            next_layer_pos = layer_positions[i + 1]
-            
-            current_neurons = neurons_by_layer[current_layer_pos]
-            next_neurons = neurons_by_layer[next_layer_pos]
-            
-            # Create weight matrix between current and next layer
-            weight_matrix = self._build_weight_matrix(
-                current_neurons, next_neurons, edge_index, edge_weights
-            )
-            
-            layer_name = f"layer_{i}_{i+1}"
-            self.layers[layer_name] = nn.Linear(len(current_neurons), len(next_neurons), bias=False)
-            
-            # Set the weights from our architecture
-            with torch.no_grad():
-                self.layers[layer_name].weight.data = weight_matrix
-        
-        # Store layer information for forward pass
-        self.layer_neurons = [neurons_by_layer[pos] for pos in layer_positions]
-        self.layer_activations = []
-        
-        # Set up activation functions for each layer
-        for layer_idx, neurons in enumerate(self.layer_neurons):
-            # For simplicity, use the most common activation in the layer
-            activations = [neuron.activation for neuron in neurons]
-            most_common_activation = max(set(activations), key=activations.count)
-            
-            activation_module = self._get_activation_module(most_common_activation)
-            self.activation_functions[f"layer_{layer_idx}"] = activation_module
-    
-    def _build_weight_matrix(self, source_neurons, target_neurons, edge_index, edge_weights):
-        """Build weight matrix between two layers based on connections"""
-        source_ids = [neuron.id for neuron in source_neurons]
-        target_ids = [neuron.id for neuron in target_neurons]
-        
-        # Create mapping from neuron ID to index
-        source_id_to_idx = {id: idx for idx, id in enumerate(source_ids)}
-        target_id_to_idx = {id: idx for idx, id in enumerate(target_ids)}
-        
-        # Initialize weight matrix
-        weight_matrix = torch.zeros(len(target_neurons), len(source_neurons))
-        
-        # Fill weight matrix from connections
-        for i in range(edge_index.shape[1]):
-            source_id = edge_index[0, i].item()
-            target_id = edge_index[1, i].item()
-            weight = edge_weights[i].item()
-            
-            if source_id in source_id_to_idx and target_id in target_id_to_idx:
-                source_idx = source_id_to_idx[source_id]
-                target_idx = target_id_to_idx[target_id]
-                weight_matrix[target_idx, source_idx] = weight
-        
-        return weight_matrix
-    
+
     def _get_activation_module(self, activation_type: ActivationType) -> nn.Module:
         """Convert activation type to PyTorch module"""
         if activation_type == ActivationType.RELU:
@@ -324,35 +290,69 @@ class GraphNeuralNetwork(nn.Module):
             return nn.Identity()
         else:
             return nn.ReLU()  # Default
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through the graph-based network"""
-        # x shape: [batch_size, 784] for MNIST
-        
-        # Reshape if needed (for convolutional thinking)
-        if x.dim() == 4:  # [batch, channels, height, width]
-            x = x.view(x.size(0), -1)
-        
-        # Process through layers
-        current_output = x
-        
-        for i in range(len(self.layer_neurons) - 1):
-            layer_name = f"layer_{i}_{i+1}"
-            activation_name = f"layer_{i+1}"  # Activation after the layer
-            
-            if layer_name in self.layers:
-                # Linear transformation
-                current_output = self.layers[layer_name](current_output)
-                
-                # Activation function
-                if activation_name in self.activation_functions:
-                    current_output = self.activation_functions[activation_name](current_output)
-        
-        # Final output should match MNIST classes (10)
-        if current_output.shape[1] != 10:
-            raise ValueError("Final output layer does not have 10 neurons for MNIST classification.")
-        return current_output
+        """Forward pass with sparse message passing"""
+        batch_size = x.size(0)
+
+        # Initialize neuron outputs
+        neuron_outputs = {}
+
+        # Set input layer outputs
+        input_layer_pos = self.layer_positions[0]
+        input_neurons = self.neurons_by_layer[input_layer_pos]
+
+        for i, neuron in enumerate(input_neurons):
+            # Input neurons get flattened pixel values
+            if x.dim() == 4:  # [batch, channels, height, width]
+                x = x.view(batch_size, -1)
+            neuron_outputs[neuron.id] = x[:, i:i+1]  # Shape: [batch_size, 1]
+
+        # Process through layers sequentially
+        for layer_idx in range(1, len(self.layer_positions)):
+            current_layer_pos = self.layer_positions[layer_idx]
+            current_neurons = self.neurons_by_layer[current_layer_pos]
+
+            # Compute outputs for current layer neurons
+            for neuron in current_neurons:
+                # Aggregate weighted inputs from connected source neurons
+                total_input = torch.zeros(batch_size, 1, device=x.device)
+
+                for source_id, _ in self.adjacency[neuron.id]:
+                    if source_id in neuron_outputs:
+                        source_output = neuron_outputs[source_id]  # [batch_size, 1]
+                        weight_key = str(source_id) + '_' + str(neuron.id)
+                        weight = self.connection_weights[weight_key]
+                        total_input += weight * source_output
+
+                # Add neuron bias
+                bias = self.neuron_biases[str(neuron.id)]
+                total_input += bias
+
+                # Apply activation
+                activated_output = self.activation_functions[layer_idx](total_input)
+                neuron_outputs[neuron.id] = activated_output
+
+        # Collect output layer activations
+        output_layer_pos = self.layer_positions[-1]
+        output_neurons = self.neurons_by_layer[output_layer_pos]
+        output_list = []
+
+        for neuron in output_neurons:
+            output_list.append(neuron_outputs[neuron.id])
+
+        # Concatenate outputs: [batch_size, num_output_neurons]
+        final_output = torch.cat(output_list, dim=1)
+
+        # Ensure we have 10 outputs for MNIST
+        if final_output.shape[1] != 10:
+            raise ValueError(f"Output layer should have 10 neurons for MNIST, got {final_output.shape[1]}")
+
+        return final_output
 
     def get_parameter_count(self) -> int:
-        """Count total trainable parameters"""
-        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+        """Count trainable parameters"""
+        total_params = 0
+        for param in self.parameters():
+            total_params += param.numel()
+        return total_params
