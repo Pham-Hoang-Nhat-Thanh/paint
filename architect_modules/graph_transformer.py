@@ -4,6 +4,11 @@ import torch.nn.functional as F
 import math
 from typing import Dict, Tuple
 
+# Enable TF32 for faster matrix multiplications on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
 class PositionalEncoding(nn.Module):
     """Positional encoding for neuron layer positions"""
     
@@ -38,27 +43,27 @@ class PositionalEncoding(nn.Module):
 
 class EdgeAwareAttention(nn.Module):
     """Multi-head attention with edge feature integration"""
-    
+
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        
+
         assert self.head_dim * num_heads == hidden_dim, "hidden_dim must be divisible by num_heads"
-        
-        # Node transformations
-        self.q_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.k_linear = nn.Linear(hidden_dim, hidden_dim)
-        self.v_linear = nn.Linear(hidden_dim, hidden_dim)
-        
+
+        # Node transformations - use fused operations where possible
+        self.q_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)  # Remove bias for speed
+        self.k_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.v_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
         # Edge feature transformation
-        self.edge_encoder = nn.Linear(1, num_heads)  # Weight to attention heads
-        
+        self.edge_encoder = nn.Linear(1, num_heads, bias=False)
+
         # Output projection
-        self.output_linear = nn.Linear(hidden_dim, hidden_dim)
+        self.output_linear = nn.Linear(hidden_dim, hidden_dim, bias=False)
         self.dropout = nn.Dropout(dropout)
-        
+
         # Layer norm
         self.layer_norm = nn.LayerNorm(hidden_dim)
         
@@ -98,6 +103,7 @@ class EdgeAwareAttention(nn.Module):
         # Create adjacency mask
         adj_mask = self.create_adjacency_mask(edge_index, num_nodes)
         adj_mask = adj_mask.unsqueeze(0).unsqueeze(1)  # [1, 1, num_nodes, num_nodes]
+        adj_mask = adj_mask.to(node_embeddings.device)
         
         # Apply edge-aware bias
         edge_attn_bias = self.edge_encoder(edge_weights.unsqueeze(-1))  # [num_edges, num_heads]
@@ -214,8 +220,8 @@ class GraphTransformer(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         
-        # Input projection
-        self.input_projection = nn.Linear(node_feature_dim, hidden_dim)
+        # Input projection - optimized
+        self.input_projection = nn.Linear(node_feature_dim, hidden_dim, bias=False)
         
         # Positional encoding
         self.positional_encoding = PositionalEncoding(hidden_dim)
@@ -231,13 +237,13 @@ class GraphTransformer(nn.Module):
             nn.LayerNorm(hidden_dim) for _ in range(num_layers)
         ])
         
-        # Feed-forward networks
+        # Feed-forward networks - optimized for speed
         self.ffns = nn.ModuleList([
             nn.Sequential(
-                nn.Linear(hidden_dim, hidden_dim * 4),
+                nn.Linear(hidden_dim, hidden_dim * 4, bias=False),
                 nn.ReLU(),
                 nn.Dropout(dropout),
-                nn.Linear(hidden_dim * 4, hidden_dim),
+                nn.Linear(hidden_dim * 4, hidden_dim, bias=False),
                 nn.Dropout(dropout)
             ) for _ in range(num_layers)
         ])

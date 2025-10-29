@@ -4,10 +4,18 @@ import torch.optim as optim
 import numpy as np
 import time
 import os
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 import torch.nn.functional as F
 import json
 import logging
+import traceback
+import networkx as nx
+import matplotlib.pyplot as plt
+
+# Enable TF32 for faster matrix multiplications on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
 from blueprint_modules.network import NeuralArchitecture
 from blueprint_modules.action import ActionSpace, Action
@@ -41,27 +49,34 @@ class ArchitectureTrainer:
         self.action_space = ActionSpace(
             max_neurons=config.search.max_neurons,
             max_connections=config.search.max_connections,
-            max_steps_per_episode=config.search.max_steps_per_episode
+            max_steps_per_episode=config.search.max_steps_per_episode,
+            connection_candidate_multiplier=config.search.connection_candidate_multiplier
         )
-        self.action_manager = ActionManager(max_neurons=config.model.max_neurons)
+        self.action_manager = ActionManager(
+            max_neurons=config.model.max_neurons,
+            exploration_boost=config.search.action_exploration_boost
+        )
         self.quick_trainer = QuickTrainer(
             train_loader, test_loader, 
             device=self.device,
             max_epochs=config.search.quick_train_epochs
+        )
+
+        # Training infrastructure
+        self.curriculum = TrainingCurriculum(
+            total_episodes=config.supervised.num_episodes + 
+                          config.mixed.num_episodes + 
+                          config.self_play.num_episodes
         )
         
         self.neural_mcts = NeuralMCTS(
             action_space=self.action_space,
             policy_value_net=self.policy_value_net,
             device=self.device,
-            exploration_weight=config.mcts.exploration_weight
-        )
-        
-        # Training infrastructure
-        self.curriculum = TrainingCurriculum(
-            total_episodes=config.supervised.num_episodes + 
-                          config.mixed.num_episodes + 
-                          config.self_play.num_episodes
+            exploration_weight=config.mcts.exploration_weight,
+            curriculum=self.curriculum,
+            quick_trainer=self.quick_trainer,
+            reward_loss_weight=config.search.reward_loss_weight
         )
         
         self.experience_buffer = ExperienceReplay(
@@ -123,8 +138,7 @@ class ArchitectureTrainer:
         for step in range(self.config.search.max_steps_per_episode):
             # Decide whether to use policy network or MCTS
             use_policy = np.random.random() < train_params["policy_mix_ratio"]
-            if step % 10 == 0:
-                print(f"  Episode {self.episode} step {step}: using {'policy' if use_policy and train_params['stage'] != 'supervised' else 'MCTS'}")
+            print(f"  Step {step}: using {'policy' if use_policy and train_params['stage'] != 'supervised' else 'MCTS'}")
 
             if use_policy and train_params["stage"] != "supervised":
                 # Use policy network directly
@@ -143,11 +157,15 @@ class ArchitectureTrainer:
                 
             # Apply action and evaluate
             new_arch = self._apply_action(current_arch, next_action)
+            print(f"    Applied action {next_action.action_type} (neurons={len(new_arch.neurons)}, connections={len(new_arch.connections)})")
             if new_arch is None:
                 break
-                
+
+            # Draw architecture diagram after action
+            self._draw_architecture_diagram(new_arch, step)
             reward = self._evaluate_architecture(new_arch)
-            print(f"    Applied action {next_action.action_type} -> reward={reward:.4f} (neurons={len(new_arch.neurons)}, connections={len(new_arch.connections)})")
+
+            print(f"      Received reward: {reward:.4f}")
             
             # Store experience
             experience = self._create_experience(
@@ -195,6 +213,13 @@ class ArchitectureTrainer:
         """Apply action to create new architecture"""
         # Create a copy of the architecture
         new_arch = NeuralArchitecture()
+        # The default NeuralArchitecture() constructor initializes a MNIST base (inputs/outputs
+        # and some initial connections). When creating a copy we don't want those default
+        # neurons/connections to be present, so clear them before copying the real architecture
+        # to avoid duplicating or accumulating connections.
+        new_arch.neurons = {}
+        new_arch.connections = []
+        new_arch.next_neuron_id = 0
         
         # Copy neurons
         for neuron_id, neuron in architecture.neurons.items():
@@ -226,11 +251,14 @@ class ArchitectureTrainer:
         """Quick evaluation of architecture"""
         try:
             # Use quick training for evaluation
-            accuracy = self.quick_trainer.train_and_evaluate(architecture)
-            print(f"      Evaluation returned accuracy={accuracy:.4f}")
-            return accuracy
+            accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
+            # Compute composite reward: accuracy - weight * loss
+            reward = accuracy - self.config.search.reward_loss_weight * loss
+            print(f"      Evaluation returned accuracy={accuracy:.4f}, loss={loss:.4f}, reward={reward:.4f}")
+            return reward
         except Exception as e:
             print(f"Evaluation error: {e}")
+            traceback.print_exc()
             return 0.0
     
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
@@ -431,6 +459,7 @@ class ArchitectureTrainer:
                     self._save_checkpoint()
             except Exception as e:
                 print(f"Immediate log/checkpoint failed: {e}")
+                traceback.print_exc()
             
             # Update curriculum
             self.curriculum.step()
@@ -479,6 +508,7 @@ class ArchitectureTrainer:
             except Exception as e:
                 # Fall back to console error if file write fails
                 print(f"Failed to write logs: {e}")
+                traceback.print_exc()
     
     def _save_checkpoint(self):
         """Save training checkpoint"""
@@ -510,3 +540,88 @@ class ArchitectureTrainer:
         self.episode = checkpoint['episode']
         
         print(f"Checkpoint loaded from episode {self.episode}")
+
+    def _draw_architecture_diagram(self, architecture: NeuralArchitecture, step: int):
+        """Draw a diagram of the neural architecture after an action"""
+        try:
+            # Create a directed graph
+            G = nx.DiGraph()
+
+            # Add nodes with attributes
+            for neuron_id, neuron in architecture.neurons.items():
+                node_label = f"N{neuron_id}\n{neuron.neuron_type.value[:3]}\n{neuron.activation.value[:3]}"
+                node_color = {
+                    'input': 'lightblue',
+                    'hidden': 'lightgreen',
+                    'output': 'lightcoral'
+                }.get(neuron.neuron_type.value, 'gray')
+
+                G.add_node(neuron_id,
+                          label=node_label,
+                          color=node_color,
+                          layer=neuron.layer_position,
+                          type=neuron.neuron_type.value)
+
+            # Add edges
+            for conn in architecture.connections:
+                if conn.enabled:
+                    G.add_edge(conn.source_id, conn.target_id,
+                              weight=abs(conn.weight),
+                              color='red' if conn.weight < 0 else 'blue')
+
+            # Create positions based on layer positions
+            pos = {}
+            layers = {}
+            for neuron_id, neuron in architecture.neurons.items():
+                layer_pos = neuron.layer_position
+                if layer_pos not in layers:
+                    layers[layer_pos] = []
+                layers[layer_pos].append(neuron_id)
+
+            # Sort layers
+            sorted_layers = sorted(layers.keys())
+            for layer_idx, layer_pos in enumerate(sorted_layers):
+                neurons_in_layer = layers[layer_pos]
+                # Sort neurons within layer by ID for consistent layout
+                neurons_in_layer.sort()
+                y_positions = np.linspace(1, -1, len(neurons_in_layer))
+                for i, neuron_id in enumerate(neurons_in_layer):
+                    pos[neuron_id] = (layer_pos, y_positions[i])
+
+            # Draw the graph
+            plt.figure(figsize=(12, 8))
+
+            # Draw nodes
+            node_colors = [G.nodes[n]['color'] for n in G.nodes()]
+            nx.draw_networkx_nodes(G, pos, node_color=node_colors,
+                                 node_size=800, alpha=0.8)
+
+            # Draw edges
+            edges = G.edges()
+            edge_colors = [G[u][v]['color'] for u, v in edges]
+            edge_weights = [G[u][v]['weight'] for u, v in edges]
+            nx.draw_networkx_edges(G, pos, edge_color=edge_colors,
+                                 width=[w*2 for w in edge_weights],
+                                 alpha=0.6, arrows=True, arrowsize=20)
+
+            # Draw labels
+            labels = {n: G.nodes[n]['label'] for n in G.nodes()}
+            nx.draw_networkx_labels(G, pos, labels, font_size=8, font_weight='bold')
+
+            # Add title and info
+            plt.title(f'Neural Architecture - Episode {self.episode}, Step {step}\n'
+                     f'Neurons: {len(architecture.neurons)}, Connections: {len(architecture.connections)}')
+            plt.axis('off')
+            plt.tight_layout()
+
+            # Save the diagram
+            os.makedirs('architecture_diagrams', exist_ok=True)
+            filename = f'architecture_diagrams/ep{self.episode:03d}_step{step:02d}.png'
+            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            plt.close()
+
+            print(f"      Architecture diagram saved: {filename}")
+
+        except Exception as e:
+            print(f"Failed to draw architecture diagram: {e}")
+            traceback.print_exc()

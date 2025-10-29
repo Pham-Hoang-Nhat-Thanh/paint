@@ -7,6 +7,11 @@ from typing import Dict
 from blueprint_modules.network import NeuralArchitecture, NeuronType, ActivationType
 from blueprint_modules.action import ActionType, Action, ActionSpace
 
+# Enable TF32 for faster matrix multiplications on Ampere+ GPUs
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.fp32_precision = 'tf32'
+    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+
 class UnifiedPolicyValueNetwork(nn.Module):
     """Unified network that outputs both policy and value predictions"""
     
@@ -25,27 +30,27 @@ class UnifiedPolicyValueNetwork(nn.Module):
             hidden_dim=hidden_dim
         )
         
-        # Shared backbone MLP
+        # Shared backbone MLP - optimized for speed
         self.shared_backbone = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),  # global_embedding is hidden_dim * 2
+            nn.Linear(hidden_dim * 2, hidden_dim, bias=False),  # global_embedding is hidden_dim * 2
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.Linear(hidden_dim, hidden_dim // 2, bias=False),
             nn.ReLU(),
             nn.Dropout(0.1)
         )
         
-        # Policy heads (factorized action space)
-        self.action_type_head = nn.Linear(hidden_dim // 2, num_actions)
-        self.source_neuron_head = nn.Linear(hidden_dim // 2, max_neurons)
-        self.target_neuron_head = nn.Linear(hidden_dim // 2, max_neurons) 
-        self.activation_head = nn.Linear(hidden_dim // 2, num_activations)
+        # Policy heads (factorized action space) - optimized
+        self.action_type_head = nn.Linear(hidden_dim // 2, num_actions, bias=False)
+        self.source_neuron_head = nn.Linear(hidden_dim // 2, max_neurons, bias=False)
+        self.target_neuron_head = nn.Linear(hidden_dim // 2, max_neurons, bias=False)
+        self.activation_head = nn.Linear(hidden_dim // 2, num_activations, bias=False)
         
-        # Value head
+        # Value head - optimized
         self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 4),
+            nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
             nn.ReLU(),
-            nn.Linear(hidden_dim // 4, 1),
+            nn.Linear(hidden_dim // 4, 1, bias=False),
             nn.Tanh()  # Output between -1 and 1
         )
         
@@ -99,53 +104,74 @@ class UnifiedPolicyValueNetwork(nn.Module):
 class ActionManager:
     """Manages action selection with masking and validation"""
 
-    def __init__(self, max_neurons: int = 100, action_space: ActionSpace = None):
+    def __init__(self, max_neurons: int = 100, action_space: ActionSpace = None, exploration_boost: float = 0.5):
         self.max_neurons = max_neurons
         self.action_space = action_space
+        self.exploration_boost = exploration_boost
     
     def get_action_masks(self, architecture: NeuralArchitecture) -> Dict[str, torch.Tensor]:
-        """Get masks for invalid actions"""
+        """Get masks for invalid actions with balanced exploration incentives"""
         masks = {}
         neurons = architecture.neurons
-        hidden_neurons = [nid for nid, neuron in neurons.items() 
+        hidden_neurons = [nid for nid, neuron in neurons.items()
                          if neuron.neuron_type == NeuronType.HIDDEN]
-        
+
         # Get the maximum neuron ID to determine tensor sizes
         max_neuron_id = max(neurons.keys()) if neurons else 0
         tensor_size = max(max_neuron_id + 1, self.max_neurons)
-        
-        # Action type mask
+
+        # Action type mask with exploration incentives
         action_mask = torch.zeros(5) - 1e9  # 5 action types
-        
+
+        # Base validity
         if len(neurons) < self.max_neurons:
             action_mask[ActionType.ADD_NEURON.value] = 0
-        
+
         if hidden_neurons:
             action_mask[ActionType.REMOVE_NEURON.value] = 0
             action_mask[ActionType.MODIFY_ACTIVATION.value] = 0
-        
+
         if len(neurons) >= 2:
             action_mask[ActionType.ADD_CONNECTION.value] = 0
-        
+
         if architecture.connections:
             action_mask[ActionType.REMOVE_CONNECTION.value] = 0
-        
+
+        # Exploration incentives: slightly boost underrepresented action types
+        num_neurons = len(neurons)
+        num_connections = len(architecture.connections)
+
+        # Boost neuron actions if architecture is too small
+        if num_neurons < 10:
+            if action_mask[ActionType.ADD_NEURON.value] == 0:
+                action_mask[ActionType.ADD_NEURON.value] += self.exploration_boost
+
+        # Boost connection actions if architecture has few connections relative to neurons
+        if num_connections < num_neurons * 2 and num_neurons >= 3:
+            if action_mask[ActionType.ADD_CONNECTION.value] == 0:
+                action_mask[ActionType.ADD_CONNECTION.value] += self.exploration_boost * 0.6
+
+        # Boost modification actions if architecture is stable
+        if num_connections > num_neurons and hidden_neurons:
+            if action_mask[ActionType.MODIFY_ACTIVATION.value] == 0:
+                action_mask[ActionType.MODIFY_ACTIVATION.value] += self.exploration_boost * 0.4
+
         masks['action_type'] = action_mask
-        
+
         # Source neuron mask (for remove/modify actions)
         source_mask = torch.zeros(tensor_size) - 1e9
         for neuron_id in hidden_neurons:
             if neuron_id < tensor_size:  # Ensure within bounds
                 source_mask[neuron_id] = 0
         masks['source_neurons'] = source_mask
-        
+
         # Target neuron mask (for connection actions)
         target_mask = torch.zeros(tensor_size) - 1e9
         for neuron_id in neurons.keys():
             if neuron_id < tensor_size:  # Ensure within bounds
                 target_mask[neuron_id] = 0
         masks['target_neurons'] = target_mask
-        
+
         return masks
     
     def select_action(self, policy_output: Dict, architecture: NeuralArchitecture,

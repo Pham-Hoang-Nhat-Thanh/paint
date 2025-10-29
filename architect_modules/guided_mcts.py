@@ -1,6 +1,6 @@
 from blueprint_modules.mcts import MCTS, MCTSNode
-from blueprint_modules.network import NeuralArchitecture, ActivationType
-from blueprint_modules.action import Action, ActionSpace
+from blueprint_modules.network import NeuralArchitecture, ActivationType, NeuronType
+from blueprint_modules.action import Action, ActionSpace, ActionType
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
 from torch.distributions import Categorical
 from typing import Dict, List
@@ -67,11 +67,34 @@ class NeuralMCTS(MCTS):
     """MCTS enhanced with neural network guidance"""
 
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
-                 device: str = 'cpu', exploration_weight: float = 1.0, curriculum=None):
+                 device: str = 'cpu', exploration_weight: float = 1.0, curriculum=None, quick_trainer=None, reward_loss_weight=0.01,
+                 iso_weight: float = 0.01, comp_weight: float = 0.0):
         super().__init__(action_space, None, exploration_weight)
         self.policy_value_net = policy_value_net
         self.device = device
         self.curriculum = curriculum
+        self.quick_trainer = quick_trainer
+        self.reward_loss_weight = reward_loss_weight
+        # Reward shaping weights: penalize isolated neurons and optionally penalize connection count
+        self.iso_weight = iso_weight
+        self.comp_weight = comp_weight
+        # Cache for evaluations to avoid redundant computations on architectures with identical isolated hidden neurons
+        self.evaluation_cache = {}
+
+    def _compute_isolation_cache_key(self, architecture: NeuralArchitecture) -> frozenset:
+        """Compute a cache key based on the connection states of isolated hidden neurons.
+
+        The key is a frozenset of (has_inward, has_outward) tuples for each isolated hidden neuron.
+        Isolated neurons are HIDDEN neurons lacking either inward or outward connections, or both.
+        """
+        isolated_states = []
+        for neuron_id, neuron in architecture.neurons.items():
+            if neuron.neuron_type == NeuronType.HIDDEN:
+                has_in = any(conn.target_neuron == neuron_id for conn in architecture.connections.values())
+                has_out = any(conn.source_neuron == neuron_id for conn in architecture.connections.values())
+                if not has_in or not has_out:
+                    isolated_states.append((has_in, has_out))
+        return frozenset(isolated_states)
         
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
         """Convert architecture to graph data for neural network"""
@@ -89,131 +112,183 @@ class NeuralMCTS(MCTS):
         graph_data['layer_positions'] = torch.FloatTensor([layer_positions]).to(self.device)
         
         return graph_data
+
+    def _value_from_quick_trainer(self, architecture: NeuralArchitecture, node_action: Action = None, is_simulation: bool = False) -> float:
+        """Compute shaped value from quick_trainer (accuracy/loss) plus isolation/complexity terms.
+
+        node_action: optional Action that produced the architecture (used to give a one-step grace to newly added neurons).
+        is_simulation: when True, be conservative about granting grace (simulations often can't identify new neuron ids reliably).
+        """
+        if not self.quick_trainer:
+            return np.random.uniform(0.0, 0.5)
+
+        try:
+            accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
+        except Exception:
+            return np.random.uniform(0.0, 0.5)
+
+        base_reward = accuracy - self.reward_loss_weight * loss
+
+        # Determine ignore ids for grace period: only when we have a node_action that added a neuron
+        ignore_ids = set()
+        if not is_simulation and node_action is not None:
+            try:
+                if node_action.action_type == ActionType.ADD_NEURON and architecture.next_neuron_id > 0:
+                    # newly added neuron id should be last allocated id
+                    ignore_ids.add(architecture.next_neuron_id - 1)
+            except Exception:
+                pass
+
+        isolated = architecture.count_isolated_neurons(ignore_ids=ignore_ids, only_hidden=True)
+        total_hidden = sum(1 for n in architecture.neurons.values() if n.neuron_type == NeuronType.HIDDEN and n.id not in ignore_ids)
+        total_hidden = max(1, total_hidden)
+        iso_term = isolated / total_hidden
+
+        num_conn = architecture.num_connections()
+        num_neurons = max(1, architecture.num_neurons())
+        comp_term = num_conn / num_neurons
+
+        return base_reward - self.iso_weight * iso_term - self.comp_weight * comp_term
+
+    def _evaluate_node(self, node: NeuralMCTSNode, is_simulation: bool = False) -> float:
+        """Evaluate a node using quick_trainer in supervised stage or the policy-value net.
+
+        This is the shared evaluator used by both `search` and `search_with_beam` so logic is
+        consistent and centralized.
+        """
+        # Use cache to avoid redundant evaluations for architectures with identical isolated neuron states
+        cache_key = self._compute_isolation_cache_key(node.architecture)
+        if cache_key and cache_key in self.evaluation_cache:
+            return self.evaluation_cache[cache_key]
+
+        # Determine stage
+        if self.curriculum:
+            train_params = self.curriculum.get_training_parameters()
+            stage = train_params.get('stage', 'supervised')
+        else:
+            stage = 'supervised' if self.quick_trainer else 'policy'
+
+        if stage == 'supervised' and self.quick_trainer:
+            value = self._value_from_quick_trainer(node.architecture, node_action=node.action, is_simulation=is_simulation)
+        else:
+            # Ensure we have a policy_value for this node
+            if node.policy_value is None:
+                with torch.no_grad():
+                    graph_data = self._prepare_graph_data(node.architecture)
+                    node.policy_value = self.policy_value_net(graph_data)
+            value = node.policy_value['value'].item()
+
+        # Cache the value only if there are isolated neurons
+        if cache_key:
+            self.evaluation_cache[cache_key] = value
+
+        return value
     
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
                temperature: float = 1.0) -> NeuralMCTSNode:
         """Run neural-guided MCTS search"""
         root = NeuralMCTSNode(initial_architecture)
 
-        # Get neural network predictions for root
-        with torch.no_grad():
-            graph_data = self._prepare_graph_data(initial_architecture)
-            policy_value = self.policy_value_net(graph_data)
-            root.policy_value = policy_value
+        # Get neural network predictions for root (skip in supervised stage for speed)
+        if self.curriculum:
+            train_params = self.curriculum.get_training_parameters()
+            stage = train_params.get('stage', 'supervised')
+            if stage != 'supervised':
+                with torch.no_grad():
+                    graph_data = self._prepare_graph_data(initial_architecture)
+                    policy_value = self.policy_value_net(graph_data)
+                    root.policy_value = policy_value
+        else:
+            with torch.no_grad():
+                graph_data = self._prepare_graph_data(initial_architecture)
+                policy_value = self.policy_value_net(graph_data)
+                root.policy_value = policy_value
 
+        # Use the centralized evaluator
+        print("Starting MCTS search...")
         for i in range(iterations):
             node = self._select(root)
 
             if not node.architecture.performance_metrics:
-                # Evaluate leaf node using value network
-                value = node.policy_value['value'].item()
+                # Leaf evaluation
+                value = self._evaluate_node(node, is_simulation=False)
                 node.architecture.performance_metrics = {'estimated_accuracy': value}
                 node.value = value
                 node.visits = 1
             else:
                 node = self._expand(node)
-                if node != self._select(root):  # If we expanded
-                    value = node.policy_value['value'].item()
+                if node != self._select(root):
+                    # We expanded; evaluate the expanded node
+                    value = self._evaluate_node(node, is_simulation=False)
                 else:
+                    # No expansion (selection returned same node) -> simulate rollout
                     value = self._simulate(node)
 
             self._backpropagate(node, value)
+            if (i + 1) % max(1, iterations // 10) == 0:
+                print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {root.value/root.visits:.4f}")
 
-            if i % 20 == 0:
-                best_child = root.best_child(0)  # Greedy best
-                if best_child:
-                    print(f"MCTS iteration {i}, best value: {best_child.value/best_child.visits:.3f}")
-
-        return self._select_final_action(root, temperature)
-
-    def search_with_beam(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
-                         beam_width: int = 5, temperature: float = 1.0) -> List[NeuralMCTSNode]:
-        """Run neural-guided MCTS search with beam search to maintain diversity"""
-        root = NeuralMCTSNode(initial_architecture)
-
-        # Get neural network predictions for root
-        with torch.no_grad():
-            graph_data = self._prepare_graph_data(initial_architecture)
-            policy_value = self.policy_value_net(graph_data)
-            root.policy_value = policy_value
-
-        # Initialize beam with root
-        beam = [root]
-
-        for i in range(iterations):
-            new_beam = []
-
-            for node in beam:
-                # Perform MCTS steps for each node in beam
-                for _ in range(beam_width // len(beam) + 1):  # Distribute iterations
-                    selected_node = self._select(node)
-
-                    if not selected_node.architecture.performance_metrics:
-                        # Evaluate leaf node using value network
-                        value = selected_node.policy_value['value'].item()
-                        selected_node.architecture.performance_metrics = {'estimated_accuracy': value}
-                        selected_node.value = value
-                        selected_node.visits = 1
-                    else:
-                        expanded_node = self._expand(selected_node)
-                        if expanded_node != self._select(node):  # If we expanded
-                            value = expanded_node.policy_value['value'].item()
-                        else:
-                            value = self._simulate(expanded_node)
-
-                    self._backpropagate(expanded_node, value)
-
-                # Add top-k children to new beam
-                top_children = node.top_k_children(beam_width)
-                new_beam.extend(top_children)
-
-            # Select top beam_width nodes for next iteration
-            if new_beam:
-                # Sort by value/visits (greedy)
-                new_beam.sort(key=lambda x: x.value / x.visits if x.visits > 0 else 0, reverse=True)
-                beam = new_beam[:beam_width]
-
-            if i % 20 == 0:
-                best_node = max(beam, key=lambda x: x.value / x.visits if x.visits > 0 else 0)
-                print(f"MCTS beam iteration {i}, best value: {best_node.value/best_node.visits:.3f}")
-
-        return beam
+        best_child = root.best_child(0)  # Greedy best child
+        # Return best action from root
+        # Select final action using temperature (visit-count based) to allow stochasticity
+        final_node = self._select_final_action(root, temperature)
+        if final_node and final_node.action:
+            action_str = f"{best_child.action.action_type.name}"
+            action_str = f"{final_node.action.action_type.name}"
+            if final_node.action.source_neuron is not None:
+                action_str += f"({final_node.action.source_neuron}"
+                if final_node.action.target_neuron is not None:
+                    action_str += f"->{final_node.action.target_neuron})"
+                else:
+                    action_str += ")"
+            elif final_node.action.activation is not None:
+                action_str += f"({final_node.action.activation.name})"
+            print(f"MCTS FINAL ACTION: {action_str} (value: {final_node.value/final_node.visits:.3f})")
+            print("MCTS search completed successfully")
+            return final_node
+        else:
+            print("MCTS search completed: no valid action found")
+            return None
+        
     
     def _select_final_action(self, root: NeuralMCTSNode, temperature: float) -> NeuralMCTSNode:
-        """Select final action based on visit counts and temperature"""
+        """Select final action based on visit counts (proportional selection)"""
         if not root.children:
             return root
-        
+
         visit_counts = torch.tensor([child.visits for child in root.children])
-        
-        if temperature == 0:
-            # Greedy selection
-            selected_idx = visit_counts.argmax().item()
-        else:
-            # Temperature-based selection
-            visit_probs = visit_counts.float() ** (1 / temperature)
-            visit_probs = visit_probs / visit_probs.sum()
-            selected_idx = Categorical(probs=visit_probs).sample().item()
-        
+
+        # Proportional selection based on visit counts (standard MCTS final selection)
+        visit_probs = visit_counts.float() / visit_counts.sum()
+        selected_idx = Categorical(probs=visit_probs).sample().item()
+
         return root.children[selected_idx]
     
     def _expand(self, node: NeuralMCTSNode) -> NeuralMCTSNode:
         """Expand node using policy network priors"""
-        if not node.policy_value:
-            # Get neural network predictions if not available
+        # Determine whether to use policy or random based on curriculum
+        if self.curriculum:
+            train_params = self.curriculum.get_training_parameters()
+            stage = train_params.get('stage', 'supervised')
+            # In supervised stage, use random actions to avoid slow policy network calls
+            if stage == 'supervised':
+                use_policy = False
+                skip_nn_calls = True
+            else:
+                use_policy = train_params['policy_mix_ratio'] > 0.0
+                skip_nn_calls = False
+        else:
+            use_policy = False  # Default to random if no curriculum
+            skip_nn_calls = True
+
+        # Get neural network predictions if needed and not skipping
+        if not node.policy_value and not skip_nn_calls:
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(node.architecture)
                 node.policy_value = self.policy_value_net(graph_data)
 
         # Use action manager to get valid actions
         action_manager = ActionManager(action_space=self.action_space)
-
-        # Determine whether to use policy or random based on curriculum
-        if self.curriculum:
-            train_params = self.curriculum.get_training_parameters()
-            use_policy = train_params['policy_mix_ratio'] > 0.0
-        else:
-            use_policy = False  # Default to random if no curriculum
 
         action = action_manager.select_action(
             node.policy_value, node.architecture, exploration=True, use_policy=use_policy
@@ -227,13 +302,17 @@ class NeuralMCTS(MCTS):
             # Create child node
             child = NeuralMCTSNode(new_architecture, parent=node, action=action)
 
-            # Compute prior probability for this action from policy network
-            child.prior_prob = self._compute_action_prior_prob(node.policy_value, action, node.architecture)
+            # Compute prior probability for this action from policy network (skip in supervised)
+            if skip_nn_calls:
+                child.prior_prob = 1.0  # Default prior for supervised stage
+            else:
+                child.prior_prob = self._compute_action_prior_prob(node.policy_value, action, node.architecture)
 
-            # Get neural network predictions for child
-            with torch.no_grad():
-                graph_data = self._prepare_graph_data(new_architecture)
-                child.policy_value = self.policy_value_net(graph_data)
+            # Get neural network predictions for child (skip in supervised)
+            if not skip_nn_calls:
+                with torch.no_grad():
+                    graph_data = self._prepare_graph_data(new_architecture)
+                    child.policy_value = self.policy_value_net(graph_data)
 
             node.children.append(child)
             return child
@@ -241,7 +320,7 @@ class NeuralMCTS(MCTS):
         return node
 
     def _compute_action_prior_prob(self, policy_output: Dict, action: Action, architecture: NeuralArchitecture) -> float:
-        """Compute the prior probability of an action from policy network output"""
+        """Compute the prior probability of an action from policy network output, boosting for de-isolating actions"""
         import torch.nn.functional as F
 
         prior_prob = 1.0
@@ -278,6 +357,36 @@ class NeuralMCTS(MCTS):
             activation_idx = list(ActivationType).index(action.activation)
             prior_prob *= activation_probs[0, activation_idx].item()
 
+        # Boost prior for de-isolating actions (ADD_CONNECTION involving isolated hidden neurons)
+        if action.action_type == ActionType.ADD_CONNECTION:
+            # Identify isolated hidden neurons and their isolation types
+            isolated_lacking_in = set()  # Neurons lacking inward connections
+            isolated_lacking_out = set()  # Neurons lacking outward connections
+            isolated_lacking_both = set()  # Neurons lacking both
+
+            for neuron_id, neuron in architecture.neurons.items():
+                if neuron.neuron_type == NeuronType.HIDDEN:
+                    has_in = any(conn.target_neuron == neuron_id for conn in architecture.connections.values())
+                    has_out = any(conn.source_neuron == neuron_id for conn in architecture.connections.values())
+                    if not has_in and not has_out:
+                        isolated_lacking_both.add(neuron_id)
+                    elif not has_in:
+                        isolated_lacking_in.add(neuron_id)
+                    elif not has_out:
+                        isolated_lacking_out.add(neuron_id)
+
+            # Boost based on specific de-isolation
+            boost = False
+            if action.target_neuron in isolated_lacking_in or action.target_neuron in isolated_lacking_both:
+                # Boost if target is a neuron lacking inward connections (or both)
+                boost = True
+            elif action.source_neuron in isolated_lacking_out:
+                # Boost if source is a neuron lacking outward connections
+                boost = True
+
+            if boost:
+                prior_prob *= 2.0  # Boost by factor of 2
+
         return prior_prob
 
     def _simulate(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
@@ -300,9 +409,37 @@ class NeuralMCTS(MCTS):
             self.action_space.apply_action(current_arch, action)
 
         # Evaluate the simulated architecture using the policy-value network
-        with torch.no_grad():
-            graph_data = self._prepare_graph_data(current_arch)
-            policy_value = self.policy_value_net(graph_data)
-            value = policy_value['value'].item()
+        # Skip neural network evaluation in supervised stage for speed
+        if self.curriculum:
+            train_params = self.curriculum.get_training_parameters()
+            stage = train_params.get('stage', 'supervised')
+            if stage == 'supervised':
+                # Train the architecture to get real performance
+                if self.quick_trainer:
+                    accuracy, loss = self.quick_trainer.train_and_evaluate(current_arch)
+                    base_reward = accuracy - self.reward_loss_weight * loss
+
+                    # Apply connectivity / isolation penalties on simulated architecture
+                    isolated = current_arch.count_isolated_neurons(ignore_ids=set(), only_hidden=True)
+                    total_hidden = max(1, sum(1 for n in current_arch.neurons.values() if n.neuron_type == NeuronType.HIDDEN))
+                    iso_term = isolated / total_hidden
+
+                    num_conn = current_arch.num_connections()
+                    num_neurons = max(1, current_arch.num_neurons())
+                    comp_term = num_conn / num_neurons
+
+                    value = base_reward - self.iso_weight * iso_term - self.comp_weight * comp_term
+                else:
+                    value = np.random.uniform(0.0, 0.5)  # Fallback if no trainer
+            else:
+                with torch.no_grad():
+                    graph_data = self._prepare_graph_data(current_arch)
+                    policy_value = self.policy_value_net(graph_data)
+                    value = policy_value['value'].item()
+        else:
+            with torch.no_grad():
+                graph_data = self._prepare_graph_data(current_arch)
+                policy_value = self.policy_value_net(graph_data)
+                value = policy_value['value'].item()
 
         return value

@@ -97,9 +97,9 @@ class MCTS:
         self.exploration_weight = exploration_weight
         
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100):
-        """Run MCTS from initial architecture"""
+        """Run MCTS from initial architecture with optimized evaluation"""
         root = MCTSNode(initial_architecture)
-        
+
         for i in range(iterations):
             node = self._select(root)
             if not node.architecture.performance_metrics:
@@ -110,13 +110,13 @@ class MCTS:
                 node.visits = 1
             else:
                 node = self._expand(node)
-                value = self._simulate(node)
-            
-            self._backpropagate(node, value)
-            
-            if i % 10 == 0:
+                if node:
+                    value = self._simulate(node)
+                    self._backpropagate(node, value)
+
+            if i % 20 == 0:  # Reduced logging frequency
                 print(f"MCTS iteration {i}, best value: {root.best_child(0).value if root.children else 0:.3f}")
-        
+
         return root.best_child(0)  # Return best child (exploitation only)
     
     def _select(self, node: MCTSNode) -> MCTSNode:

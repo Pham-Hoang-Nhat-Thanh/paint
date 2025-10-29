@@ -47,7 +47,7 @@ class MCTSConfig:
 class TrainingStageConfig:
     """Base configuration for each training stage"""
     # Training parameters
-    batch_size: int = 32
+    batch_size: int = 64
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
@@ -126,19 +126,26 @@ class ArchitectureSearchConfig:
     max_neurons: int = 1000
     max_connections: int = 10000
     max_steps_per_episode: int = 50
-    
+
     # Evaluation
-    quick_train_epochs: int = 3
+    quick_train_epochs: int = 1
     final_train_epochs: int = 10
     evaluation_batch_size: int = 64
-    
+
     # Termination conditions
     target_accuracy: float = 0.97
     patience: int = 20
-    
+
+    # Reward configuration
+    reward_loss_weight: float = 0.1  # Weight for loss in composite reward (reward = accuracy - weight * loss)
+
+    # Action space balancing
+    action_exploration_boost: float = 0.5  # Boost factor for underrepresented actions
+    connection_candidate_multiplier: int = 3  # Multiplier for connection candidates (num_neurons * multiplier)
+
     # Action space
     allowed_actions: List = None
-    
+
     def __post_init__(self):
         if self.allowed_actions is None:
             from blueprint_modules.action import ActionType
@@ -177,3 +184,16 @@ class OverallConfig:
     log_interval: int = 5
     # Global training interval (how often to run training steps across episodes)
     train_interval: int = 1
+
+    # GPU optimizations
+    use_mixed_precision: bool = True
+    gradient_accumulation_steps: int = 2
+    enable_tf32: bool = True
+
+    # Parallel evaluation
+    parallel_evaluation: bool = True
+    max_parallel_workers: int = 4
+
+    # Early stopping
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.001
