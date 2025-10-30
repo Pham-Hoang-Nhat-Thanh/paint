@@ -130,7 +130,7 @@ class ArchitectureSearchConfig:
     # Evaluation
     quick_train_epochs: int = 1
     final_train_epochs: int = 10
-    evaluation_batch_size: int = 64
+    evaluation_batch_size: int = 32  # Reduced for faster evaluation
 
     # Termination conditions
     target_accuracy: float = 0.97

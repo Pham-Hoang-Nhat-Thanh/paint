@@ -1,9 +1,10 @@
 import torch
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
 from enum import Enum
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 
 class NeuronType(Enum):
     INPUT = "input"
@@ -215,6 +216,62 @@ class NeuralArchitecture:
             counts[neuron.neuron_type] += 1
         return counts
     
+    def to_serializable_dict(self) -> dict:
+        """Convert architecture to serializable dict for multiprocessing"""
+        return {
+            'next_neuron_id': self.next_neuron_id,
+            'neurons': [
+                {
+                    'id': neuron.id,
+                    'neuron_type': neuron.neuron_type.value,  # Convert enum to string
+                    'activation': neuron.activation.value,    # Convert enum to string
+                    'layer_position': neuron.layer_position,
+                    'bias': neuron.bias
+                }
+                for neuron in self.neurons.values()
+            ],
+            'connections': [
+                {
+                    'source_id': conn.source_id,
+                    'target_id': conn.target_id,
+                    'weight': conn.weight,
+                    'enabled': conn.enabled
+                }
+                for conn in self.connections
+            ]
+        }
+
+    @classmethod
+    def from_serializable_dict(cls, data: dict) -> 'NeuralArchitecture':
+        """Reconstruct architecture from serializable dict"""
+        arch = cls()
+        arch.neurons = {}
+        arch.connections = []
+        arch.next_neuron_id = data['next_neuron_id']
+
+        # Reconstruct neurons
+        for neuron_data in data['neurons']:
+            neuron = Neuron(
+                id=neuron_data['id'],
+                neuron_type=NeuronType(neuron_data['neuron_type']),
+                activation=ActivationType(neuron_data['activation']),
+                layer_position=neuron_data['layer_position'],
+                bias=neuron_data['bias']
+            )
+            arch.neurons[neuron.id] = neuron
+
+        # Reconstruct connections
+        for conn_data in data['connections']:
+            conn = Connection(
+                source_id=conn_data['source_id'],
+                target_id=conn_data['target_id'],
+                weight=conn_data['weight'],
+                enabled=conn_data['enabled']
+            )
+            arch.connections.append(conn)
+
+        return arch
+
     def __str__(self):
         counts = self.get_neuron_count()
         return f"NeuralArchitecture(neurons={sum(counts.values())}, connections={len(self.connections)})"
@@ -230,10 +287,20 @@ class GraphNeuralNetwork(nn.Module):
     4. Proper gradient flow through all operations
     """
     
-    def __init__(self, architecture: NeuralArchitecture):
+    def __init__(self, architecture: NeuralArchitecture, device: Optional[str] = None):
         super().__init__()
         self.architecture = architecture
-        
+        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+
+        # Enable GPU optimizations
+        if self.device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+            if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+                # Use new API for TF32 precision
+                torch.set_float32_matmul_precision('high')
+                torch.backends.cudnn.conv.fp32_precision = 'tf32'
+                torch.backends.cuda.matmul.fp32_precision = 'tf32'
+
         # Build optimized network structure
         self._build_optimized_network()
     
@@ -341,8 +408,8 @@ class GraphNeuralNetwork(nn.Module):
             
             # Store as parameter
             key = f"weights_{src_layer}_{tgt_layer}"
-            self.weight_matrices[key] = nn.Parameter(weight_matrix)
-        
+            self.weight_matrices[key] = nn.Parameter(weight_matrix.to(self.device))
+
         # Build bias vectors for each layer
         for layer_idx, neuron_ids in self.layer_indices.items():
             biases = torch.zeros(len(neuron_ids))
@@ -351,7 +418,7 @@ class GraphNeuralNetwork(nn.Module):
                 biases[i] = neuron.bias
             
             key = f"biases_{layer_idx}"
-            self.bias_vectors[key] = nn.Parameter(biases)
+            self.bias_vectors[key] = nn.Parameter(biases.to(self.device))
     
     def _precompute_activations(self):
         """Precompute activation functions without inplace operations"""
@@ -381,11 +448,15 @@ class GraphNeuralNetwork(nn.Module):
         else:
             return nn.ReLU()  # Removed inplace=True
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, use_mixed_precision: bool = False) -> torch.Tensor:
         """
         Optimized forward pass with batched operations and proper gradient flow
         x: [batch_size, 784] for MNIST
+        use_mixed_precision: Enable automatic mixed precision for faster computation
         """
+        # Ensure input is on correct device
+        x = x.to(self.device)
+
         batch_size = x.size(0)
         
         # Reshape input if needed
@@ -407,7 +478,7 @@ class GraphNeuralNetwork(nn.Module):
                 input_data = x
             else:
                 # Too few input neurons, pad with zeros
-                padding = torch.zeros(batch_size, 784 - len(input_neuron_ids), device=x.device)
+                padding = torch.zeros(batch_size, 784 - len(input_neuron_ids), device=self.device)
                 input_data = torch.cat([x[:, :len(input_neuron_ids)], padding], dim=1)
         else:
             input_data = x
@@ -425,10 +496,15 @@ class GraphNeuralNetwork(nn.Module):
                 if weight_key in self.weight_matrices:
                     prev_output = layer_outputs[prev_layer_idx]
                     weight_matrix = self.weight_matrices[weight_key]
-                    
-                    # Batched matrix multiplication (gradient-safe)
-                    layer_input = torch.matmul(prev_output, weight_matrix.t())
-                    
+
+                    # Use autocast for mixed precision if enabled
+                    if use_mixed_precision:
+                        with autocast('cuda'):
+                            # Batched matrix multiplication (gradient-safe)
+                            layer_input = torch.matmul(prev_output, weight_matrix.t())
+                    else:
+                        # Batched matrix multiplication (gradient-safe)
+                        layer_input = torch.matmul(prev_output, weight_matrix.t())
                     if current_output is None:
                         current_output = layer_input
                     else:
@@ -443,15 +519,19 @@ class GraphNeuralNetwork(nn.Module):
                 # Apply activation (gradient-safe, no inplace)
                 activation_key = str(current_layer_idx)
                 if activation_key in self.activation_modules:
-                    current_output = self.activation_modules[activation_key](current_output)
-                
+                    if use_mixed_precision:
+                        with autocast('cuda'):
+                            current_output = self.activation_modules[activation_key](current_output)
+                    else:
+                        current_output = self.activation_modules[activation_key](current_output)
+
                 layer_outputs[current_layer_idx] = current_output
             else:
                 # If no connections to this layer, initialize with zeros
                 num_neurons = len(self.layer_indices[current_layer_idx])
-                layer_outputs[current_layer_idx] = torch.zeros(batch_size, num_neurons, 
-                                                             device=x.device)
-        
+                layer_outputs[current_layer_idx] = torch.zeros(batch_size, num_neurons,
+                                                             device=self.device)
+
         # Extract output from last layer
         output_layer_idx = len(self.layer_positions) - 1
         final_output = layer_outputs[output_layer_idx]
@@ -461,8 +541,8 @@ class GraphNeuralNetwork(nn.Module):
             final_output = final_output[:, :10]  # Take first 10 neurons
         elif final_output.shape[1] < 10:
             # Pad with zeros if needed (gradient-safe)
-            padding = torch.zeros(batch_size, 10 - final_output.shape[1], 
-                                device=final_output.device)
+            padding = torch.zeros(batch_size, 10 - final_output.shape[1],
+                                device=self.device)
             final_output = torch.cat([final_output, padding], dim=1)
         
         return final_output
@@ -470,3 +550,25 @@ class GraphNeuralNetwork(nn.Module):
     def get_parameter_count(self) -> int:
         """Count trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    @torch.jit.export
+    def jit_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """JIT-compiled forward pass for maximum performance"""
+        return self.forward(x, use_mixed_precision=False)
+
+    def enable_jit_compilation(self):
+        """Compile the forward method with TorchScript for optimization"""
+        if not hasattr(self, '_jit_compiled'):
+            try:
+                self._jit_compiled = torch.jit.script(self.jit_forward)
+                print("JIT compilation successful")
+            except Exception as e:
+                print(f"JIT compilation failed: {e}")
+                self._jit_compiled = None
+
+    def forward_jit(self, x: torch.Tensor) -> torch.Tensor:
+        """Use JIT-compiled forward pass if available"""
+        if hasattr(self, '_jit_compiled') and self._jit_compiled is not None:
+            return self._jit_compiled(x)
+        else:
+            return self.forward(x)

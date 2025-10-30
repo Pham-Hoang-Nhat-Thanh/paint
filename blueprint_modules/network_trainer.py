@@ -7,11 +7,19 @@ import traceback
 class QuickTrainer:
     """Proper training and evaluation using the graph-based networks"""
     
-    def __init__(self, train_loader, test_loader, device='cpu', max_epochs=5):
+    def __init__(self, train_loader, test_loader, device='cpu', max_epochs=5, use_mixed_precision=False):
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = device
         self.max_epochs = max_epochs
+        self.use_mixed_precision = use_mixed_precision
+
+        # Setup scaler for mixed precision
+        if use_mixed_precision:
+            from torch.amp import GradScaler
+            self.scaler = GradScaler('cuda')
+        else:
+            self.scaler = None
     
     def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
         """Train the graph-based network and return (final_accuracy, last_epoch_avg_loss)
@@ -41,13 +49,18 @@ class QuickTrainer:
                     data, target = data.to(self.device), target.to(self.device)
                     optimizer.zero_grad()
 
-                    # Forward pass
-                    output = model(data)
+                    # Forward pass with optimizations
+                    output = model(data, use_mixed_precision=self.use_mixed_precision)
                     loss = criterion(output, target)
 
-                    # Backward pass
-                    loss.backward()
-                    optimizer.step()
+                    # Backward pass with mixed precision support
+                    if self.scaler is not None:
+                        self.scaler.scale(loss).backward()
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
+                    else:
+                        loss.backward()
+                        optimizer.step()
 
                     epoch_loss += loss.item()
                     batch_count += 1
@@ -55,7 +68,7 @@ class QuickTrainer:
                     correct += (pred == target).sum().item()
                     total += target.size(0)
             
-            # Final evaluation
+            # Final evaluation on test set
             final_accuracy, final_loss = self.evaluate_model(model)
             
             # Store performance metrics
@@ -87,7 +100,7 @@ class QuickTrainer:
                 # Move inputs to the trainer device before any model call
                 data, target = data.to(self.device), target.to(self.device)
 
-                output = model(data)
+                output = model(data, use_mixed_precision=self.use_mixed_precision)
                 batch_loss = criterion(output, target)
                 loss += batch_loss.item()
 

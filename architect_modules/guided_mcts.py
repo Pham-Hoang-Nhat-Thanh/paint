@@ -1,12 +1,15 @@
 from blueprint_modules.mcts import MCTS, MCTSNode
 from blueprint_modules.network import NeuralArchitecture, ActivationType, NeuronType
 from blueprint_modules.action import Action, ActionSpace, ActionType
+from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
 from torch.distributions import Categorical
 from typing import Dict, List
 import torch
 import math
 import numpy as np
+import traceback
+from concurrent.futures import ProcessPoolExecutor
 
 
 class NeuralMCTSNode(MCTSNode):
@@ -68,7 +71,8 @@ class NeuralMCTS(MCTS):
 
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
                  device: str = 'cpu', exploration_weight: float = 1.0, curriculum=None, quick_trainer=None, reward_loss_weight=0.01,
-                 iso_weight: float = 0.01, comp_weight: float = 0.0):
+                 iso_weight: float = 0.01, comp_weight: float = 0.0, parallel_workers: int = 4,
+                 early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001):
         super().__init__(action_space, None, exploration_weight)
         self.policy_value_net = policy_value_net
         self.device = device
@@ -78,8 +82,15 @@ class NeuralMCTS(MCTS):
         # Reward shaping weights: penalize isolated neurons and optionally penalize connection count
         self.iso_weight = iso_weight
         self.comp_weight = comp_weight
+        # Parallel processing settings
+        self.parallel_workers = parallel_workers
+        # Early stopping settings
+        self.early_stopping_patience = early_stopping_patience
+        self.early_stopping_min_delta = early_stopping_min_delta
         # Cache for evaluations to avoid redundant computations on architectures with identical isolated hidden neurons
         self.evaluation_cache = {}
+        # Evolutionary cycle tracking
+        self.current_cycle = EvolutionaryCycle()
 
     def _compute_isolation_cache_key(self, architecture: NeuralArchitecture) -> frozenset:
         """Compute a cache key based on the connection states of isolated hidden neurons.
@@ -186,7 +197,7 @@ class NeuralMCTS(MCTS):
     
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
                temperature: float = 1.0) -> NeuralMCTSNode:
-        """Run neural-guided MCTS search"""
+        """Run neural-guided MCTS search with evolutionary cycle tracking and early stopping"""
         root = NeuralMCTSNode(initial_architecture)
 
         # Get neural network predictions for root (skip in supervised stage for speed)
@@ -203,6 +214,10 @@ class NeuralMCTS(MCTS):
                 graph_data = self._prepare_graph_data(initial_architecture)
                 policy_value = self.policy_value_net(graph_data)
                 root.policy_value = policy_value
+
+        # Early stopping tracking
+        best_values = []
+        no_improvement_count = 0
 
         # Use the centralized evaluator
         print("Starting MCTS search...")
@@ -225,15 +240,41 @@ class NeuralMCTS(MCTS):
                     value = self._simulate(node)
 
             self._backpropagate(node, value)
-            if (i + 1) % max(1, iterations // 10) == 0:
-                print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {root.value/root.visits:.4f}")
 
-        best_child = root.best_child(0)  # Greedy best child
-        # Return best action from root
+            # Early stopping check
+            current_best = root.value / root.visits if root.visits > 0 else 0.0
+            best_values.append(current_best)
+
+            # Check for improvement over the last patience iterations
+            if len(best_values) >= self.early_stopping_patience:
+                recent_best = max(best_values[-self.early_stopping_patience:])
+                oldest_recent = min(best_values[-self.early_stopping_patience:])
+                improvement = recent_best - oldest_recent
+
+                if improvement < self.early_stopping_min_delta:
+                    no_improvement_count += 1
+                else:
+                    no_improvement_count = 0
+
+                # Early stopping condition
+                if no_improvement_count >= self.early_stopping_patience:
+                    print(f"Early stopping at iteration {i + 1}: no significant improvement in last {self.early_stopping_patience} iterations")
+                    break
+
+            if (i + 1) % max(1, iterations // 10) == 0:
+                print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {current_best:.4f}")
+
         # Select final action using temperature (visit-count based) to allow stochasticity
         final_node = self._select_final_action(root, temperature)
         if final_node and final_node.action:
-            action_str = f"{best_child.action.action_type.name}"
+            # Update evolutionary cycle with final node's value
+            final_value = final_node.value / final_node.visits
+            self.current_cycle.add_evaluation(final_value)
+
+            # Reset cycle if structural change
+            if final_node.action.action_type in [ActionType.ADD_NEURON, ActionType.REMOVE_NEURON]:
+                self.current_cycle.reset()
+
             action_str = f"{final_node.action.action_type.name}"
             if final_node.action.source_neuron is not None:
                 action_str += f"({final_node.action.source_neuron}"
@@ -287,12 +328,28 @@ class NeuralMCTS(MCTS):
                 graph_data = self._prepare_graph_data(node.architecture)
                 node.policy_value = self.policy_value_net(graph_data)
 
-        # Use action manager to get valid actions
+        # Use action manager to get valid actions with evolutionary cycle context
         action_manager = ActionManager(action_space=self.action_space)
 
-        action = action_manager.select_action(
-            node.policy_value, node.architecture, exploration=True, use_policy=use_policy
+        # Get valid actions with cycle-aware prioritization
+        valid_actions = self.action_space.get_valid_actions(
+            node.architecture, current_step=0, evolutionary_cycle=self.current_cycle
         )
+
+        if not valid_actions:
+            return node  # No valid actions available
+
+        if use_policy and node.policy_value is not None:
+            # Use policy network to select from valid actions
+            action = action_manager.select_action(
+                node.policy_value, node.architecture, exploration=True, use_policy=True
+            )
+            # Filter to only valid actions if needed
+            if action not in valid_actions:
+                action = np.random.choice(valid_actions)
+        else:
+            # Random selection from valid actions
+            action = np.random.choice(valid_actions)
 
         # Apply action to create new architecture
         new_architecture = node._copy_architecture()
@@ -390,11 +447,42 @@ class NeuralMCTS(MCTS):
         return prior_prob
 
     def _simulate(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
-        """Simulate from a node using random actions and evaluate with the policy-value net.
+        """Simulate from a node using parallel random rollouts and evaluate with the policy-value net.
 
-        Overrides the base MCTS._simulate which expects an external evaluation function.
-        This version performs random rollouts on the architecture and uses the
-        neural network to estimate the final state's value.
+        Uses multiple processes to run parallel rollouts for better exploration.
+        """
+        if self.parallel_workers <= 1:
+            # Fallback to single rollout if parallel disabled
+            return self._single_rollout(node, max_depth)
+
+        # Run multiple parallel rollouts
+        rollout_values = []
+        with ProcessPoolExecutor(max_workers=self.parallel_workers) as executor:
+            # Convert architecture to serializable dict using the new method
+            arch_data = node.architecture.to_serializable_dict()
+
+            # Submit parallel rollout tasks - pass only serializable data
+            futures = [executor.submit(self._single_rollout_process, arch_data, max_depth,
+                                     self.reward_loss_weight, self.iso_weight, self.comp_weight)
+                      for _ in range(self.parallel_workers)]
+
+            # Collect results
+            for future in futures:
+                try:
+                    value = future.result(timeout=30)  # 30 second timeout per rollout
+                    rollout_values.append(value)
+                except Exception as e:
+                    print(f"Rollout failed: {e}")
+                    traceback.print_exc()
+                    rollout_values.append(0.0)  # Default value for failed rollouts
+
+        # Return average of parallel rollouts
+        return np.mean(rollout_values) if rollout_values else 0.0
+
+    def _single_rollout(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
+        """Single rollout simulation from a node using random actions.
+
+        This is the core rollout logic that can be parallelized.
         """
         # Copy architecture for simulation
         current_arch = node._copy_architecture()
@@ -443,3 +531,67 @@ class NeuralMCTS(MCTS):
                 value = policy_value['value'].item()
 
         return value
+
+    @staticmethod
+    def _single_rollout_process(architecture_data: dict, max_depth: int, reward_loss_weight: float,
+                               iso_weight: float, comp_weight: float) -> float:
+        """Static method for parallel rollout execution - uses serializable dict data"""
+        try:
+            # Import here to avoid circular imports in multiprocessing
+            from blueprint_modules.action import ActionSpace
+            from blueprint_modules.network import NeuralArchitecture, NeuronType, ActivationType
+
+            # Create a fresh action space for this process
+            action_space = ActionSpace()
+
+            # Reconstruct architecture from serializable data
+            current_arch = NeuralArchitecture()
+            current_arch.neurons = {}
+            current_arch.connections = []
+            current_arch.next_neuron_id = architecture_data['next_neuron_id']
+
+            # Reconstruct neurons
+            for neuron_data in architecture_data['neurons']:
+                neuron = type('Neuron', (), neuron_data)()
+                current_arch.neurons[neuron.id] = neuron
+
+            # Reconstruct connections
+            for conn_data in architecture_data['connections']:
+                conn = type('Connection', (), conn_data)()
+                current_arch.connections.append(conn)
+
+            # Perform rollout
+            for _ in range(max_depth):
+                valid_actions = action_space.get_valid_actions(current_arch)
+                if not valid_actions:
+                    break
+
+                # Randomly choose an action and apply
+                action = np.random.choice(valid_actions)
+                action_space.apply_action(current_arch, action)
+
+            # Simple evaluation - use architecture properties as proxy
+            # This avoids needing to pickle complex objects like trainers and networks
+            connected_frac = current_arch.connected_fraction()
+            num_neurons = current_arch.num_neurons()
+            num_connections = current_arch.num_connections()
+
+            # Size penalty (balance complexity)
+            size_score = 1.0 / (1.0 + 0.01 * num_neurons)
+
+            # Layer diversity bonus
+            layer_positions = set(n.layer_position for n in current_arch.neurons.values())
+            layer_bonus = min(1.0, len(layer_positions) / 5.0)
+
+            # Combine scores
+            proxy_score = 0.4 * connected_frac + 0.3 * size_score + 0.3 * layer_bonus
+
+            # Add small random noise
+            import random
+            noise = random.uniform(-0.05, 0.05)
+
+            return max(0.0, min(1.0, proxy_score + noise))
+
+        except Exception as e:
+            # Return default value on any error
+            return 0.0

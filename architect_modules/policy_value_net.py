@@ -185,8 +185,7 @@ class ActionManager:
             if valid_actions:
                 return np.random.choice(valid_actions)
             else:
-                # Fallback to a default action if no valid actions
-                return Action(action_type=ActionType.ADD_CONNECTION, source_neuron=0, target_neuron=1)
+                raise ValueError("No valid actions available in the current architecture")
 
         masks = self.get_action_masks(architecture)
 

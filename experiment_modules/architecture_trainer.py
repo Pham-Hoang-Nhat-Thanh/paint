@@ -57,9 +57,10 @@ class ArchitectureTrainer:
             exploration_boost=config.search.action_exploration_boost
         )
         self.quick_trainer = QuickTrainer(
-            train_loader, test_loader, 
+            train_loader, test_loader,
             device=self.device,
-            max_epochs=config.search.quick_train_epochs
+            max_epochs=config.search.quick_train_epochs,
+            use_mixed_precision=config.use_mixed_precision,
         )
 
         # Training infrastructure
@@ -76,7 +77,10 @@ class ArchitectureTrainer:
             exploration_weight=config.mcts.exploration_weight,
             curriculum=self.curriculum,
             quick_trainer=self.quick_trainer,
-            reward_loss_weight=config.search.reward_loss_weight
+            reward_loss_weight=config.search.reward_loss_weight,
+            parallel_workers=config.max_parallel_workers if config.parallel_evaluation else 1,
+            early_stopping_patience=config.early_stopping_patience,
+            early_stopping_min_delta=config.early_stopping_min_delta
         )
         
         self.experience_buffer = ExperienceReplay(
