@@ -1,9 +1,8 @@
 import torch
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Optional
 from dataclasses import dataclass
 from enum import Enum
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.amp import autocast
 
 class NeuronType(Enum):
@@ -74,7 +73,7 @@ class NeuralArchitecture:
         random.seed(42)
         input_ids = list(range(784))
         for output_id in range(784, 794):
-            num_connections = max(1, 784 // 10)
+            num_connections = max(1, 784 // 10 // 4)  # Average ~19 connections per output
             selected_inputs = random.sample(input_ids, num_connections)
             for input_id in selected_inputs:
                 weight = random.uniform(-0.1, 0.1)
@@ -306,6 +305,12 @@ class GraphNeuralNetwork(nn.Module):
     
     def _build_optimized_network(self):
         """Build optimized network structure with batched operations"""
+        # Clear old parameter dictionaries to ensure clean rebuild
+        self.weight_matrices = nn.ParameterDict()
+        self.bias_vectors = nn.ParameterDict()
+        self.weight_masks = {}  # Store masks as regular dict (not parameters)
+        self.activation_modules = nn.ModuleDict()
+
         # Group neurons by layer position with tolerance
         self.layer_groups = self._group_neurons_by_layer()
         self.layer_positions = sorted(self.layer_groups.keys())
@@ -381,9 +386,6 @@ class GraphNeuralNetwork(nn.Module):
     
     def _build_efficient_parameters(self):
         """Build efficient parameter tensors without breaking gradients"""
-        self.weight_matrices = nn.ParameterDict()
-        self.bias_vectors = nn.ParameterDict()
-        
         # Build weight matrices for connected layers
         for (src_layer, tgt_layer), connections in self.layer_connectivity.items():
             if not connections:
@@ -395,20 +397,29 @@ class GraphNeuralNetwork(nn.Module):
             # Create mapping from neuron ID to index within layer
             src_id_to_idx = {nid: idx for idx, nid in enumerate(src_neurons)}
             tgt_id_to_idx = {nid: idx for idx, nid in enumerate(tgt_neurons)}
-            
-            # Initialize weight matrix with small random values
-            weight_matrix = torch.randn(len(tgt_neurons), len(src_neurons)) * 0.01
-            
-            # Fill weight matrix with actual connection weights
+
+            # Initialize weight matrix with zeros (truly sparse)
+            weight_matrix = torch.zeros(len(tgt_neurons), len(src_neurons))
+            # Initialize mask matrix with zeros
+            mask_matrix = torch.zeros(len(tgt_neurons), len(src_neurons), dtype=torch.bool)
+
+            # Fill weight matrix and mask with actual connection weights
             for src_id, tgt_id, weight in connections:
                 if src_id in src_id_to_idx and tgt_id in tgt_id_to_idx:
                     src_idx = src_id_to_idx[src_id]
                     tgt_idx = tgt_id_to_idx[tgt_id]
                     weight_matrix[tgt_idx, src_idx] = weight
-            
-            # Store as parameter
+                    mask_matrix[tgt_idx, src_idx] = True
+
+            # Store as parameter and mask
             key = f"weights_{src_layer}_{tgt_layer}"
-            self.weight_matrices[key] = nn.Parameter(weight_matrix.to(self.device))
+            param = nn.Parameter(weight_matrix.to(self.device))
+            # Register hook to freeze irrelevant weights (zero gradients for non-connected positions)
+            def mask_hook(grad, mask=mask_matrix.to(self.device)):
+                return grad * mask.float()
+            param.register_hook(mask_hook)
+            self.weight_matrices[key] = param
+            self.weight_masks[key] = mask_matrix.to(self.device)
 
         # Build bias vectors for each layer
         for layer_idx, neuron_ids in self.layer_indices.items():
@@ -496,15 +507,20 @@ class GraphNeuralNetwork(nn.Module):
                 if weight_key in self.weight_matrices:
                     prev_output = layer_outputs[prev_layer_idx]
                     weight_matrix = self.weight_matrices[weight_key]
+                    mask = self.weight_masks[weight_key]
+
+                    # Apply mask to weight matrix (zero out non-connected weights, freezing them during training)
+                    masked_weight_matrix = weight_matrix * mask.float()
 
                     # Use autocast for mixed precision if enabled
                     if use_mixed_precision:
                         with autocast('cuda'):
                             # Batched matrix multiplication (gradient-safe)
-                            layer_input = torch.matmul(prev_output, weight_matrix.t())
+                            layer_input = torch.matmul(prev_output, masked_weight_matrix.t())
                     else:
                         # Batched matrix multiplication (gradient-safe)
-                        layer_input = torch.matmul(prev_output, weight_matrix.t())
+                        layer_input = torch.matmul(prev_output, masked_weight_matrix.t())
+
                     if current_output is None:
                         current_output = layer_input
                     else:
@@ -572,3 +588,41 @@ class GraphNeuralNetwork(nn.Module):
             return self._jit_compiled(x)
         else:
             return self.forward(x)
+
+    def update_architecture(self, new_architecture: NeuralArchitecture):
+        """Rebuild the network structure for a modified architecture"""
+        # Save current learned parameters to preserve training progress
+        old_weight_matrices = dict(self.weight_matrices)
+        old_bias_vectors = dict(self.bias_vectors)
+        old_weight_masks = dict(self.weight_masks)
+
+        self.architecture = new_architecture
+        # Clear any cached JIT compilation to prevent OOM from accumulated compiled models
+        if hasattr(self, '_jit_compiled'):
+            self._jit_compiled = None
+            # Force garbage collection to free memory immediately
+            import gc
+            gc.collect()
+
+        # Rebuild the entire network structure
+        self._build_optimized_network()
+
+        # Copy back learned weights for existing parameter keys to preserve training
+        for key, new_matrix in self.weight_matrices.items():
+            if key in old_weight_matrices:
+                old_matrix = old_weight_matrices[key]
+                old_mask = old_weight_masks[key]
+                new_mask = self.weight_masks[key]
+
+                # Only copy weights if shapes match (architecture changes may alter matrix sizes)
+                if old_matrix.shape == new_matrix.shape:
+                    # Only copy weights where both old and new masks allow connections
+                    combined_mask = old_mask & new_mask
+                    new_matrix.data[combined_mask] = old_matrix.data[combined_mask]
+
+        for key, new_bias in self.bias_vectors.items():
+            if key in old_bias_vectors:
+                old_bias = old_bias_vectors[key]
+                # Copy overlapping elements from old learned biases
+                min_len = min(len(old_bias), len(new_bias))
+                new_bias.data[:min_len] = old_bias.data[:min_len]

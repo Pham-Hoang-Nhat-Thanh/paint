@@ -7,8 +7,8 @@ class ModelConfig:
     """Configuration for the Graph Transformer and Policy-Value Network"""
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
-    hidden_dim: int = 128
-    num_heads: int = 8
+    hidden_dim: int = 64
+    num_heads: int = 4
     num_layers: int = 3
     dropout: float = 0.1
     use_edge_features: bool = True
@@ -20,16 +20,16 @@ class ModelConfig:
     
     # Shared Backbone
     backbone_hidden_dims: List[int] = None
-    
+
     def __post_init__(self):
         if self.backbone_hidden_dims is None:
-            self.backbone_hidden_dims = [256, 128]
+            self.backbone_hidden_dims = [128, 64]
 
 @dataclass
 class MCTSConfig:
     """Configuration for Neural MCTS"""
     # Search parameters
-    num_simulations: int = 100
+    num_simulations: int = 50
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -47,7 +47,7 @@ class MCTSConfig:
 class TrainingStageConfig:
     """Base configuration for each training stage"""
     # Training parameters
-    batch_size: int = 64
+    batch_size: int = 32
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
@@ -130,7 +130,7 @@ class ArchitectureSearchConfig:
     # Evaluation
     quick_train_epochs: int = 1
     final_train_epochs: int = 10
-    evaluation_batch_size: int = 32  # Reduced for faster evaluation
+    evaluation_batch_size: int = 16  # Reduced for faster evaluation
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -173,15 +173,18 @@ class OverallConfig:
     search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
     
     # System
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    device: str = "auto"  # "auto", "cpu", or "cuda:X" where X is GPU index
+    gpu_memory_fraction: float = 0.9  # Fraction of GPU memory to use (0.1-1.0)
+    enable_memory_monitoring: bool = True
+    memory_check_threshold_mb: float = 500  # Minimum free memory threshold in MB
     seed: int = 42
     log_dir: str = "logs/"
     checkpoint_dir: str = "checkpoints/"
     
     # Monitoring
     eval_interval: int = 10
-    checkpoint_interval: int = 50
-    log_interval: int = 5
+    checkpoint_interval: int = 1
+    log_interval: int = 2
     # Global training interval (how often to run training steps across episodes)
     train_interval: int = 1
 

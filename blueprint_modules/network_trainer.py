@@ -6,7 +6,7 @@ import traceback
 
 class QuickTrainer:
     """Proper training and evaluation using the graph-based networks"""
-    
+
     def __init__(self, train_loader, test_loader, device='cpu', max_epochs=5, use_mixed_precision=False):
         self.train_loader = train_loader
         self.test_loader = test_loader
@@ -20,6 +20,9 @@ class QuickTrainer:
             self.scaler = GradScaler('cuda')
         else:
             self.scaler = None
+
+        # Initialize model as None - will be set when architecture is provided
+        self.model = None
     
     def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
         """Train the graph-based network and return (final_accuracy, last_epoch_avg_loss)
@@ -29,9 +32,9 @@ class QuickTrainer:
         """
         try:
             # Convert architecture to executable model
-            model = GraphNeuralNetwork(architecture)
-            model.to(self.device)
-            
+            self.update_architecture(architecture)
+            model = self.model
+
             # Setup training
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
             criterion = nn.CrossEntropyLoss()
@@ -110,6 +113,13 @@ class QuickTrainer:
 
         avg_loss = loss / len(self.test_loader) if len(self.test_loader) > 0 else 0.0
         return (correct / total if total > 0 else 0.0), avg_loss
+
+    def update_architecture(self, architecture: NeuralArchitecture):
+        """Update the model with a new architecture"""
+        if self.model is None:
+            self.model = GraphNeuralNetwork(architecture, device=self.device)
+        else:
+            self.model.update_architecture(architecture)
 
     def architecture_to_pytorch(self, architecture: NeuralArchitecture) -> GraphNeuralNetwork:
         """Convert architecture to executable PyTorch model"""

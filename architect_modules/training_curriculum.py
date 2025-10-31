@@ -173,7 +173,7 @@ class PolicyValueLoss(nn.Module):
         # Value loss
         value_loss = F.mse_loss(
             predictions['value'].squeeze(),
-            targets['value']
+            targets['value'].squeeze()
         )
         total_loss += self.value_weight * value_loss
 

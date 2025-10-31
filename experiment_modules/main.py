@@ -59,22 +59,69 @@ def load_mnist_data(batch_size=64):
     _data_cache[cache_key] = (train_loader, test_loader)
     return train_loader, test_loader
 
+def find_latest_checkpoint(checkpoint_dir: str) -> str:
+    """Find the latest checkpoint file in the checkpoint directory"""
+    if not os.path.exists(checkpoint_dir):
+        return None
+
+    checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_ep') and f.endswith('.pth')]
+    if not checkpoint_files:
+        return None
+
+    # Extract episode numbers and find the latest
+    episodes = []
+    for f in checkpoint_files:
+        try:
+            ep_str = f.split('checkpoint_ep')[1].split('.pth')[0]
+            episodes.append((int(ep_str), f))
+        except (ValueError, IndexError):
+            continue
+
+    if not episodes:
+        return None
+
+    latest_episode, latest_file = max(episodes, key=lambda x: x[0])
+    return os.path.join(checkpoint_dir, latest_file)
+
 def main():
     # Load configuration
     config = OverallConfig()
-    
+
+    # Manual GPU selection - set to specific GPU (change this number as needed)
+    gpu_id = 2  # Change this to select different GPU (0, 1, 2, etc.)
+    if torch.cuda.is_available() and gpu_id < torch.cuda.device_count():
+        config.device = f"cuda:{gpu_id}"
+        torch.cuda.set_device(gpu_id)
+        print(f"Manually selected GPU {gpu_id}: {torch.cuda.get_device_name(gpu_id)}")
+    else:
+        config.device = "cpu"
+        print("CUDA not available or invalid GPU ID, using CPU")
+
     # Load data
     print("Loading MNIST data...")
     train_loader, test_loader = load_mnist_data(
         batch_size=config.search.evaluation_batch_size
     )
-    
+
     # Create trainer
     trainer = ArchitectureTrainer(config, train_loader, test_loader)
-    
+
+    # Check for existing checkpoints and resume if available
+    latest_checkpoint = find_latest_checkpoint(config.checkpoint_dir)
+    if latest_checkpoint:
+        print(f"Found existing checkpoint: {latest_checkpoint}")
+        try:
+            trainer.load_checkpoint(latest_checkpoint)
+            print(f"Resumed training from episode {trainer.episode}")
+        except Exception as e:
+            print(f"Failed to load checkpoint {latest_checkpoint}: {e}")
+            print("Starting training from scratch...")
+    else:
+        print("No existing checkpoints found. Starting training from scratch...")
+
     # Run training
     history = trainer.run_training()
-    
+
     # Print final results
     best_episode = max(history, key=lambda x: x['final_accuracy'])
     print(f"\nTraining completed!")

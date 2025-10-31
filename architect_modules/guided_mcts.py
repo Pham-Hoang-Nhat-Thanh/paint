@@ -1,5 +1,5 @@
 from blueprint_modules.mcts import MCTS, MCTSNode
-from blueprint_modules.network import NeuralArchitecture, ActivationType, NeuronType
+from blueprint_modules.network import NeuralArchitecture, ActivationType, NeuronType, Neuron, Connection
 from blueprint_modules.action import Action, ActionSpace, ActionType
 from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
@@ -92,21 +92,7 @@ class NeuralMCTS(MCTS):
         # Evolutionary cycle tracking
         self.current_cycle = EvolutionaryCycle()
 
-    def _compute_isolation_cache_key(self, architecture: NeuralArchitecture) -> frozenset:
-        """Compute a cache key based on the connection states of isolated hidden neurons.
-
-        The key is a frozenset of (has_inward, has_outward) tuples for each isolated hidden neuron.
-        Isolated neurons are HIDDEN neurons lacking either inward or outward connections, or both.
-        """
-        isolated_states = []
-        for neuron_id, neuron in architecture.neurons.items():
-            if neuron.neuron_type == NeuronType.HIDDEN:
-                has_in = any(conn.target_neuron == neuron_id for conn in architecture.connections.values())
-                has_out = any(conn.source_neuron == neuron_id for conn in architecture.connections.values())
-                if not has_in or not has_out:
-                    isolated_states.append((has_in, has_out))
-        return frozenset(isolated_states)
-        
+  
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
         """Convert architecture to graph data for neural network"""
         graph_data = architecture.to_graph_representation()
@@ -134,6 +120,8 @@ class NeuralMCTS(MCTS):
             return np.random.uniform(0.0, 0.5)
 
         try:
+            # Update the quick trainer's model with the new architecture
+            self.quick_trainer.update_architecture(architecture)
             accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
         except Exception:
             return np.random.uniform(0.0, 0.5)
@@ -167,10 +155,6 @@ class NeuralMCTS(MCTS):
         This is the shared evaluator used by both `search` and `search_with_beam` so logic is
         consistent and centralized.
         """
-        # Use cache to avoid redundant evaluations for architectures with identical isolated neuron states
-        cache_key = self._compute_isolation_cache_key(node.architecture)
-        if cache_key and cache_key in self.evaluation_cache:
-            return self.evaluation_cache[cache_key]
 
         # Determine stage
         if self.curriculum:
@@ -188,10 +172,6 @@ class NeuralMCTS(MCTS):
                     graph_data = self._prepare_graph_data(node.architecture)
                     node.policy_value = self.policy_value_net(graph_data)
             value = node.policy_value['value'].item()
-
-        # Cache the value only if there are isolated neurons
-        if cache_key:
-            self.evaluation_cache[cache_key] = value
 
         return value
     
@@ -552,12 +532,23 @@ class NeuralMCTS(MCTS):
 
             # Reconstruct neurons
             for neuron_data in architecture_data['neurons']:
-                neuron = type('Neuron', (), neuron_data)()
+                neuron = Neuron(
+                    id=neuron_data['id'],
+                    neuron_type=NeuronType(neuron_data['neuron_type']),
+                    activation=ActivationType(neuron_data['activation']),
+                    layer_position=neuron_data['layer_position'],
+                    bias=neuron_data['bias']
+                )
                 current_arch.neurons[neuron.id] = neuron
 
             # Reconstruct connections
             for conn_data in architecture_data['connections']:
-                conn = type('Connection', (), conn_data)()
+                conn = Connection(
+                    source_id=conn_data['source_id'],
+                    target_id=conn_data['target_id'],
+                    weight=conn_data['weight'],
+                    enabled=conn_data['enabled']
+                )
                 current_arch.connections.append(conn)
 
             # Perform rollout

@@ -11,6 +11,8 @@ import logging
 import traceback
 import networkx as nx
 import matplotlib.pyplot as plt
+from blueprint_modules.network import Neuron, Connection
+from blueprint_modules.network import ActivationType
 
 # Enable TF32 for faster matrix multiplications on Ampere+ GPUs
 if torch.cuda.is_available():
@@ -165,6 +167,9 @@ class ArchitectureTrainer:
             if new_arch is None:
                 break
 
+            # Update the quick trainer's model with the new architecture
+            self.quick_trainer.update_architecture(new_arch)
+
             # Draw architecture diagram after action
             self._draw_architecture_diagram(new_arch, step)
             reward = self._evaluate_architecture(new_arch)
@@ -227,23 +232,23 @@ class ArchitectureTrainer:
         
         # Copy neurons
         for neuron_id, neuron in architecture.neurons.items():
-            new_arch.neurons[neuron_id] = type('Neuron', (), {
-                'id': neuron.id,
-                'neuron_type': neuron.neuron_type,
-                'activation': neuron.activation,
-                'layer_position': neuron.layer_position,
-                'bias': neuron.bias
-            })()
+            new_arch.neurons[neuron_id] = Neuron(
+                id=neuron.id,
+                neuron_type=neuron.neuron_type,
+                activation=neuron.activation,
+                layer_position=neuron.layer_position,
+                bias=neuron.bias
+            )
             new_arch.next_neuron_id = max(new_arch.next_neuron_id, neuron_id + 1)
-        
+
         # Copy connections
         for conn in architecture.connections:
-            new_arch.connections.append(type('Connection', (), {
-                'source_id': conn.source_id,
-                'target_id': conn.target_id,
-                'weight': conn.weight,
-                'enabled': conn.enabled
-            })())
+            new_arch.connections.append(Connection(
+                source_id=conn.source_id,
+                target_id=conn.target_id,
+                weight=conn.weight,
+                enabled=conn.enabled
+            ))
         
         new_arch.performance_metrics = architecture.performance_metrics.copy()
         
@@ -390,7 +395,7 @@ class ArchitectureTrainer:
                 policy_loss += F.cross_entropy(individual_predictions['action_type'], 
                                              individual_targets['action_type'])
                 value_loss += F.mse_loss(individual_predictions['value'].squeeze(),
-                                       individual_targets['value'])
+                                       individual_targets['value'].squeeze())
         
         # Backward pass
         self.optimizer.zero_grad()
@@ -419,20 +424,21 @@ class ArchitectureTrainer:
     def _create_targets(self, experience: Dict) -> Dict:
         """Create training targets from experience"""
         action = experience['action']
-        
+
         targets = {
-            'action_type': torch.tensor([action.action_type.value]),
-            'value': torch.tensor([experience['reward']])
+            'action_type': torch.tensor([action.action_type.value]).to(self.device),
+            'value': torch.tensor([experience['reward']]).to(self.device)
         }
-        
+
         # Add optional targets
         if action.source_neuron is not None:
-            targets['source_neuron'] = torch.tensor([action.source_neuron])
+            targets['source_neuron'] = torch.tensor([action.source_neuron]).to(self.device)
         if action.target_neuron is not None:
-            targets['target_neuron'] = torch.tensor([action.target_neuron])
+            targets['target_neuron'] = torch.tensor([action.target_neuron]).to(self.device)
         if action.activation is not None:
-            targets['activation'] = torch.tensor([action.activation.value])
-        
+            activation_idx = list(ActivationType).index(action.activation)
+            targets['activation'] = torch.tensor([activation_idx]).to(self.device)
+
         return targets
     
     def run_training(self):
@@ -464,23 +470,23 @@ class ArchitectureTrainer:
             except Exception as e:
                 print(f"Immediate log/checkpoint failed: {e}")
                 traceback.print_exc()
-            
+
+            # Checkpoint if needed (before updating episode counter)
+            if self.curriculum.should_checkpoint(self.config.checkpoint_interval):
+                self._save_checkpoint()
+
             # Update curriculum
             self.curriculum.step()
             self.episode += 1
-            
+
             # Update learning rate
             new_lr = self.curriculum.get_learning_rate()
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = new_lr
-            
+
             # Log progress
             self.training_history.append(episode_metrics)
             self._log_episode(episode_metrics)
-            
-            # Checkpoint if needed
-            if self.curriculum.should_checkpoint(self.config.checkpoint_interval):
-                self._save_checkpoint()
             
             # Early stopping if we found a good architecture
             if episode_metrics['final_accuracy'] >= self.config.search.target_accuracy:
@@ -523,27 +529,29 @@ class ArchitectureTrainer:
             'curriculum_state': self.curriculum.get_state(),
             'best_accuracy': self.best_accuracy,
             'training_history': self.training_history,
+            'experience_buffer': self.experience_buffer,
             'config': self.config
         }
-        
+
         filename = f"checkpoint_ep{self.episode}.pth"
         filepath = os.path.join(self.config.checkpoint_dir, filename)
         torch.save(checkpoint, filepath)
-        
+
         print(f"Checkpoint saved: {filepath}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load training checkpoint"""
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        
+        checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
+
         self.policy_value_net.load_state_dict(checkpoint['policy_value_net_state'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
         self.curriculum.set_state(checkpoint['curriculum_state'])
         self.best_accuracy = checkpoint['best_accuracy']
         self.training_history = checkpoint['training_history']
-        self.episode = checkpoint['episode']
-        
-        print(f"Checkpoint loaded from episode {self.episode}")
+        self.experience_buffer = checkpoint['experience_buffer']
+        self.episode = checkpoint['episode'] + 1  # Start next episode
+
+        print(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
 
     def _draw_architecture_diagram(self, architecture: NeuralArchitecture, step: int):
         """Draw a diagram of the neural architecture after an action"""
@@ -619,9 +627,9 @@ class ArchitectureTrainer:
             plt.tight_layout()
 
             # Save the diagram
-            os.makedirs('architecture_diagrams', exist_ok=True)
-            filename = f'architecture_diagrams/ep{self.episode:03d}_step{step:02d}.png'
-            plt.savefig(filename, dpi=150, bbox_inches='tight')
+            os.makedirs(f'architecture_diagrams/ep{self.episode:03d}', exist_ok=True)
+            filename = f'architecture_diagrams/ep{self.episode:03d}/step{step:02d}.jpg'
+            plt.savefig(filename, dpi=100, bbox_inches='tight', format='jpg')
             plt.close()
 
             print(f"      Architecture diagram saved: {filename}")
