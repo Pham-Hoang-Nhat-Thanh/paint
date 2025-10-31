@@ -130,4 +130,8 @@ def main():
           f"{best_episode['total_connections']} connections")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nTraining interrupted by user. Exiting...")
+        exit(0)

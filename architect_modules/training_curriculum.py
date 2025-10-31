@@ -23,8 +23,8 @@ class TrainingCurriculum:
         self.episode_count = 0
         
         # Stage boundaries
-        self.supervised_episodes = 50
-        self.mixed_episodes = 150
+        self.supervised_episodes = total_episodes // 10
+        self.mixed_episodes = self.supervised_episodes * 3
         self.self_play_episodes = total_episodes
         
         # Current state

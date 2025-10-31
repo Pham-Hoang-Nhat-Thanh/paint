@@ -79,7 +79,7 @@ class SupervisedConfig(TrainingStageConfig):
 @dataclass
 class MixedConfig(TrainingStageConfig):
     """Configuration for mixed exploration stage"""
-    num_episodes: int = 100
+    num_episodes: int = 150
     learning_rate: float = 5e-4
     
     # Policy vs MCTS mixing
