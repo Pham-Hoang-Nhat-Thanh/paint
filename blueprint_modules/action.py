@@ -2,6 +2,7 @@ from enum import Enum
 from typing import List, Dict, Optional, TYPE_CHECKING
 import numpy as np
 from dataclasses import dataclass
+import traceback
 from .network import NeuralArchitecture, NeuronType, ActivationType, Neuron
 
 if TYPE_CHECKING:
@@ -25,6 +26,19 @@ class Action:
     def __post_init__(self):
         if self.parameters is None:
             self.parameters = {}
+    
+    def __eq__(self, other):
+        """Two actions are equal if all their fields match"""
+        if not isinstance(other, Action):
+            return False
+        return (self.action_type == other.action_type and
+                self.source_neuron == other.source_neuron and
+                self.target_neuron == other.target_neuron and
+                self.activation == other.activation)
+    
+    def __hash__(self):
+        """Make Action hashable so it can be used in sets and as dict keys"""
+        return hash((self.action_type, self.source_neuron, self.target_neuron, self.activation))
 
 class ActionSpace:
     """Manages valid actions for a given neural architecture"""
@@ -90,6 +104,7 @@ class ActionSpace:
                 
         except Exception as e:
             print(f"Error applying action {action}: {e}")
+            traceback.print_exc()
             return False
 
         return False

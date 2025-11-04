@@ -73,7 +73,7 @@ class NeuralArchitecture:
         random.seed(42)
         input_ids = list(range(784))
         for output_id in range(784, 794):
-            num_connections = max(1, 784 // 10 // 4)  # Average ~19 connections per output
+            num_connections = 5  # Average of 5 connections per output neuron
             selected_inputs = random.sample(input_ids, num_connections)
             for input_id in selected_inputs:
                 weight = random.uniform(-0.1, 0.1)
@@ -125,6 +125,48 @@ class NeuralArchitecture:
             if not (conn.source_id == source_id and conn.target_id == target_id)
         ]
         return len(self.connections) < initial_count
+    
+    def compute_signature(self) -> str:
+        """Compute deterministic canonical signature of architecture for transposition detection.
+        
+        This signature is invariant to neuron ID renumbering but captures the graph structure,
+        neuron types, activations, and layer positions. Two architectures with the same
+        signature are considered identical states in MCTS.
+        
+        The signature format: <neuron_part>||<connection_part>
+        - neuron_part: sorted list of (type, activation, layer_pos) tuples
+        - connection_part: sorted list of (src_idx, tgt_idx) pairs where idx is position in sorted neuron list
+        """
+        # Sort neurons by (neuron_type, layer_position, activation) for canonical ordering
+        # This creates a deterministic mapping independent of neuron IDs
+        sorted_neurons = sorted(
+            self.neurons.items(),
+            key=lambda x: (x[1].neuron_type.value, x[1].layer_position, x[1].activation.value, x[0])
+        )
+        
+        # Build neuron signature and ID mapping
+        neuron_sig_parts = []
+        id_to_canonical_idx = {}
+        for canonical_idx, (neuron_id, neuron) in enumerate(sorted_neurons):
+            neuron_sig_parts.append(
+                f"{neuron.neuron_type.name}:{neuron.activation.name}:{neuron.layer_position:.4f}"
+            )
+            id_to_canonical_idx[neuron_id] = canonical_idx
+        
+        neuron_sig = "|".join(neuron_sig_parts)
+        
+        # Build connection signature using canonical indices
+        conn_sig_parts = []
+        for conn in sorted(self.connections, key=lambda c: (c.source_id, c.target_id)):
+            if conn.enabled:
+                src_idx = id_to_canonical_idx.get(conn.source_id)
+                tgt_idx = id_to_canonical_idx.get(conn.target_id)
+                if src_idx is not None and tgt_idx is not None:
+                    conn_sig_parts.append(f"{src_idx}->{tgt_idx}")
+        
+        conn_sig = ",".join(conn_sig_parts)
+        
+        return f"{neuron_sig}||{conn_sig}"
     
     def to_graph_representation(self) -> Dict:
         """Convert architecture to graph format for transformer"""

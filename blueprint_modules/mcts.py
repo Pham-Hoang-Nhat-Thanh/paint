@@ -120,8 +120,13 @@ class MCTS:
         return root.best_child(0)  # Return best child (exploitation only)
     
     def _select(self, node: MCTSNode) -> MCTSNode:
-        """Select a node to expand"""
-        while node.children:
+        """Select a node to expand using UCT.
+        
+        Traverse down the tree by selecting best children until we reach:
+        1. A node that is not fully expanded (still has untried actions), OR
+        2. A leaf node (no children)
+        """
+        while node.is_fully_expanded() and node.children:
             node = node.best_child(self.exploration_weight)
             
             # If node hasn't been evaluated, stop here

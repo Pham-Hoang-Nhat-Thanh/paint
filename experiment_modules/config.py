@@ -29,7 +29,7 @@ class ModelConfig:
 class MCTSConfig:
     """Configuration for Neural MCTS"""
     # Search parameters
-    num_simulations: int = 50
+    num_simulations: int = 200 # With earlier stopping, more simulations help compensate
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -40,7 +40,7 @@ class MCTSConfig:
     temperature_decay: float = 0.99
     
     # Rollout settings
-    rollout_depth: int = 10
+    rollout_depth: int = 20  # Increased for deeper rollouts
     use_value_network: bool = True
 
 @dataclass
@@ -125,12 +125,12 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 50
+    max_steps_per_episode: int = 100  # Increased for deeper guided MCTS iterations
 
     # Evaluation
-    quick_train_epochs: int = 1
+    quick_train_epochs: int = 0.1  # Reduced for faster evaluations
     final_train_epochs: int = 10
-    evaluation_batch_size: int = 16  # Reduced for faster evaluation
+    evaluation_batch_size: int = 32  # Increased for faster evaluation with larger batches
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -173,10 +173,11 @@ class OverallConfig:
     search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
     
     # System
-    device: str = "auto"  # "auto", "cpu", or "cuda:X" where X is GPU index
+    device: str = "cuda:1"  # Options: "auto" (picks GPU with most free memory), "cpu", or "cuda:X" (specific GPU)
+                             # Note: Environment variable GPU_ID=X overrides this setting
     gpu_memory_fraction: float = 0.9  # Fraction of GPU memory to use (0.1-1.0)
     enable_memory_monitoring: bool = True
-    memory_check_threshold_mb: float = 500  # Minimum free memory threshold in MB
+    memory_check_threshold_mb: float = 5000  # Minimum free memory threshold in MB
     seed: int = 42
     log_dir: str = "logs/"
     checkpoint_dir: str = "checkpoints/"
@@ -190,12 +191,8 @@ class OverallConfig:
 
     # GPU optimizations
     use_mixed_precision: bool = True
-    gradient_accumulation_steps: int = 2
+    gradient_accumulation_steps: int = 1  # Reduced for faster training
     enable_tf32: bool = True
-
-    # Parallel evaluation
-    parallel_evaluation: bool = True
-    max_parallel_workers: int = 4
 
     # Early stopping
     early_stopping_patience: int = 5

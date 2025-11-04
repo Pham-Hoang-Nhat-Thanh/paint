@@ -11,7 +11,6 @@ import numpy as np
 import traceback
 from concurrent.futures import ProcessPoolExecutor
 
-
 class NeuralMCTSNode(MCTSNode):
     """MCTS node enhanced with neural network predictions"""
 
@@ -21,6 +20,27 @@ class NeuralMCTSNode(MCTSNode):
         self.policy_value = policy_value  # Neural network predictions
         self.prior_prob = 0.0  # Prior probability from policy network
         self.curriculum = curriculum
+        # Cache valid actions for this node to check if fully expanded
+        self._valid_actions_cache = None
+    
+    def is_fully_expanded(self) -> bool:
+        """Check if all valid actions have been expanded as children.
+        
+        Since NeuralMCTS doesn't use untried_actions list, we need to compare
+        the expanded actions (children) with all valid actions for this state.
+        """
+        # Get all valid actions for this node (cache it to avoid recomputation)
+        if self._valid_actions_cache is None:
+            # Import here to avoid circular dependency
+            from blueprint_modules.action import ActionSpace
+            # We'll need the action_space from the parent MCTS instance
+            # For now, return False to indicate not fully expanded if we can't check
+            # The MCTS search method will set this properly
+            return False
+        
+        # Check if all valid actions have corresponding children
+        expanded_actions = {child.action for child in self.children if child.action is not None}
+        return len(expanded_actions) >= len(self._valid_actions_cache)
     
     def best_child(self, exploration_weight: float = 1.0) -> 'NeuralMCTSNode':
         """Select best child using PUCT formula (AlphaZero style)"""
@@ -43,36 +63,12 @@ class NeuralMCTSNode(MCTSNode):
 
         return max(self.children, key=puct_score)
 
-    def top_k_children(self, k: int, exploration_weight: float = 1.0) -> List['NeuralMCTSNode']:
-        """Select top-k children using PUCT formula (AlphaZero style)"""
-        if not self.children:
-            return []
-
-        def puct_score(child: 'NeuralMCTSNode') -> float:
-            if child.visits == 0:
-                return float('inf')
-
-            # PUCT formula: Q + U
-            # Q: exploitation term (average value)
-            q_value = child.value / child.visits
-
-            # U: exploration term
-            u_value = exploration_weight * child.prior_prob * \
-                     math.sqrt(self.visits) / (1 + child.visits)
-
-            return q_value + u_value
-
-        # Sort children by PUCT score in descending order and return top-k
-        sorted_children = sorted(self.children, key=puct_score, reverse=True)
-        return sorted_children[:k]
-
 class NeuralMCTS(MCTS):
     """MCTS enhanced with neural network guidance"""
 
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
                  device: str = 'cpu', exploration_weight: float = 1.0, curriculum=None, quick_trainer=None, reward_loss_weight=0.01,
-                 iso_weight: float = 0.01, comp_weight: float = 0.0, parallel_workers: int = 4,
-                 early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001):
+                 iso_weight: float = 0.01, comp_weight: float = 0.0, early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001):
         super().__init__(action_space, None, exploration_weight)
         self.policy_value_net = policy_value_net
         self.device = device
@@ -82,8 +78,6 @@ class NeuralMCTS(MCTS):
         # Reward shaping weights: penalize isolated neurons and optionally penalize connection count
         self.iso_weight = iso_weight
         self.comp_weight = comp_weight
-        # Parallel processing settings
-        self.parallel_workers = parallel_workers
         # Early stopping settings
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
@@ -92,7 +86,18 @@ class NeuralMCTS(MCTS):
         # Evolutionary cycle tracking
         self.current_cycle = EvolutionaryCycle()
 
-  
+    def cleanup(self):
+        """Clean up resources used by NeuralMCTS"""
+        # Clear evaluation cache to free memory
+        self.evaluation_cache.clear()
+        
+        # Reset evolutionary cycle
+        self.current_cycle.reset() if hasattr(self.current_cycle, 'reset') else None
+        
+        # Force garbage collection
+        import gc
+        gc.collect()
+
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
         """Convert architecture to graph data for neural network"""
         graph_data = architecture.to_graph_representation()
@@ -124,6 +129,7 @@ class NeuralMCTS(MCTS):
             self.quick_trainer.update_architecture(architecture)
             accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
         except Exception:
+            traceback.print_exc()
             return np.random.uniform(0.0, 0.5)
 
         base_reward = accuracy - self.reward_loss_weight * loss
@@ -136,6 +142,7 @@ class NeuralMCTS(MCTS):
                     # newly added neuron id should be last allocated id
                     ignore_ids.add(architecture.next_neuron_id - 1)
             except Exception:
+                traceback.print_exc()
                 pass
 
         isolated = architecture.count_isolated_neurons(ignore_ids=ignore_ids, only_hidden=True)
@@ -150,11 +157,7 @@ class NeuralMCTS(MCTS):
         return base_reward - self.iso_weight * iso_term - self.comp_weight * comp_term
 
     def _evaluate_node(self, node: NeuralMCTSNode, is_simulation: bool = False) -> float:
-        """Evaluate a node using quick_trainer in supervised stage or the policy-value net.
-
-        This is the shared evaluator used by both `search` and `search_with_beam` so logic is
-        consistent and centralized.
-        """
+        """Evaluate a node using quick_trainer in supervised stage or the policy-value net."""
 
         # Determine stage
         if self.curriculum:
@@ -176,9 +179,43 @@ class NeuralMCTS(MCTS):
         return value
     
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
-               temperature: float = 1.0) -> NeuralMCTSNode:
-        """Run neural-guided MCTS search with evolutionary cycle tracking and early stopping"""
-        root = NeuralMCTSNode(initial_architecture)
+               temperature: float = 1.0, reuse_root: NeuralMCTSNode = None) -> NeuralMCTSNode:
+        """Run standard neural-guided MCTS search (AlphaZero style).
+        
+        Terminology:
+        - iteration: One complete MCTS cycle (SELECT → EXPAND → SIMULATE → BACKUP)
+        - step: One action within a rollout simulation (during _simulate, max_depth steps)
+        - episode: One full architecture design session (in architecture_trainer.py)
+        
+        Each iteration (i):
+        1. SELECT: Traverse tree to leaf using PUCT formula
+        2. EXPAND: Add one new child to leaf (if not terminal)
+        3. SIMULATE: Run rollout from new/leaf node (up to max_depth steps)
+        4. BACKUP: Propagate result up the tree
+        
+        Args:
+            initial_architecture: Starting architecture for search
+            iterations: Number of MCTS iterations to run
+            temperature: Temperature for action selection
+            reuse_root: Optional existing tree root to continue search (enables tree reuse)
+        """
+        
+        # Reuse existing tree root if provided, otherwise create new root
+        if reuse_root is not None:
+            root = reuse_root
+            root._valid_actions_cache = None
+            # Verify root architecture matches initial_architecture
+            root_neurons = sorted(root.architecture.neurons.keys())
+            initial_neurons = sorted(initial_architecture.neurons.keys())
+            if root_neurons != initial_neurons:
+                print(f"ERROR: Root architecture mismatch in search()!")
+                print(f"  reuse_root neurons: {root_neurons}")
+                print(f"  initial_architecture neurons: {initial_neurons}")
+                print(f"  Missing in root: {set(initial_neurons) - set(root_neurons)}")
+                print(f"  Extra in root: {set(root_neurons) - set(initial_neurons)}")
+            print(f"Reusing tree with {root.visits} visits from previous search")
+        else:
+            root = NeuralMCTSNode(initial_architecture)
 
         # Get neural network predictions for root (skip in supervised stage for speed)
         if self.curriculum:
@@ -198,30 +235,39 @@ class NeuralMCTS(MCTS):
         # Early stopping tracking
         best_values = []
         no_improvement_count = 0
+        initial_visits = root.visits  # Track starting visits for reused trees
+        
+        # Add Dirichlet noise to root for exploration (AlphaZero-style)
+        # This ensures we explore even when policy network has strong (but potentially wrong) priors
+        self._add_dirichlet_noise_to_root(root)
 
-        # Use the centralized evaluator
         print("Starting MCTS search...")
         for i in range(iterations):
+            # ===== STEP 1: SELECT =====
+            # Traverse tree using PUCT until reaching a leaf node
             node = self._select(root)
 
-            if not node.architecture.performance_metrics:
-                # Leaf evaluation
-                value = self._evaluate_node(node, is_simulation=False)
-                node.architecture.performance_metrics = {'estimated_accuracy': value}
-                node.value = value
-                node.visits = 1
-            else:
-                node = self._expand(node)
-                if node != self._select(root):
-                    # We expanded; evaluate the expanded node
-                    value = self._evaluate_node(node, is_simulation=False)
-                else:
-                    # No expansion (selection returned same node) -> simulate rollout
-                    value = self._simulate(node)
+            # ===== STEP 2: EXPAND =====
+            # Add one new child to leaf (returns expanded child or same node if no expansion possible)
+            expanded_node = self._expand(node)
 
-            self._backpropagate(node, value)
+            # ===== STEP 3: SIMULATE/EVALUATE =====
+            # Evaluate the expanded child (or leaf node if expansion failed)
+            # Supervised stage: direct evaluation; Policy stage: rollout simulation
+            value = self._simulate(expanded_node, max_depth=5)
 
-            # Early stopping check
+            # ===== STEP 4: BACKUP =====
+            # Propagate value up the tree
+            self._backpropagate(expanded_node, value)
+
+            # Early stopping check - only after sufficient new visits on reused trees
+            new_visits = root.visits - initial_visits
+            min_new_visits = min(20, iterations // 2)  # At least 20 new visits or half of iterations
+            
+            # Skip early stopping until we have enough new exploration on reused trees
+            if new_visits < min_new_visits:
+                continue
+                
             current_best = root.value / root.visits if root.visits > 0 else 0.0
             best_values.append(current_best)
 
@@ -244,7 +290,8 @@ class NeuralMCTS(MCTS):
             if (i + 1) % max(1, iterations // 10) == 0:
                 print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {current_best:.4f}")
 
-        # Select final action using temperature (visit-count based) to allow stochasticity
+        # ===== STEP 5: SELECT FINAL ACTION =====
+        # Use visit counts to select final action (most visited = most promising)
         final_node = self._select_final_action(root, temperature)
         if final_node and final_node.action:
             # Update evolutionary cycle with final node's value
@@ -264,13 +311,40 @@ class NeuralMCTS(MCTS):
                     action_str += ")"
             elif final_node.action.activation is not None:
                 action_str += f"({final_node.action.activation.name})"
-            print(f"MCTS FINAL ACTION: {action_str} (value: {final_node.value/final_node.visits:.3f})")
+            print(f"MCTS FINAL ACTION: {action_str} (value: {final_node.value/final_node.visits:.3f}, visits: {final_node.visits})")
+            print(f"MCTS tree stats: {root.visits} total visits, {len(root.children)} children at root")
             print("MCTS search completed successfully")
-            return final_node
+            
+            # Return tuple: (selected_child, search_root)
+            # selected_child becomes new root for next search (tree reuse)
+            # search_root provides visit distribution for training
+            return (final_node, root)
         else:
             print("MCTS search completed: no valid action found")
-            return None
+            return (root, root)  # Return tuple even on failure
         
+    
+    def _add_dirichlet_noise_to_root(self, root: NeuralMCTSNode, epsilon: float = 0.25, alpha: float = 0.3):
+        """Add Dirichlet noise to root node priors for exploration (AlphaZero-style).
+        
+        This ensures exploration even when the policy network has strong but potentially
+        incorrect priors. The noise is only added at the root of each search.
+        
+        Args:
+            root: Root node of MCTS search
+            epsilon: Weight of noise (0.25 = 75% prior, 25% noise)
+            alpha: Dirichlet concentration parameter (lower = more dispersed)
+        """
+        if not root.children or len(root.children) == 0:
+            return  # No children yet, noise will be applied during expansion
+        
+        # Generate Dirichlet noise
+        num_children = len(root.children)
+        noise = np.random.dirichlet([alpha] * num_children)
+        
+        # Mix noise with existing priors
+        for i, child in enumerate(root.children):
+            child.prior_prob = (1 - epsilon) * child.prior_prob + epsilon * noise[i]
     
     def _select_final_action(self, root: NeuralMCTSNode, temperature: float) -> NeuralMCTSNode:
         """Select final action based on visit counts (proportional selection)"""
@@ -286,7 +360,11 @@ class NeuralMCTS(MCTS):
         return root.children[selected_idx]
     
     def _expand(self, node: NeuralMCTSNode) -> NeuralMCTSNode:
-        """Expand node using policy network priors"""
+        """Expand node by creating ONE new child (standard MCTS expansion).
+        
+        Filters out already-expanded actions to avoid duplicates. This allows
+        natural tree widening as MCTS iterations repeatedly expand the same node.
+        """
         # Determine whether to use policy or random based on curriculum
         if self.curriculum:
             train_params = self.curriculum.get_training_parameters()
@@ -311,24 +389,32 @@ class NeuralMCTS(MCTS):
         # Use action manager to get valid actions with evolutionary cycle context
         action_manager = ActionManager(action_space=self.action_space)
 
-        # Get valid actions with cycle-aware prioritization
-        valid_actions = self.action_space.get_valid_actions(
+        # Get valid actions - filter out actions already expanded as children
+        all_valid_actions = self.action_space.get_valid_actions(
             node.architecture, current_step=0, evolutionary_cycle=self.current_cycle
         )
+        
+        # Cache valid actions for is_fully_expanded check
+        if node._valid_actions_cache is None:
+            node._valid_actions_cache = all_valid_actions
+        
+        # Filter out actions that already have children
+        expanded_actions = {child.action for child in node.children if child.action is not None}
+        valid_actions = [a for a in all_valid_actions if a not in expanded_actions]
 
         if not valid_actions:
-            return node  # No valid actions available
+            return node  # No unexpanded actions available
 
         if use_policy and node.policy_value is not None:
             # Use policy network to select from valid actions
             action = action_manager.select_action(
                 node.policy_value, node.architecture, exploration=True, use_policy=True
             )
-            # Filter to only valid actions if needed
+            # Filter to only valid unexpanded actions
             if action not in valid_actions:
                 action = np.random.choice(valid_actions)
         else:
-            # Random selection from valid actions
+            # Random selection from valid unexpanded actions
             action = np.random.choice(valid_actions)
 
         # Apply action to create new architecture
@@ -339,9 +425,12 @@ class NeuralMCTS(MCTS):
             # Create child node
             child = NeuralMCTSNode(new_architecture, parent=node, action=action)
 
-            # Compute prior probability for this action from policy network (skip in supervised)
+            # Compute prior probability for this action from policy network
             if skip_nn_calls:
-                child.prior_prob = 1.0  # Default prior for supervised stage
+                # In supervised stage without policy network guidance:
+                # Use uniform priors (1.0 / num_valid_actions) for unbiased exploration
+                # This ensures PUCT treats all actions equally until visit counts differ
+                child.prior_prob = 1.0 / len(all_valid_actions) if all_valid_actions else 1.0
             else:
                 child.prior_prob = self._compute_action_prior_prob(node.policy_value, action, node.architecture)
 
@@ -350,7 +439,7 @@ class NeuralMCTS(MCTS):
                 with torch.no_grad():
                     graph_data = self._prepare_graph_data(new_architecture)
                     child.policy_value = self.policy_value_net(graph_data)
-
+            
             node.children.append(child)
             return child
 
@@ -403,8 +492,8 @@ class NeuralMCTS(MCTS):
 
             for neuron_id, neuron in architecture.neurons.items():
                 if neuron.neuron_type == NeuronType.HIDDEN:
-                    has_in = any(conn.target_neuron == neuron_id for conn in architecture.connections.values())
-                    has_out = any(conn.source_neuron == neuron_id for conn in architecture.connections.values())
+                    has_in = any(conn.target_id == neuron_id for conn in architecture.connections)
+                    has_out = any(conn.source_id == neuron_id for conn in architecture.connections)
                     if not has_in and not has_out:
                         isolated_lacking_both.add(neuron_id)
                     elif not has_in:
@@ -427,40 +516,41 @@ class NeuralMCTS(MCTS):
         return prior_prob
 
     def _simulate(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
-        """Simulate from a node using parallel random rollouts and evaluate with the policy-value net.
+        """Simulate from a node and evaluate.
 
-        Uses multiple processes to run parallel rollouts for better exploration.
+        Terminology:
+        - max_depth: Maximum number of steps in the rollout simulation (default: 5 steps)
+        - Each step: One random action applied to the architecture during rollout
+        
+        Note: Parallel rollouts per iteration are wasteful in standard MCTS because:
+        - MCTS iterations already provide exploration via tree traversal
+        - Tree reuse accumulates knowledge across steps
+        - Parallel rollouts don't share information with each other
+        
+        Better to use single rollout per iteration and let the tree handle exploration.
+        Parallelization should happen at the iteration level, not rollout level.
         """
-        if self.parallel_workers <= 1:
-            # Fallback to single rollout if parallel disabled
-            return self._single_rollout(node, max_depth)
+        # Determine curriculum stage
+        if self.curriculum:
+            train_params = self.curriculum.get_training_parameters()
+            stage = train_params.get('stage', 'supervised')
+        else:
+            stage = 'supervised' if self.quick_trainer else 'policy'
 
-        # Run multiple parallel rollouts
-        rollout_values = []
-        with ProcessPoolExecutor(max_workers=self.parallel_workers) as executor:
-            # Convert architecture to serializable dict using the new method
-            arch_data = node.architecture.to_serializable_dict()
+        # In supervised stage, use direct evaluation (no rollouts)
+        if stage == 'supervised':
+            return self._evaluate_node(node, is_simulation=False)
 
-            # Submit parallel rollout tasks - pass only serializable data
-            futures = [executor.submit(self._single_rollout_process, arch_data, max_depth,
-                                     self.reward_loss_weight, self.iso_weight, self.comp_weight)
-                      for _ in range(self.parallel_workers)]
+        # In policy stage, use single rollout (tree handles exploration)
+        return self._rollout(node, max_depth)
 
-            # Collect results
-            for future in futures:
-                try:
-                    value = future.result(timeout=30)  # 30 second timeout per rollout
-                    rollout_values.append(value)
-                except Exception as e:
-                    print(f"Rollout failed: {e}")
-                    traceback.print_exc()
-                    rollout_values.append(0.0)  # Default value for failed rollouts
-
-        # Return average of parallel rollouts
-        return np.mean(rollout_values) if rollout_values else 0.0
-
-    def _single_rollout(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
+    def _rollout(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
         """Single rollout simulation from a node using random actions.
+
+        Terminology:
+        - max_depth: Maximum number of steps (actions) to take during rollout
+        - Each step: One random action applied to the architecture
+        - Rollout: Complete simulation from current node to max_depth steps
 
         This is the core rollout logic that can be parallelized.
         """
@@ -511,78 +601,3 @@ class NeuralMCTS(MCTS):
                 value = policy_value['value'].item()
 
         return value
-
-    @staticmethod
-    def _single_rollout_process(architecture_data: dict, max_depth: int, reward_loss_weight: float,
-                               iso_weight: float, comp_weight: float) -> float:
-        """Static method for parallel rollout execution - uses serializable dict data"""
-        try:
-            # Import here to avoid circular imports in multiprocessing
-            from blueprint_modules.action import ActionSpace
-            from blueprint_modules.network import NeuralArchitecture, NeuronType, ActivationType
-
-            # Create a fresh action space for this process
-            action_space = ActionSpace()
-
-            # Reconstruct architecture from serializable data
-            current_arch = NeuralArchitecture()
-            current_arch.neurons = {}
-            current_arch.connections = []
-            current_arch.next_neuron_id = architecture_data['next_neuron_id']
-
-            # Reconstruct neurons
-            for neuron_data in architecture_data['neurons']:
-                neuron = Neuron(
-                    id=neuron_data['id'],
-                    neuron_type=NeuronType(neuron_data['neuron_type']),
-                    activation=ActivationType(neuron_data['activation']),
-                    layer_position=neuron_data['layer_position'],
-                    bias=neuron_data['bias']
-                )
-                current_arch.neurons[neuron.id] = neuron
-
-            # Reconstruct connections
-            for conn_data in architecture_data['connections']:
-                conn = Connection(
-                    source_id=conn_data['source_id'],
-                    target_id=conn_data['target_id'],
-                    weight=conn_data['weight'],
-                    enabled=conn_data['enabled']
-                )
-                current_arch.connections.append(conn)
-
-            # Perform rollout
-            for _ in range(max_depth):
-                valid_actions = action_space.get_valid_actions(current_arch)
-                if not valid_actions:
-                    break
-
-                # Randomly choose an action and apply
-                action = np.random.choice(valid_actions)
-                action_space.apply_action(current_arch, action)
-
-            # Simple evaluation - use architecture properties as proxy
-            # This avoids needing to pickle complex objects like trainers and networks
-            connected_frac = current_arch.connected_fraction()
-            num_neurons = current_arch.num_neurons()
-            num_connections = current_arch.num_connections()
-
-            # Size penalty (balance complexity)
-            size_score = 1.0 / (1.0 + 0.01 * num_neurons)
-
-            # Layer diversity bonus
-            layer_positions = set(n.layer_position for n in current_arch.neurons.values())
-            layer_bonus = min(1.0, len(layer_positions) / 5.0)
-
-            # Combine scores
-            proxy_score = 0.4 * connected_frac + 0.3 * size_score + 0.3 * layer_bonus
-
-            # Add small random noise
-            import random
-            noise = random.uniform(-0.05, 0.05)
-
-            return max(0.0, min(1.0, proxy_score + noise))
-
-        except Exception as e:
-            # Return default value on any error
-            return 0.0

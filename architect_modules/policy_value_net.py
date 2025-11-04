@@ -3,6 +3,7 @@ import torch.nn as nn
 import numpy as np
 from torch.distributions import Categorical
 from .graph_transformer import GraphTransformer
+import traceback
 from typing import Dict
 from blueprint_modules.network import NeuralArchitecture, NeuronType, ActivationType
 from blueprint_modules.action import ActionType, Action, ActionSpace
@@ -188,6 +189,10 @@ class ActionManager:
                 raise ValueError("No valid actions available in the current architecture")
 
         masks = self.get_action_masks(architecture)
+        # Move masks to the same device as policy_output
+        device = policy_output['action_type'].device
+        for key in masks:
+            masks[key] = masks[key].to(device)
 
         # Get the actual tensor size needed
         max_neuron_id = max(architecture.neurons.keys()) if architecture.neurons else 0
@@ -213,7 +218,7 @@ class ActionManager:
             
             return Action(
                 action_type=action_type,
-                activation=ActivationType(activation_idx)
+                activation=list(ActivationType)[activation_idx % 4]
             )
         
         elif action_type == ActionType.REMOVE_NEURON:
@@ -279,7 +284,7 @@ class ActionManager:
             return Action(
                 action_type=action_type,
                 source_neuron=source_idx,
-                activation=ActivationType(activation_idx)
+                activation=list(ActivationType)[activation_idx % 4]
             )
         
         elif action_type == ActionType.ADD_CONNECTION:
@@ -338,6 +343,7 @@ class ActionManager:
                     if 0 <= source_idx < target_logits.shape[1]:
                         target_logits[:, source_idx] -= 1e9
             except Exception:
+                traceback.print_exc()
                 # Defensive: if shapes are unexpected, fall back to masking all indices
                 if target_logits.dim() == 1:
                     target_logits[:tensor_size] -= 1e9
@@ -402,6 +408,7 @@ class ActionManager:
                 try:
                     sel_idx = Categorical(logits=combined_logits).sample().item()
                 except Exception:
+                    traceback.print_exc()
                     # Fallback: pick highest-scoring connection
                     sel_idx = int(combined_logits.argmax().item())
             else:

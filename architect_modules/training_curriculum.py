@@ -17,16 +17,14 @@ class CurriculumState:
 
 class TrainingCurriculum:
     """Manages the training curriculum from supervised to RL"""
-    
-    def __init__(self, total_episodes: int = 500):
-        self.total_episodes = total_episodes
+
+    def __init__(self, supervised_episodes: int, mixed_episodes: int, self_play_episodes: int):
+        self.supervised_episodes = supervised_episodes
+        self.mixed_episodes = supervised_episodes + mixed_episodes
+        self.self_play_episodes = self.mixed_episodes + self_play_episodes
+        self.total_episodes = self.self_play_episodes
         self.episode_count = 0
-        
-        # Stage boundaries
-        self.supervised_episodes = total_episodes // 10
-        self.mixed_episodes = self.supervised_episodes * 3
-        self.self_play_episodes = total_episodes
-        
+
         # Current state
         self.state = CurriculumState()
         
@@ -130,47 +128,96 @@ class PolicyValueLoss(nn.Module):
         """
         predictions: output from policy_value_net
         targets: {
-            'action_type': target action type,
+            'action_type': target action type (single action label for supervised),
             'source_neuron': target source neuron,
             'target_neuron': target target neuron,
             'activation': target activation,
-            'value': target value
+            'value': target value,
+            'mcts_policy': OPTIONAL - visit distribution from MCTS (AlphaZero-style),
+            'mcts_actions': OPTIONAL - actions explored by MCTS
         }
         """
         total_loss = 0.0
 
-        # Action type loss
-        action_loss = F.cross_entropy(
-            predictions['action_type'],
-            targets['action_type']
-        )
-        total_loss += action_loss
+        # Check if we have MCTS policy distribution (AlphaZero-style training)
+        use_mcts_policy = 'mcts_policy' in targets and 'mcts_actions' in targets
+        
+        if use_mcts_policy:
+            # AlphaZero-style: Train policy to match MCTS visit distribution
+            # This is MORE informative than single action labels because it shows
+            # the relative quality of ALL explored actions
+            mcts_policy = targets['mcts_policy']  # List of probabilities
+            mcts_actions = targets['mcts_actions']  # List of Action objects
+            
+            # Convert MCTS visit distribution to target logits for each policy head
+            # We'll use KL divergence to match the distribution
+            action_type_targets = torch.zeros_like(predictions['action_type'])
+            
+            for prob, action in zip(mcts_policy, mcts_actions):
+                # Accumulate probability mass for each action component
+                action_type_targets[0, action.action_type.value] += prob
+            
+            # KL divergence loss (or cross-entropy with soft targets)
+            action_probs = F.log_softmax(predictions['action_type'], dim=-1)
+            action_loss = -torch.sum(action_type_targets * action_probs)
+            total_loss += action_loss
+            
+            # Note: For hierarchical policy (source/target/activation), we still use
+            # hard labels from the selected action since MCTS doesn't provide
+            # distributions over these sub-actions
+            if targets.get('source_neuron') is not None:
+                source_loss = F.cross_entropy(
+                    predictions['source_logits'],
+                    targets['source_neuron']
+                )
+                total_loss += source_loss
 
-        # Source neuron loss (only if applicable)
-        if targets.get('source_neuron') is not None:
-            source_loss = F.cross_entropy(
-                predictions['source_logits'],
-                targets['source_neuron']
+            if targets.get('target_neuron') is not None:
+                target_loss = F.cross_entropy(
+                    predictions['target_logits'],
+                    targets['target_neuron']
+                )
+                total_loss += target_loss
+
+            if targets.get('activation') is not None:
+                activation_loss = F.cross_entropy(
+                    predictions['activation_logits'],
+                    targets['activation']
+                )
+                total_loss += activation_loss
+        else:
+            # Supervised learning: Train on single action labels
+            action_loss = F.cross_entropy(
+                predictions['action_type'],
+                targets['action_type']
             )
-            total_loss += source_loss
+            total_loss += action_loss
 
-        # Target neuron loss (only if applicable)
-        if targets.get('target_neuron') is not None:
-            target_loss = F.cross_entropy(
-                predictions['target_logits'],
-                targets['target_neuron']
-            )
-            total_loss += target_loss
+            # Source neuron loss (only if applicable)
+            if targets.get('source_neuron') is not None:
+                source_loss = F.cross_entropy(
+                    predictions['source_logits'],
+                    targets['source_neuron']
+                )
+                total_loss += source_loss
 
-        # Activation loss (only if applicable)
-        if targets.get('activation') is not None:
-            activation_loss = F.cross_entropy(
-                predictions['activation_logits'],
-                targets['activation']
-            )
-            total_loss += activation_loss
+            # Target neuron loss (only if applicable)
+            if targets.get('target_neuron') is not None:
+                target_loss = F.cross_entropy(
+                    predictions['target_logits'],
+                    targets['target_neuron']
+                )
+                total_loss += target_loss
 
-        # Value loss
+            # Activation loss (only if applicable)
+            if targets.get('activation') is not None:
+                activation_loss = F.cross_entropy(
+                    predictions['activation_logits'],
+                    targets['activation']
+                )
+                total_loss += activation_loss
+
+        # Value loss (always used)
         value_loss = F.mse_loss(
             predictions['value'].squeeze(),
             targets['value'].squeeze()
