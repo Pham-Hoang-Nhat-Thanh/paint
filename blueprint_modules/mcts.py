@@ -58,35 +58,45 @@ class MCTSNode:
         return None
     
     def _copy_architecture(self) -> NeuralArchitecture:
-        """Create a deep copy of the architecture"""
-        # Use the standard library deepcopy for a robust copy of the architecture.
-        # deepcopy will guarantee that nested mutable objects (neurons, connections,
-        # performance metrics, etc.) are duplicated and that the returned object is
-        # independent of the original.
+        """Create a fast copy of the architecture (no MNIST base init, no deepcopy)."""
+        # Avoid calling NeuralArchitecture.__init__ to skip MNIST base init
+        arch = self.architecture
+        new_arch = object.__new__(NeuralArchitecture)
+        # Copy neurons (shallow copy of dict, but new Neuron objects)
+        new_arch.neurons = {nid: Neuron(
+            neuron.id, neuron.neuron_type, neuron.activation,
+            neuron.layer_position, neuron.bias
+        ) for nid, neuron in arch.neurons.items()}
+        # Copy connections (new Connection objects)
+        new_arch.connections = [Connection(
+            conn.source_id, conn.target_id, conn.weight, conn.enabled
+        ) for conn in arch.connections]
+        # Copy next_neuron_id
+        new_arch.next_neuron_id = arch.next_neuron_id
+        # Copy performance metrics (shallow copy)
         try:
-            return copy.deepcopy(self.architecture)
+            new_arch.performance_metrics = arch.performance_metrics.copy()
         except Exception:
-            # Defensive fallback: manual construction mirroring the previous logic.
-            new_arch = NeuralArchitecture()
-            # Recreate neuron objects
-            new_arch.neurons = {nid: Neuron(
-                neuron.id, neuron.neuron_type, neuron.activation,
-                neuron.layer_position, neuron.bias
-            ) for nid, neuron in self.architecture.neurons.items()}
-
-            # Recreate connections
-            new_arch.connections = [Connection(
-                conn.source_id, conn.target_id, conn.weight, conn.enabled
-            ) for conn in self.architecture.connections]
-
-            new_arch.next_neuron_id = self.architecture.next_neuron_id
-            # Shallow-copy performance metrics dict as a best-effort
-            try:
-                new_arch.performance_metrics = self.architecture.performance_metrics.copy()
-            except Exception:
-                new_arch.performance_metrics = {}
-
-            return new_arch
+            new_arch.performance_metrics = {}
+        # Copy _connection_set if present
+        if hasattr(arch, '_connection_set'):
+            new_arch._connection_set = set(arch._connection_set)
+        # IMPORTANT: Copy cached attributes when structure is identical (before applying action)
+        # Caches will be invalidated when action is applied (add/remove neurons/connections)
+        if hasattr(arch, '_sorted_neuron_ids') and arch._sorted_neuron_ids is not None:
+            new_arch._sorted_neuron_ids = list(arch._sorted_neuron_ids)  # Copy the list
+        else:
+            new_arch._sorted_neuron_ids = None
+        
+        if hasattr(arch, '_connectivity_cache') and arch._connectivity_cache is not None:
+            new_arch._connectivity_cache = {
+                'has_incoming': set(arch._connectivity_cache['has_incoming']),
+                'has_outgoing': set(arch._connectivity_cache['has_outgoing'])
+            }
+        else:
+            new_arch._connectivity_cache = None
+        # Copy any other custom attributes if needed
+        return new_arch
 
 class MCTS:
     """Monte Carlo Tree Search for architecture exploration"""

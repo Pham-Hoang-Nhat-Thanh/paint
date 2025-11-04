@@ -95,7 +95,7 @@ class OverallConfig:
     max_episodes: int = 500
     
     # System
-    device: str = "cuda:1"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:0"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000
@@ -104,10 +104,10 @@ class OverallConfig:
     checkpoint_dir: str = "checkpoints/"
     
     # Monitoring
-    eval_interval: int = 10
+    eval_interval: int = 1
     checkpoint_interval: int = 10
-    log_interval: int = 2
-    train_interval: int = 10  # Train every N episodes
+    log_interval: int = 1
+    train_interval: int = 2  # Train every N episodes
 
     # GPU optimizations
     use_mixed_precision: bool = True

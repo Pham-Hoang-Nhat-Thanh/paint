@@ -55,6 +55,10 @@ class NeuralArchitecture:
         self.next_neuron_id = 0
         self.performance_metrics: Dict = {}
         
+        # Cache for optimization - invalidate when structure changes
+        self._sorted_neuron_ids = None
+        self._connectivity_cache = None  # {'has_incoming': set, 'has_outgoing': set}
+        
         # Initialize with MNIST base structure
         self._initialize_mnist_base()
     
@@ -87,6 +91,9 @@ class NeuralArchitecture:
         neuron_id = self.next_neuron_id
         self.neurons[neuron_id] = Neuron(neuron_id, neuron_type, activation, layer_position)
         self.next_neuron_id += 1
+        # Invalidate caches
+        self._sorted_neuron_ids = None
+        self._connectivity_cache = None
         return neuron_id
     
     def add_connection(self, source_id: int, target_id: int, weight: float = 0.1) -> bool:
@@ -104,6 +111,8 @@ class NeuralArchitecture:
         
         self.connections.append(Connection(source_id, target_id, weight))
         self._connection_set.add(conn_key)
+        # Invalidate connectivity cache
+        self._connectivity_cache = None
         return True
     
     def remove_neuron(self, neuron_id: int) -> bool:
@@ -130,6 +139,9 @@ class NeuralArchitecture:
         ]
         
         del self.neurons[neuron_id]
+        # Invalidate caches
+        self._sorted_neuron_ids = None
+        self._connectivity_cache = None
         return True
     
     def remove_connection(self, source_id: int, target_id: int) -> bool:
@@ -145,6 +157,9 @@ class NeuralArchitecture:
             conn for conn in self.connections 
             if not (conn.source_id == source_id and conn.target_id == target_id)
         ]
+        # Invalidate connectivity cache
+        if len(self.connections) < initial_count:
+            self._connectivity_cache = None
         return len(self.connections) < initial_count
     
     def compute_signature(self) -> str:
@@ -188,7 +203,7 @@ class NeuralArchitecture:
     
     def to_graph_representation(self) -> Dict:
         """Convert architecture to graph format for transformer"""
-        node_ids = sorted(self.neurons.keys())
+        node_ids = self._get_sorted_neuron_ids()
         id_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
         
         # Vectorized node features using list comprehension
@@ -214,8 +229,26 @@ class NeuralArchitecture:
             'edge_index': edge_index,
             'edge_weights': edge_weights,
             'node_mapping': id_to_index,
-            'performance': self.performance_metrics
+            'performance': self.performance_metrics,
+            'sorted_neuron_ids': node_ids  # Return sorted IDs for reuse
         }
+    
+    def _get_sorted_neuron_ids(self) -> List[int]:
+        """Get sorted neuron IDs (cached) - O(1) after first call, O(n log n) on first call"""
+        if self._sorted_neuron_ids is None:
+            self._sorted_neuron_ids = sorted(self.neurons.keys())
+        return self._sorted_neuron_ids
+    
+    def _get_connectivity_sets(self) -> Dict[str, set]:
+        """Get connectivity sets (has_incoming, has_outgoing) - cached and reused"""
+        if self._connectivity_cache is None:
+            has_incoming = set()
+            has_outgoing = set()
+            for conn in self.connections:
+                has_incoming.add(conn.target_id)
+                has_outgoing.add(conn.source_id)
+            self._connectivity_cache = {'has_incoming': has_incoming, 'has_outgoing': has_outgoing}
+        return self._connectivity_cache
 
     # --- Utility helpers for architecture statistics (used by MCTS reward shaping) ---
     def num_neurons(self) -> int:
@@ -308,10 +341,16 @@ class NeuralArchitecture:
     @classmethod
     def from_serializable_dict(cls, data: dict) -> 'NeuralArchitecture':
         """Reconstruct architecture from serializable dict"""
-        arch = cls()
+        arch = cls.__new__(cls)  # Create instance without calling __init__
         arch.neurons = {}
         arch.connections = []
         arch.next_neuron_id = data['next_neuron_id']
+        arch.performance_metrics = {}
+        
+        # Initialize caches
+        arch._sorted_neuron_ids = None
+        arch._connectivity_cache = None
+        arch._connection_set = set()
 
         # Reconstruct neurons
         for neuron_data in data['neurons']:
@@ -333,6 +372,7 @@ class NeuralArchitecture:
                 enabled=conn_data['enabled']
             )
             arch.connections.append(conn)
+            arch._connection_set.add((conn.source_id, conn.target_id))
 
         return arch
 
