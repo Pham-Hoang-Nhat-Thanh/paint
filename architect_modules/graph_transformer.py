@@ -270,9 +270,7 @@ class GraphTransformer(nn.Module):
         edge_index = graph_data['edge_index']
         edge_weights = graph_data['edge_weights']
         layer_positions = graph_data['layer_positions']
-        
-        batch_size, num_nodes, _ = node_features.shape
-        
+
         # Input projection
         x = self.input_projection(node_features)  # [batch_size, num_nodes, hidden_dim]
         x = self.dropout(x)

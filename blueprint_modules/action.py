@@ -113,10 +113,12 @@ class ActionSpace:
                                 current_step: int, evolutionary_cycle: 'EvolutionaryCycle'):
         """Add actions with evolutionary cycle-aware prioritization"""
         neurons = architecture.neurons
-        hidden_neurons = [nid for nid, neuron in neurons.items()
-                         if neuron.neuron_type == NeuronType.HIDDEN]
         num_neurons = len(neurons)
         num_connections = len(architecture.connections)
+        
+        # Filter hidden neurons once
+        hidden_neurons = [nid for nid, neuron in neurons.items()
+                         if neuron.neuron_type == NeuronType.HIDDEN]
 
         # Always allow structural changes (add/remove neurons)
         if num_neurons < self.max_neurons:
@@ -158,10 +160,12 @@ class ActionSpace:
                                        current_step: int):
         """Add actions with simple prioritization for policy network compatibility"""
         neurons = architecture.neurons
-        hidden_neurons = [nid for nid, neuron in neurons.items()
-                         if neuron.neuron_type == NeuronType.HIDDEN]
         num_neurons = len(neurons)
         num_connections = len(architecture.connections)
+        
+        # Filter hidden neurons once
+        hidden_neurons = [nid for nid, neuron in neurons.items()
+                         if neuron.neuron_type == NeuronType.HIDDEN]
 
         # Always allow structural changes
         if num_neurons < self.max_neurons:
@@ -199,13 +203,19 @@ class ActionSpace:
                 ))
 
     def _get_isolated_hidden_neurons(self, architecture: NeuralArchitecture) -> set:
-        """Get set of isolated hidden neurons"""
+        """Get set of isolated hidden neurons - optimized with set operations"""
+        # Build connectivity sets in single pass through connections
+        targets = set()
+        sources = set()
+        for conn in architecture.connections:
+            targets.add(conn.target_id)
+            sources.add(conn.source_id)
+        
+        # Find isolated hidden neurons (missing incoming OR outgoing connections)
         isolated = set()
         for neuron_id, neuron in architecture.neurons.items():
             if neuron.neuron_type == NeuronType.HIDDEN:
-                has_in = any(conn.target_id == neuron_id for conn in architecture.connections)
-                has_out = any(conn.source_id == neuron_id for conn in architecture.connections)
-                if not has_in or not has_out:
+                if neuron_id not in targets or neuron_id not in sources:
                     isolated.add(neuron_id)
         return isolated
 
@@ -213,20 +223,38 @@ class ActionSpace:
                                 isolated_hidden: set):
         """Aggressively add actions that help de-isolate neurons - prioritize connections that fix isolation"""
         neurons = architecture.neurons
-        all_neuron_ids = list(neurons.keys())
         existing_connections = {(conn.source_id, conn.target_id) for conn in architecture.connections}
 
-        # Identify isolation types for each isolated neuron
-        isolation_details = {}
-        for neuron_id in isolated_hidden:
-            has_in = any(conn.target_id == neuron_id for conn in architecture.connections)
-            has_out = any(conn.source_id == neuron_id for conn in architecture.connections)
-            isolation_details[neuron_id] = {'has_in': has_in, 'has_out': has_out}
+        # Build connectivity sets efficiently in single pass
+        targets = set()
+        sources = set()
+        for conn in architecture.connections:
+            targets.add(conn.target_id)
+            sources.add(conn.source_id)
+        
+        # Identify isolation types for each isolated neuron using sets (O(1) lookup)
+        isolation_details = {
+            neuron_id: {
+                'has_in': neuron_id in targets,
+                'has_out': neuron_id in sources
+            }
+            for neuron_id in isolated_hidden
+        }
 
-        # Separate neurons by type for smarter connection generation
-        input_neurons = [nid for nid, n in neurons.items() if n.neuron_type == NeuronType.INPUT]
-        output_neurons = [nid for nid, n in neurons.items() if n.neuron_type == NeuronType.OUTPUT]
-        hidden_neurons = [nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN]
+        # Separate neurons by type for smarter connection generation (single pass)
+        input_neurons = []
+        output_neurons = []
+        hidden_neurons = []
+        neuron_type_cache = {}  # Cache for faster type lookups
+        
+        for nid, n in neurons.items():
+            neuron_type_cache[nid] = n.neuron_type
+            if n.neuron_type == NeuronType.INPUT:
+                input_neurons.append(nid)
+            elif n.neuron_type == NeuronType.OUTPUT:
+                output_neurons.append(nid)
+            elif n.neuron_type == NeuronType.HIDDEN:
+                hidden_neurons.append(nid)
 
         candidates = []
         added = set()
@@ -235,37 +263,48 @@ class ActionSpace:
         completely_isolated = [nid for nid, details in isolation_details.items()
                               if not details['has_in'] and not details['has_out']]
 
+        # Pre-slice neuron lists for better performance
+        input_sample = input_neurons[:5]
+        output_sample = output_neurons[:5]
+        
         for isolated_id in completely_isolated:
             # Try to connect to inputs and outputs first
-            for input_id in input_neurons[:5]:  # Limit to avoid explosion
-                if (input_id, isolated_id) not in existing_connections and self._is_valid_connection(neurons, input_id, isolated_id):
-                    candidates.append((input_id, isolated_id))
-                    added.add((input_id, isolated_id))
+            # Optimized: inputs->hidden and hidden->outputs are always valid, skip validation
+            for input_id in input_sample:
+                conn_key = (input_id, isolated_id)
+                if conn_key not in existing_connections and conn_key not in added:
+                    candidates.append(conn_key)  # input->hidden always valid
+                    added.add(conn_key)
 
-            for output_id in output_neurons[:5]:
-                if (isolated_id, output_id) not in existing_connections and self._is_valid_connection(neurons, isolated_id, output_id):
-                    candidates.append((isolated_id, output_id))
-                    added.add((isolated_id, output_id))
+            for output_id in output_sample:
+                conn_key = (isolated_id, output_id)
+                if conn_key not in existing_connections and conn_key not in added:
+                    candidates.append(conn_key)  # hidden->output always valid
+                    added.add(conn_key)
 
         # Priority 2: Fix neurons missing inward connections
         missing_inward = [nid for nid, details in isolation_details.items() if not details['has_in']]
         for isolated_id in missing_inward:
-            # Connect from inputs and other hidden neurons
+            # Connect from inputs and other hidden neurons (pre-filter and slice)
             potential_sources = input_neurons + [h for h in hidden_neurons if h != isolated_id]
-            for source_id in potential_sources[:10]:  # More candidates for missing inward
-                if (source_id, isolated_id) not in existing_connections and self._is_valid_connection(neurons, source_id, isolated_id):
-                    candidates.append((source_id, isolated_id))
-                    added.add((source_id, isolated_id))
+            for source_id in potential_sources[:10]:
+                conn_key = (source_id, isolated_id)
+                if conn_key not in existing_connections and conn_key not in added:
+                    if self._is_valid_connection(neurons, source_id, isolated_id):
+                        candidates.append(conn_key)
+                        added.add(conn_key)
 
         # Priority 3: Fix neurons missing outward connections
         missing_outward = [nid for nid, details in isolation_details.items() if not details['has_out']]
         for isolated_id in missing_outward:
-            # Connect to outputs and other hidden neurons
+            # Connect to outputs and other hidden neurons (pre-filter and slice)
             potential_targets = output_neurons + [h for h in hidden_neurons if h != isolated_id]
-            for target_id in potential_targets[:10]:  # More candidates for missing outward
-                if (isolated_id, target_id) not in existing_connections and self._is_valid_connection(neurons, isolated_id, target_id):
-                    candidates.append((isolated_id, target_id))
-                    added.add((isolated_id, target_id))
+            for target_id in potential_targets[:10]:
+                conn_key = (isolated_id, target_id)
+                if conn_key not in existing_connections and conn_key not in added:
+                    if self._is_valid_connection(neurons, isolated_id, target_id):
+                        candidates.append(conn_key)
+                        added.add(conn_key)
 
         # Add all unique candidates (no arbitrary limit - let MCTS decide)
         for source_id, target_id in candidates:
@@ -298,13 +337,20 @@ class ActionSpace:
             all_neuron_ids = list(neurons.keys())
             existing_connections = {(conn.source_id, conn.target_id) for conn in architecture.connections}
 
+            # Pre-compute number of attempts
+            num_attempts = min(15, len(all_neuron_ids) ** 2 // 10)
             candidates = []
-            for _ in range(min(15, len(all_neuron_ids) ** 2 // 10)):
+            added_in_loop = set()
+            
+            for _ in range(num_attempts):
                 source_id = np.random.choice(all_neuron_ids)
                 target_id = np.random.choice(all_neuron_ids)
-                if source_id != target_id and (source_id, target_id) not in existing_connections:
+                conn_key = (source_id, target_id)
+                
+                if source_id != target_id and conn_key not in existing_connections and conn_key not in added_in_loop:
                     if self._is_valid_connection(neurons, source_id, target_id):
-                        candidates.append((source_id, target_id))
+                        candidates.append(conn_key)
+                        added_in_loop.add(conn_key)
 
             for source_id, target_id in candidates[:5]:  # Limit for efficiency
                 valid_actions.append(Action(
@@ -314,25 +360,20 @@ class ActionSpace:
                 ))
 
     def _is_valid_connection(self, neurons: Dict[int, Neuron], source_id: int, target_id: int) -> bool:
-        """Check if a connection between two neurons is valid based on neuron types"""
+        """Check if a connection between two neurons is valid based on neuron types - optimized"""
         source_type = neurons[source_id].neuron_type
         target_type = neurons[target_id].neuron_type
 
-        # Prevent input neurons from connecting to each other
-        if source_type == NeuronType.INPUT and target_type == NeuronType.INPUT:
+        # Fast path: Allow input->hidden, input->output, hidden->hidden, hidden->output
+        # Reject everything else (fewer comparisons)
+        
+        # Output neurons can't be sources (except to themselves, which is already prevented)
+        if source_type == NeuronType.OUTPUT:
             return False
-
-        # Prevent output neurons from connecting to input or hidden neurons
-        if source_type == NeuronType.OUTPUT and target_type in [NeuronType.INPUT, NeuronType.HIDDEN]:
+        
+        # Input neurons can't be targets
+        if target_type == NeuronType.INPUT:
             return False
-
-        # Prevent hidden neurons from connecting to input neurons (backward flow)
-        if source_type == NeuronType.HIDDEN and target_type == NeuronType.INPUT:
-            return False
-
-        # Prevent output neurons from connecting to output neurons
-        if source_type == NeuronType.OUTPUT and target_type == NeuronType.OUTPUT:
-            return False
-
-        # Allow all other connections: input->hidden, input->output, hidden->hidden, hidden->output
+        
+        # All other combinations are valid: input->hidden, input->output, hidden->hidden, hidden->output
         return True

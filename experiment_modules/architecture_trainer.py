@@ -16,7 +16,6 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from blueprint_modules.network import Neuron, Connection
-from blueprint_modules.network import ActivationType
 
 # Suppress TF32 deprecation warnings
 warnings.filterwarnings("ignore", message="Please use the new API settings to control TF32 behavior")
@@ -26,12 +25,11 @@ if torch.cuda.is_available():
     torch.backends.cuda.matmul.fp32_precision = 'tf32'
     torch.backends.cudnn.conv.fp32_precision = 'tf32'
 
-from blueprint_modules.network import NeuralArchitecture
+from blueprint_modules.network import NeuralArchitecture, ActivationType
 from blueprint_modules.action import ActionSpace, Action
 from blueprint_modules.network_trainer import QuickTrainer
 from architect_modules.guided_mcts import NeuralMCTS
 from architect_modules.policy_value_net import UnifiedPolicyValueNetwork, ActionManager
-from architect_modules.training_curriculum import TrainingCurriculum, PolicyValueLoss
 from .experience_replay import ExperienceReplay
 from .config import OverallConfig
 
@@ -65,47 +63,35 @@ class ArchitectureTrainer:
             max_neurons=config.model.max_neurons,
             exploration_boost=config.search.action_exploration_boost
         )
-        self.quick_trainer = QuickTrainer(
-            train_loader, test_loader,
-            device=self.device,
-            max_epochs=config.search.quick_train_epochs,
-            use_mixed_precision=config.use_mixed_precision,
-            eval_samples=2000  # Limit evaluation to 2000 samples for speed (80% faster eval)
-        )
-
-        # Training infrastructure
-        self.curriculum = TrainingCurriculum(
-            supervised_episodes=config.supervised.num_episodes,
-            mixed_episodes=config.mixed.num_episodes,
-            self_play_episodes=config.self_play.num_episodes
-        )
         
         self.neural_mcts = NeuralMCTS(
             action_space=self.action_space,
             policy_value_net=self.policy_value_net,
             device=self.device,
             exploration_weight=config.mcts.exploration_weight,
-            curriculum=self.curriculum,
-            quick_trainer=self.quick_trainer,
-            reward_loss_weight=config.search.reward_loss_weight,
+            iso_weight=config.search.iso_weight if hasattr(config.search, 'iso_weight') else 0.01,
+            comp_weight=config.search.comp_weight if hasattr(config.search, 'comp_weight') else 0.0,
             early_stopping_patience=config.early_stopping_patience,
             early_stopping_min_delta=config.early_stopping_min_delta,
         )
         
-        self.experience_buffer = ExperienceReplay(
-            capacity=config.self_play.replay_buffer_size
+        # QuickTrainer for final episode evaluation
+        self.quick_trainer = QuickTrainer(
+            train_loader=train_loader,
+            test_loader=test_loader,
+            device=self.device,
+            max_epochs=10
         )
         
-        self.loss_fn = PolicyValueLoss(
-            value_weight=config.supervised.value_loss_weight,
-            entropy_weight=config.supervised.entropy_weight
+        self.experience_buffer = ExperienceReplay(
+            capacity=10000  # Replay buffer size
         )
         
         # Optimizer
         self.optimizer = optim.Adam(
             self.policy_value_net.parameters(),
-            lr=config.supervised.learning_rate,
-            weight_decay=config.supervised.weight_decay
+            lr=config.model.learning_rate if hasattr(config.model, 'learning_rate') else 1e-3,
+            weight_decay=1e-4
         )
         
         # Training state
@@ -132,7 +118,7 @@ class ArchitectureTrainer:
             self.logger.addHandler(fh)
 
         print(f"ArchitectureTrainer initialized on {self.device}")
-        print(f"Total episodes: {self.curriculum.total_episodes}")
+        print(f"Starting AlphaZero-style MCTS training (no curriculum, pure self-play)")
     
     def cleanup(self):
         """Clean up trainer resources"""
@@ -154,15 +140,8 @@ class ArchitectureTrainer:
         print("Trainer cleanup completed")
     
     def run_training_episode(self) -> Dict[str, Any]:
-        """Run one complete training episode
-        
-        Note: MCTS tree (mcts_root) is maintained within this episode but NOT saved in checkpoints.
-        Each new episode starts with a fresh tree (mcts_root=None). This is intentional because:
-        - Each episode explores a different architecture design trajectory
-        - Tree reuse is beneficial within an episode but not across episodes
-        - Starting fresh each episode provides exploration diversity
-        """
-        print(f"Starting episode {self.episode} (stage: {self.curriculum.get_stage()})")
+        """Run one complete training episode using AlphaZero-style MCTS."""
+        print(f"Starting episode {self.episode}")
         # Initialize architecture
         current_arch = NeuralArchitecture()
         
@@ -171,36 +150,23 @@ class ArchitectureTrainer:
         episode_steps = 0
         step_times = []  # Track time for each step
         
-        # Get current training parameters
-        train_params = self.curriculum.get_training_parameters()
-        
         # Initialize MCTS tree reuse (for persistent tree across steps WITHIN this episode)
-        # Not saved in checkpoints - each episode starts fresh for exploration diversity
         mcts_root = None  # Will store the selected child node for next iteration
         
-        # Run search until convergence or max steps
+        # Run MCTS-guided search until convergence or max steps
         for step in range(self.config.search.max_steps_per_episode):
             print(f"Step {step + 1}/{self.config.search.max_steps_per_episode}:")
             step_start_time = time.time()
-            # Decide whether to use policy network or MCTS
-            use_policy = np.random.random() < train_params["policy_mix_ratio"]
-
-            if use_policy and train_params["stage"] != "supervised":
-                # Use policy network directly (faster than MCTS)
-                next_action = self._get_policy_action(current_arch, train_params["temperature"])
-                # Don't reuse tree when using policy network (tree is out of sync)
-                mcts_root = None
-                search_root = None
-            else:  
-                # Returns: (selected_child, search_root)
-                best_node, search_root = self.neural_mcts.search(
-                    current_arch,
-                    iterations=self.config.mcts.num_simulations,
-                    temperature=self.config.mcts.temperature,
-                    reuse_root=mcts_root  # Reuse tree from previous step
-                )
-                
-                next_action = best_node.action if best_node else None
+            
+            # MCTS search (always, no policy_mix_ratio since we're pure AlphaZero now)
+            best_node, search_root = self.neural_mcts.search(
+                current_arch,
+                iterations=self.config.mcts.num_simulations,
+                temperature=self.config.mcts.temperature,
+                reuse_root=mcts_root  # Reuse tree from previous step
+            )
+            
+            next_action = best_node.action if best_node else None
 
             if next_action is None:
                 print("No valid action found, terminating episode")
@@ -224,11 +190,7 @@ class ArchitectureTrainer:
                 traceback.print_exc()
                 raise RuntimeError("Action application failed")
 
-            # Update the quick trainer's model with the new architecture
-            self.quick_trainer.update_architecture(new_arch)
-
             # Draw architecture diagram after action (save every step for debugging)
-            # In tmux, plt.savefig buffers may not flush immediately, so we force close/flush
             self._draw_architecture_diagram(new_arch, step)
             reward = self._evaluate_architecture(new_arch)
 
@@ -241,7 +203,7 @@ class ArchitectureTrainer:
 
             # Store experience with MCTS visit distribution
             experience = self._create_experience(
-                current_arch, next_action, reward, new_arch, train_params["stage"],
+                current_arch, next_action, reward, new_arch,
                 search_root=search_root  # Contains visit distribution from MCTS
             )
             episode_experiences.append(experience)
@@ -252,7 +214,6 @@ class ArchitectureTrainer:
             episode_steps += 1
             
             # Update tree reuse: best_node IS the child node we want to reuse as next root
-            # Its architecture was created during expansion and matches current_arch
             if best_node is not None:
                 mcts_root = best_node
                 # Verify tree reuse correctness
@@ -262,7 +223,6 @@ class ArchitectureTrainer:
                     print(f"WARNING: Tree reuse architecture mismatch detected!")
                     print(f"  mcts_root neurons: {root_neurons}")
                     print(f"  current_arch neurons: {current_neurons}")
-                    print(f"  Difference: {set(current_neurons) - set(root_neurons)}")
                 else:
                     print(f"  Tree reuse OK: {len(root_neurons)} neurons match (visits: {best_node.visits})")
 
@@ -270,6 +230,7 @@ class ArchitectureTrainer:
             if self._should_terminate_episode(current_arch, step, reward):
                 print(f"Episode termination condition met at step {step}")
                 break
+        
         # Log tree reuse statistics
         if mcts_root is not None and hasattr(mcts_root, 'visits'):
             print(f"Episode ended with MCTS tree containing {mcts_root.visits} total visits")
@@ -280,12 +241,15 @@ class ArchitectureTrainer:
             current_arch, episode_rewards, episode_experiences, episode_steps
         )
         
+        # Evaluate final architecture with QuickTrainer to show true progress
+        final_eval = self._evaluate_final_architecture(current_arch)
+        print(f"Final Architecture Evaluation: Accuracy={final_eval['final_accuracy']:.4f}, Loss={final_eval['final_loss']:.4f} ({final_eval['method']})")
+        episode_metrics.update(final_eval)
+        
         # CRITICAL: Update all experiences with final episode reward (AlphaZero-style credit assignment)
-        # This tells the value network: "If you reach state S in this trajectory, 
-        # the final outcome was R_final" rather than just the immediate reward
         final_reward = episode_rewards[-1] if episode_rewards else 0.0
         for exp in episode_experiences:
-            exp['value_target'] = final_reward  # Replace immediate reward with final outcome
+            exp['value_target'] = final_reward
         
         # Add experiences to replay buffer
         for exp in episode_experiences:
@@ -294,19 +258,6 @@ class ArchitectureTrainer:
 
         return episode_metrics
     
-    def _get_policy_action(self, architecture: NeuralArchitecture, temperature: float) -> Action:
-        """Get action from policy network"""
-        with torch.no_grad():
-            graph_data = self._prepare_graph_data(architecture)
-            policy_output = self.policy_value_net(graph_data)
-            
-            # Use exploration based on temperature
-            exploration = temperature > 0.1
-            action = self.action_manager.select_action(
-                policy_output, architecture, exploration=exploration
-            )
-            
-            return action
     
     def _actions_match(self, action1: Action, action2: Action) -> bool:
         """Check if two actions are equivalent"""
@@ -379,18 +330,44 @@ class ArchitectureTrainer:
         return new_arch if success else None
     
     def _evaluate_architecture(self, architecture: NeuralArchitecture) -> float:
-        """Quick evaluation of architecture"""
+        """Evaluate architecture using policy-value network (lightweight, per-step)"""
         try:
-            # Use quick training for evaluation
-            accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
-            # Compute composite reward: accuracy - weight * loss
-            reward = accuracy - self.config.search.reward_loss_weight * loss
-            return reward
+            # Use policy-value network for fast evaluation during episode
+            with torch.no_grad():
+                graph_data = self._prepare_graph_data(architecture)
+                policy_output = self.policy_value_net(graph_data)
+                # Value output is the estimated accuracy
+                value = policy_output['value'].item()
+                return value
         except Exception as e:
             print(f"Evaluation error: {e}")
             traceback.print_exc()
             return 0.0
     
+    def _evaluate_final_architecture(self, architecture: NeuralArchitecture) -> Dict[str, float]:
+        """Full evaluation of final episode architecture using actual training
+        
+        This is called at the end of each episode to show true progress.
+        Uses QuickTrainer for actual training + evaluation on test set.
+        """
+        try:
+            accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
+            return {
+                'final_accuracy': accuracy,
+                'final_loss': loss,
+                'method': 'quick_trainer'
+            }
+        except Exception as e:
+            print(f"Final evaluation error: {e}")
+            traceback.print_exc()
+            # Fallback to policy-value estimate
+            estimated_value = self._evaluate_architecture(architecture)
+            return {
+                'final_accuracy': estimated_value,
+                'final_loss': 0.0,
+                'method': 'fallback_policy_network'
+            }
+
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
         """Prepare graph data for neural network"""
         graph_data = architecture.to_graph_representation()
@@ -490,7 +467,7 @@ class ArchitectureTrainer:
         }
     
     def _create_experience(self, state: NeuralArchitecture, action: Action, 
-                          reward: float, next_state: NeuralArchitecture, stage: str,
+                          reward: float, next_state: NeuralArchitecture,
                           search_root=None) -> Dict:
         """Create experience tuple with MCTS visit distribution for AlphaZero-style training"""
         experience = {
@@ -498,7 +475,6 @@ class ArchitectureTrainer:
             'action': action,
             'reward': reward,  # Immediate reward (will be replaced with final episode reward)
             'next_state': next_state,
-            'stage': stage,
             'timestamp': time.time()
         }
         
@@ -544,7 +520,6 @@ class ArchitectureTrainer:
         
         metrics = {
             'episode': self.episode,
-            'stage': self.curriculum.get_stage(),
             'steps': steps,
             'final_accuracy': final_reward,
             'average_reward': avg_reward,
@@ -579,11 +554,7 @@ class ArchitectureTrainer:
         return priority + novelty_bonus
     
     def train_on_batch(self, batch_size: int = 32):
-        """Train policy-value network on a batch of experiences with size-grouped batching
-        
-        Strategy: Group experiences by architecture size, then batch within each group.
-        This allows GPU batching for same-sized architectures while handling variable sizes.
-        """
+        """Train policy-value network on a batch of experiences (AlphaZero-style)"""
         if len(self.experience_buffer) < batch_size:
             print(f"  [Training] Skipping: replay buffer has {len(self.experience_buffer)} experiences, need {batch_size}")
             return None
@@ -610,10 +581,7 @@ class ArchitectureTrainer:
         value_loss_accum = 0.0
         total_experiences = 0
         
-        # Process each experience individually
-        # Note: Current graph transformer architecture doesn't support true batching
-        # because it pools all nodes together expecting batch_size in dim 0
-        # Future optimization: Modify transformer to use PyG batch tensor for per-graph pooling
+        # Process each experience individually (graph transformer architecture doesn't support batching)
         for arch_size, group_data in size_groups.items():
             print(f"  [Training] Processing {len(group_data)} experiences with {arch_size} neurons")
             for exp_idx, (exp, weight, idx) in enumerate(group_data):
@@ -624,22 +592,23 @@ class ArchitectureTrainer:
                 # Forward pass for single experience
                 predictions = self.policy_value_net(graph_data)
                 
-                # Compute weighted loss
+                # Compute losses: policy (cross-entropy) + value (MSE)
                 try:
-                    loss = self.loss_fn(predictions, targets) * weight
+                    policy_loss = F.cross_entropy(predictions['action_type'], 
+                                                 targets['action_type'])
+                    value_loss = F.mse_loss(predictions['value'].squeeze(),
+                                           targets['value'].squeeze())
+                    
+                    # Combine losses with weight
+                    loss = (policy_loss + value_loss) * weight
                     total_loss += loss
                     
-                    # Log individual components (for monitoring)
-                    with torch.no_grad():
-                        policy_loss_accum += F.cross_entropy(predictions['action_type'], 
-                                                      targets['action_type'])
-                        value_loss_accum += F.mse_loss(predictions['value'].squeeze(),
-                                                targets['value'].squeeze())
+                    policy_loss_accum += policy_loss.item()
+                    value_loss_accum += value_loss.item()
                 except Exception as e:
                     print(f"    [ERROR] Loss computation failed for experience {exp_idx}/{len(group_data)}")
-                    print(f"    Action type: {targets.get('action_type', 'N/A')}")
-                    print(f"    Has mcts_policy: {'mcts_policy' in targets}")
-                    print(f"    Has mcts_actions: {'mcts_actions' in targets}")
+                    print(f"    Predictions keys: {predictions.keys()}")
+                    print(f"    Targets keys: {targets.keys()}")
                     raise
             
             total_experiences += len(group_data)
@@ -651,7 +620,7 @@ class ArchitectureTrainer:
         # Gradient clipping
         torch.nn.utils.clip_grad_norm_(
             self.policy_value_net.parameters(), 
-            self.config.supervised.max_grad_norm
+            max_norm=1.0
         )
         
         self.optimizer.step()
@@ -662,8 +631,8 @@ class ArchitectureTrainer:
         
         out = {
             'total_loss': total_loss.item() / total_experiences,
-            'policy_loss': policy_loss_accum.item() / total_experiences,
-            'value_loss': value_loss_accum.item() / total_experiences
+            'policy_loss': policy_loss_accum / total_experiences,
+            'value_loss': value_loss_accum / total_experiences
         }
         print(f"  [Training] Completed: total_loss={out['total_loss']:.6f}, policy={out['policy_loss']:.6f}, value={out['value_loss']:.6f}")
         return out
@@ -698,24 +667,20 @@ class ArchitectureTrainer:
         return targets
     
     def run_training(self):
-        """Run complete training process"""
+        """Run complete training process using AlphaZero-style MCTS + policy network"""
         print("Starting architecture search training...")
         
-        while not self.curriculum.is_complete():
+        while self.episode < self.config.max_episodes:
             # Run training episode
             episode_metrics = self.run_training_episode()
             
             # Train on batch if we have enough experiences
-            # Use supervised.train_interval (per-stage) rather than a nonexistent top-level alias
-            train_interval = getattr(self.config, 'train_interval', None)
-            if train_interval is None:
-                train_interval = self.config.supervised.train_interval
-
+            train_interval = getattr(self.config, 'train_interval', 10)
             if self.episode > 0 and self.episode % train_interval == 0:
                 # Train on all accumulated experiences in the buffer
                 remaining = len(self.experience_buffer)
                 while remaining > 0:
-                    batch_size = min(self.config.supervised.batch_size, remaining)
+                    batch_size = min(self.config.batch_size, remaining)
                     train_metrics = self.train_on_batch(batch_size)
                     if train_metrics:
                         episode_metrics.update(train_metrics)
@@ -732,18 +697,12 @@ class ArchitectureTrainer:
                 print(f"Immediate log/checkpoint failed: {e}")
                 traceback.print_exc()
 
-            # Checkpoint if needed (before updating episode counter)
-            if self.curriculum.should_checkpoint(self.config.checkpoint_interval):
+            # Checkpoint periodically
+            if self.episode > 0 and self.episode % self.config.checkpoint_interval == 0:
                 self._save_checkpoint()
 
-            # Update curriculum
-            self.curriculum.step()
+            # Update episode counter
             self.episode += 1
-
-            # Update learning rate
-            new_lr = self.curriculum.get_learning_rate()
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = new_lr
 
             # Log progress (less frequently to reduce I/O)
             self.training_history.append(episode_metrics)
@@ -759,18 +718,17 @@ class ArchitectureTrainer:
     def _log_episode(self, metrics: Dict):
         """Log episode metrics"""
         if self.episode % self.config.log_interval == 0:
-            stage = metrics['stage']
             accuracy = metrics['final_accuracy']
             neurons = metrics['total_neurons']
             connections = metrics['total_connections']
             
-            print(f"Episode {self.episode} ({stage}): "
+            print(f"Episode {self.episode}: "
                   f"Accuracy={accuracy:.4f}, Neurons={neurons}, "
                   f"Connections={connections}, Best={self.best_accuracy:.4f}")
 
             # Structured file logging
             try:
-                self.logger.info(f"Episode {self.episode} ({stage}) Accuracy={accuracy:.4f} "
+                self.logger.info(f"Episode {self.episode} Accuracy={accuracy:.4f} "
                                  f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}")
                 # Append JSONL metrics
                 with open(self.metrics_path, 'a', encoding='utf-8') as mf:
@@ -781,33 +739,20 @@ class ArchitectureTrainer:
                 traceback.print_exc()
     
     def _save_checkpoint(self):
-        """Save training checkpoint
+        """Save training checkpoint (AlphaZero-style, no curriculum)
         
         Note: MCTS tree state (mcts_root) is NOT saved because:
         - Tree is episode-scoped (resets between episodes)
         - Each episode should start with fresh tree for exploration diversity
         - Tree reuse is only beneficial within a single episode
-        - Saving trees would be memory-intensive and not beneficial
         """
         checkpoint = {
             'episode': self.episode,
             'policy_value_net_state': self.policy_value_net.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
-            'curriculum_state': self.curriculum.get_state(),
             'best_accuracy': self.best_accuracy,
             'training_history': self.training_history,
-            'experience_buffer': self.experience_buffer,
-            'config': self.config,
-            # Add parallelization-related state (configuration, not tree)
-            'neural_mcts_state': {
-                'evaluation_cache': self.neural_mcts.evaluation_cache,
-                'current_cycle': self.neural_mcts.current_cycle,
-                'exploration_weight': self.neural_mcts.exploration_weight,
-                'reward_loss_weight': self.neural_mcts.reward_loss_weight,
-                'iso_weight': self.neural_mcts.iso_weight,
-                'comp_weight': self.neural_mcts.comp_weight
-                # Note: mcts_root tree is NOT saved (episode-scoped, intentionally reset)
-            }
+            'config': self.config
         }
 
         filename = f"checkpoint_ep{self.episode}.pth"
@@ -822,24 +767,9 @@ class ArchitectureTrainer:
 
         self.policy_value_net.load_state_dict(checkpoint['policy_value_net_state'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        self.curriculum.set_state(checkpoint['curriculum_state'])
         self.best_accuracy = checkpoint['best_accuracy']
         self.training_history = checkpoint['training_history']
-        self.experience_buffer = checkpoint['experience_buffer']
         self.episode = checkpoint['episode'] + 1  # Start next episode
-
-        # Restore parallelization-related state
-        if 'neural_mcts_state' in checkpoint:
-            mcts_state = checkpoint['neural_mcts_state']
-            self.neural_mcts.evaluation_cache = mcts_state.get('evaluation_cache', {})
-            self.neural_mcts.current_cycle = mcts_state.get('current_cycle', self.neural_mcts.current_cycle)
-            self.neural_mcts.exploration_weight = mcts_state.get('exploration_weight', self.neural_mcts.exploration_weight)
-            self.neural_mcts.reward_loss_weight = mcts_state.get('reward_loss_weight', self.neural_mcts.reward_loss_weight)
-            self.neural_mcts.iso_weight = mcts_state.get('iso_weight', self.neural_mcts.iso_weight)
-            self.neural_mcts.comp_weight = mcts_state.get('comp_weight', self.neural_mcts.comp_weight)
-
-        # Ensure curriculum episode_count matches the resumed episode
-        self.curriculum.episode_count = self.episode
 
         print(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
 
@@ -853,20 +783,30 @@ class ArchitectureTrainer:
             # Create a directed graph
             G = nx.DiGraph()
 
-            # Add nodes with attributes
+            # Separate neurons by type
+            input_neurons = []
+            hidden_neurons = []
+            output_neurons = []
+            
             for neuron_id, neuron in architecture.neurons.items():
-                node_label = f"N{neuron_id}\n{neuron.neuron_type.value[:3]}\n{neuron.activation.value[:3]}"
+                node_label = str(neuron_id)  # Only show ID
                 node_color = {
-                    'input': 'lightblue',
-                    'hidden': 'lightgreen',
-                    'output': 'lightcoral'
+                    'input': '#3498db',      # Blue for inputs
+                    'hidden': '#2ecc71',     # Green for hidden
+                    'output': '#e74c3c'      # Red for outputs
                 }.get(neuron.neuron_type.value, 'gray')
 
                 G.add_node(neuron_id,
                           label=node_label,
                           color=node_color,
-                          layer=neuron.layer_position,
                           type=neuron.neuron_type.value)
+                
+                if neuron.neuron_type.value == 'input':
+                    input_neurons.append(neuron_id)
+                elif neuron.neuron_type.value == 'hidden':
+                    hidden_neurons.append(neuron_id)
+                elif neuron.neuron_type.value == 'output':
+                    output_neurons.append(neuron_id)
 
             # Add edges
             for conn in architecture.connections:
@@ -875,24 +815,30 @@ class ArchitectureTrainer:
                               weight=abs(conn.weight),
                               color='red' if conn.weight < 0 else 'blue')
 
-            # Create positions based on layer positions
+            # Create positions: inputs on left, outputs on right, hidden random in between
             pos = {}
-            layers = {}
-            for neuron_id, neuron in architecture.neurons.items():
-                layer_pos = neuron.layer_position
-                if layer_pos not in layers:
-                    layers[layer_pos] = []
-                layers[layer_pos].append(neuron_id)
-
-            # Sort layers
-            sorted_layers = sorted(layers.keys())
-            for layer_idx, layer_pos in enumerate(sorted_layers):
-                neurons_in_layer = layers[layer_pos]
-                # Sort neurons within layer by ID for consistent layout
-                neurons_in_layer.sort()
-                y_positions = np.linspace(1, -1, len(neurons_in_layer))
-                for i, neuron_id in enumerate(neurons_in_layer):
-                    pos[neuron_id] = (layer_pos, y_positions[i])
+            
+            # Position input neurons on the left (x=0)
+            input_neurons.sort()
+            if input_neurons:
+                y_positions = np.linspace(1, -1, len(input_neurons))
+                for i, neuron_id in enumerate(input_neurons):
+                    pos[neuron_id] = (0.0, y_positions[i])
+            
+            # Position output neurons on the right (x=2)
+            output_neurons.sort()
+            if output_neurons:
+                y_positions = np.linspace(1, -1, len(output_neurons))
+                for i, neuron_id in enumerate(output_neurons):
+                    pos[neuron_id] = (2.0, y_positions[i])
+            
+            # Position hidden neurons randomly in 2D space between inputs and outputs
+            # Use neuron_id as seed for reproducibility across runs
+            for neuron_id in hidden_neurons:
+                rng = np.random.RandomState(neuron_id)
+                x = rng.uniform(0.3, 1.7)  # Random x between input and output layers
+                y = rng.uniform(-1.2, 1.2)  # Random y spread
+                pos[neuron_id] = (x, y)
 
             # Draw the graph
             plt.figure(figsize=(12, 8))

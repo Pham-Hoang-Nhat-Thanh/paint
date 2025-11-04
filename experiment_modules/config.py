@@ -27,9 +27,9 @@ class ModelConfig:
 
 @dataclass
 class MCTSConfig:
-    """Configuration for Neural MCTS"""
+    """Configuration for AlphaZero-style Neural MCTS (no rollouts)"""
     # Search parameters
-    num_simulations: int = 200 # With earlier stopping, more simulations help compensate
+    num_simulations: int = 100
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -38,86 +38,6 @@ class MCTSConfig:
     max_children: int = 50
     temperature: float = 1.0
     temperature_decay: float = 0.99
-    
-    # Rollout settings
-    rollout_depth: int = 20  # Increased for deeper rollouts
-    use_value_network: bool = True
-
-@dataclass
-class TrainingStageConfig:
-    """Base configuration for each training stage"""
-    # Training parameters
-    batch_size: int = 32
-    learning_rate: float = 1e-3
-    weight_decay: float = 1e-4
-    max_grad_norm: float = 1.0
-    
-    # Loss weights
-    value_loss_weight: float = 1.0
-    policy_loss_weight: float = 1.0
-    entropy_weight: float = 0.01
-    
-    # Update frequency
-    train_interval: int = 1
-    target_update_interval: int = 100
-
-@dataclass
-class SupervisedConfig(TrainingStageConfig):
-    """Configuration for supervised pretraining stage"""
-    num_episodes: int = 50
-    learning_rate: float = 1e-3
-    batch_size: int = 32
-    
-    # Expert data
-    expert_data_path: str = "data/expert_architectures.pkl"
-    min_expert_accuracy: float = 0.85
-    
-    # Curriculum
-    warmup_epochs: int = 10
-    use_teacher_forcing: bool = True
-
-@dataclass
-class MixedConfig(TrainingStageConfig):
-    """Configuration for mixed exploration stage"""
-    num_episodes: int = 150
-    learning_rate: float = 5e-4
-    
-    # Policy vs MCTS mixing
-    initial_policy_ratio: float = 0.0
-    final_policy_ratio: float = 0.7
-    mixing_schedule: str = "linear"
-    
-    # Exploration
-    initial_temperature: float = 1.0
-    final_temperature: float = 0.5
-    
-    # Experience replay
-    replay_buffer_size: int = 5000
-    initial_buffer_size: int = 1000
-
-@dataclass
-class SelfPlayConfig(TrainingStageConfig):
-    """Configuration for self-play RL stage"""
-    num_episodes: int = 300
-    learning_rate: float = 1e-4
-    
-    # Policy guidance
-    policy_ratio: float = 0.9
-    temperature: float = 0.1
-    
-    # Experience replay
-    replay_buffer_size: int = 10000
-    priority_alpha: float = 0.6
-    priority_beta: float = 0.4
-    priority_epsilon: float = 1e-6
-    
-    # Training stability
-    target_update_interval: int = 50
-    gradient_clip: float = 1.0
-    
-    # Learning rate scheduling
-    lr_schedule: str = "cosine"
-    warmup_episodes: int = 10
 
 @dataclass
 class ArchitectureSearchConfig:
@@ -125,12 +45,12 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 100  # Increased for deeper guided MCTS iterations
+    max_steps_per_episode: int = 500  # Increased to allow more complex architectures
 
     # Evaluation
     quick_train_epochs: int = 0.1  # Reduced for faster evaluations
     final_train_epochs: int = 10
-    evaluation_batch_size: int = 32  # Increased for faster evaluation with larger batches
+    evaluation_batch_size: int = 64  # Increased for faster evaluation with larger batches
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -157,41 +77,41 @@ class ArchitectureSearchConfig:
 
 @dataclass
 class OverallConfig:
-    """Complete training configuration"""
+    """Complete training configuration for AlphaZero-style MCTS + policy network"""
     # Model
     model: ModelConfig = field(default_factory=ModelConfig)
 
     # MCTS
     mcts: MCTSConfig = field(default_factory=MCTSConfig)
 
-    # Training stages
-    supervised: SupervisedConfig = field(default_factory=SupervisedConfig)
-    mixed: MixedConfig = field(default_factory=MixedConfig)
-    self_play: SelfPlayConfig = field(default_factory=SelfPlayConfig)
-
     # Architecture search
     search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
     
+    # Training parameters (unified, no staged configs)
+    batch_size: int = 32
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-4
+    max_grad_norm: float = 1.0
+    max_episodes: int = 500
+    
     # System
-    device: str = "cuda:1"  # Options: "auto" (picks GPU with most free memory), "cpu", or "cuda:X" (specific GPU)
-                             # Note: Environment variable GPU_ID=X overrides this setting
-    gpu_memory_fraction: float = 0.9  # Fraction of GPU memory to use (0.1-1.0)
+    device: str = "cuda:1"  # Options: "auto", "cpu", or "cuda:X"
+    gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
-    memory_check_threshold_mb: float = 5000  # Minimum free memory threshold in MB
+    memory_check_threshold_mb: float = 5000
     seed: int = 42
     log_dir: str = "logs/"
     checkpoint_dir: str = "checkpoints/"
     
     # Monitoring
     eval_interval: int = 10
-    checkpoint_interval: int = 1
+    checkpoint_interval: int = 10
     log_interval: int = 2
-    # Global training interval (how often to run training steps across episodes)
-    train_interval: int = 1
+    train_interval: int = 10  # Train every N episodes
 
     # GPU optimizations
     use_mixed_precision: bool = True
-    gradient_accumulation_steps: int = 1  # Reduced for faster training
+    gradient_accumulation_steps: int = 1
     enable_tf32: bool = True
 
     # Early stopping

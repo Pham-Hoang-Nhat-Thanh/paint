@@ -4,12 +4,10 @@ from blueprint_modules.action import Action, ActionSpace, ActionType
 from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
 from torch.distributions import Categorical
-from typing import Dict, List
+from typing import Dict
 import torch
 import math
 import numpy as np
-import traceback
-from concurrent.futures import ProcessPoolExecutor
 
 class NeuralMCTSNode(MCTSNode):
     """MCTS node enhanced with neural network predictions"""
@@ -67,21 +65,18 @@ class NeuralMCTS(MCTS):
     """MCTS enhanced with neural network guidance"""
 
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
-                 device: str = 'cpu', exploration_weight: float = 1.0, curriculum=None, quick_trainer=None, reward_loss_weight=0.01,
-                 iso_weight: float = 0.01, comp_weight: float = 0.0, early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001):
+                 device: str = 'cpu', exploration_weight: float = 1.0,
+                 iso_weight: float = 0.01, comp_weight: float = 0.0, 
+                 early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001):
         super().__init__(action_space, None, exploration_weight)
         self.policy_value_net = policy_value_net
         self.device = device
-        self.curriculum = curriculum
-        self.quick_trainer = quick_trainer
-        self.reward_loss_weight = reward_loss_weight
-        # Reward shaping weights: penalize isolated neurons and optionally penalize connection count
         self.iso_weight = iso_weight
         self.comp_weight = comp_weight
         # Early stopping settings
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
-        # Cache for evaluations to avoid redundant computations on architectures with identical isolated hidden neurons
+        # Cache for evaluations to avoid redundant computations
         self.evaluation_cache = {}
         # Evolutionary cycle tracking
         self.current_cycle = EvolutionaryCycle()
@@ -115,68 +110,20 @@ class NeuralMCTS(MCTS):
         
         return graph_data
 
-    def _value_from_quick_trainer(self, architecture: NeuralArchitecture, node_action: Action = None, is_simulation: bool = False) -> float:
-        """Compute shaped value from quick_trainer (accuracy/loss) plus isolation/complexity terms.
-
-        node_action: optional Action that produced the architecture (used to give a one-step grace to newly added neurons).
-        is_simulation: when True, be conservative about granting grace (simulations often can't identify new neuron ids reliably).
-        """
-        if not self.quick_trainer:
-            return np.random.uniform(0.0, 0.5)
-
-        try:
-            # Update the quick trainer's model with the new architecture
-            self.quick_trainer.update_architecture(architecture)
-            accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
-        except Exception:
-            traceback.print_exc()
-            return np.random.uniform(0.0, 0.5)
-
-        base_reward = accuracy - self.reward_loss_weight * loss
-
-        # Determine ignore ids for grace period: only when we have a node_action that added a neuron
-        ignore_ids = set()
-        if not is_simulation and node_action is not None:
-            try:
-                if node_action.action_type == ActionType.ADD_NEURON and architecture.next_neuron_id > 0:
-                    # newly added neuron id should be last allocated id
-                    ignore_ids.add(architecture.next_neuron_id - 1)
-            except Exception:
-                traceback.print_exc()
-                pass
-
-        isolated = architecture.count_isolated_neurons(ignore_ids=ignore_ids, only_hidden=True)
-        total_hidden = sum(1 for n in architecture.neurons.values() if n.neuron_type == NeuronType.HIDDEN and n.id not in ignore_ids)
-        total_hidden = max(1, total_hidden)
-        iso_term = isolated / total_hidden
-
-        num_conn = architecture.num_connections()
-        num_neurons = max(1, architecture.num_neurons())
-        comp_term = num_conn / num_neurons
-
-        return base_reward - self.iso_weight * iso_term - self.comp_weight * comp_term
 
     def _evaluate_node(self, node: NeuralMCTSNode, is_simulation: bool = False) -> float:
-        """Evaluate a node using quick_trainer in supervised stage or the policy-value net."""
-
-        # Determine stage
-        if self.curriculum:
-            train_params = self.curriculum.get_training_parameters()
-            stage = train_params.get('stage', 'supervised')
-        else:
-            stage = 'supervised' if self.quick_trainer else 'policy'
-
-        if stage == 'supervised' and self.quick_trainer:
-            value = self._value_from_quick_trainer(node.architecture, node_action=node.action, is_simulation=is_simulation)
-        else:
-            # Ensure we have a policy_value for this node
-            if node.policy_value is None:
-                with torch.no_grad():
-                    graph_data = self._prepare_graph_data(node.architecture)
-                    node.policy_value = self.policy_value_net(graph_data)
-            value = node.policy_value['value'].item()
-
-        return value
+        """Evaluate a node using the policy-value network (AlphaZero style).
+        
+        No supervised stage - the policy-value network is the sole evaluator from the start.
+        It learns from MCTS-generated experience and improves over time.
+        """
+        # Ensure we have a policy_value for this node
+        if node.policy_value is None:
+            with torch.no_grad():
+                graph_data = self._prepare_graph_data(node.architecture)
+                node.policy_value = self.policy_value_net(graph_data)
+        
+        return node.policy_value['value'].item()
     
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
                temperature: float = 1.0, reuse_root: NeuralMCTSNode = None) -> NeuralMCTSNode:
@@ -217,20 +164,11 @@ class NeuralMCTS(MCTS):
         else:
             root = NeuralMCTSNode(initial_architecture)
 
-        # Get neural network predictions for root (skip in supervised stage for speed)
-        if self.curriculum:
-            train_params = self.curriculum.get_training_parameters()
-            stage = train_params.get('stage', 'supervised')
-            if stage != 'supervised':
-                with torch.no_grad():
-                    graph_data = self._prepare_graph_data(initial_architecture)
-                    policy_value = self.policy_value_net(graph_data)
-                    root.policy_value = policy_value
-        else:
-            with torch.no_grad():
-                graph_data = self._prepare_graph_data(initial_architecture)
-                policy_value = self.policy_value_net(graph_data)
-                root.policy_value = policy_value
+        # Get neural network predictions for root
+        with torch.no_grad():
+            graph_data = self._prepare_graph_data(initial_architecture)
+            policy_value = self.policy_value_net(graph_data)
+            root.policy_value = policy_value
 
         # Early stopping tracking
         best_values = []
@@ -253,8 +191,7 @@ class NeuralMCTS(MCTS):
 
             # ===== STEP 3: SIMULATE/EVALUATE =====
             # Evaluate the expanded child (or leaf node if expansion failed)
-            # Supervised stage: direct evaluation; Policy stage: rollout simulation
-            value = self._simulate(expanded_node, max_depth=5)
+            value = self._simulate(expanded_node)
 
             # ===== STEP 4: BACKUP =====
             # Propagate value up the tree
@@ -362,26 +299,11 @@ class NeuralMCTS(MCTS):
     def _expand(self, node: NeuralMCTSNode) -> NeuralMCTSNode:
         """Expand node by creating ONE new child (standard MCTS expansion).
         
-        Filters out already-expanded actions to avoid duplicates. This allows
-        natural tree widening as MCTS iterations repeatedly expand the same node.
+        Uses policy network guidance for action selection (AlphaZero style).
+        Filters out already-expanded actions to avoid duplicates.
         """
-        # Determine whether to use policy or random based on curriculum
-        if self.curriculum:
-            train_params = self.curriculum.get_training_parameters()
-            stage = train_params.get('stage', 'supervised')
-            # In supervised stage, use random actions to avoid slow policy network calls
-            if stage == 'supervised':
-                use_policy = False
-                skip_nn_calls = True
-            else:
-                use_policy = train_params['policy_mix_ratio'] > 0.0
-                skip_nn_calls = False
-        else:
-            use_policy = False  # Default to random if no curriculum
-            skip_nn_calls = True
-
-        # Get neural network predictions if needed and not skipping
-        if not node.policy_value and not skip_nn_calls:
+        # Get neural network predictions if needed
+        if not node.policy_value:
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(node.architecture)
                 node.policy_value = self.policy_value_net(graph_data)
@@ -405,16 +327,12 @@ class NeuralMCTS(MCTS):
         if not valid_actions:
             return node  # No unexpanded actions available
 
-        if use_policy and node.policy_value is not None:
-            # Use policy network to select from valid actions
-            action = action_manager.select_action(
-                node.policy_value, node.architecture, exploration=True, use_policy=True
-            )
-            # Filter to only valid unexpanded actions
-            if action not in valid_actions:
-                action = np.random.choice(valid_actions)
-        else:
-            # Random selection from valid unexpanded actions
+        # Use policy network to select from valid actions
+        action = action_manager.select_action(
+            node.policy_value, node.architecture, exploration=True, use_policy=True
+        )
+        # Filter to only valid unexpanded actions
+        if action not in valid_actions:
             action = np.random.choice(valid_actions)
 
         # Apply action to create new architecture
@@ -425,20 +343,13 @@ class NeuralMCTS(MCTS):
             # Create child node
             child = NeuralMCTSNode(new_architecture, parent=node, action=action)
 
-            # Compute prior probability for this action from policy network
-            if skip_nn_calls:
-                # In supervised stage without policy network guidance:
-                # Use uniform priors (1.0 / num_valid_actions) for unbiased exploration
-                # This ensures PUCT treats all actions equally until visit counts differ
-                child.prior_prob = 1.0 / len(all_valid_actions) if all_valid_actions else 1.0
-            else:
-                child.prior_prob = self._compute_action_prior_prob(node.policy_value, action, node.architecture)
+            # Compute prior probability from policy network
+            child.prior_prob = self._compute_action_prior_prob(node.policy_value, action, node.architecture)
 
-            # Get neural network predictions for child (skip in supervised)
-            if not skip_nn_calls:
-                with torch.no_grad():
-                    graph_data = self._prepare_graph_data(new_architecture)
-                    child.policy_value = self.policy_value_net(graph_data)
+            # Get neural network predictions for child
+            with torch.no_grad():
+                graph_data = self._prepare_graph_data(new_architecture)
+                child.policy_value = self.policy_value_net(graph_data)
             
             node.children.append(child)
             return child
@@ -515,89 +426,14 @@ class NeuralMCTS(MCTS):
 
         return prior_prob
 
-    def _simulate(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
-        """Simulate from a node and evaluate.
+    def _simulate(self, node: NeuralMCTSNode) -> float:
+        """Evaluate a node using its value (direct evaluation).
 
-        Terminology:
-        - max_depth: Maximum number of steps in the rollout simulation (default: 5 steps)
-        - Each step: One random action applied to the architecture during rollout
+        In NAS, random rollouts are not predictive because random future actions 
+        don't necessarily lead to better architectures. Instead, we use direct 
+        evaluation (quick_trainer in supervised, value network in policy stage).
         
-        Note: Parallel rollouts per iteration are wasteful in standard MCTS because:
-        - MCTS iterations already provide exploration via tree traversal
-        - Tree reuse accumulates knowledge across steps
-        - Parallel rollouts don't share information with each other
-        
-        Better to use single rollout per iteration and let the tree handle exploration.
-        Parallelization should happen at the iteration level, not rollout level.
+        This is the AlphaZero approach: neural network evaluation replaces rollouts.
         """
-        # Determine curriculum stage
-        if self.curriculum:
-            train_params = self.curriculum.get_training_parameters()
-            stage = train_params.get('stage', 'supervised')
-        else:
-            stage = 'supervised' if self.quick_trainer else 'policy'
+        return self._evaluate_node(node, is_simulation=False)
 
-        # In supervised stage, use direct evaluation (no rollouts)
-        if stage == 'supervised':
-            return self._evaluate_node(node, is_simulation=False)
-
-        # In policy stage, use single rollout (tree handles exploration)
-        return self._rollout(node, max_depth)
-
-    def _rollout(self, node: NeuralMCTSNode, max_depth: int = 5) -> float:
-        """Single rollout simulation from a node using random actions.
-
-        Terminology:
-        - max_depth: Maximum number of steps (actions) to take during rollout
-        - Each step: One random action applied to the architecture
-        - Rollout: Complete simulation from current node to max_depth steps
-
-        This is the core rollout logic that can be parallelized.
-        """
-        # Copy architecture for simulation
-        current_arch = node._copy_architecture()
-
-        for _ in range(max_depth):
-            valid_actions = self.action_space.get_valid_actions(current_arch)
-            if not valid_actions:
-                break
-
-            # Randomly choose an action and apply
-            action = np.random.choice(valid_actions)
-            self.action_space.apply_action(current_arch, action)
-
-        # Evaluate the simulated architecture using the policy-value network
-        # Skip neural network evaluation in supervised stage for speed
-        if self.curriculum:
-            train_params = self.curriculum.get_training_parameters()
-            stage = train_params.get('stage', 'supervised')
-            if stage == 'supervised':
-                # Train the architecture to get real performance
-                if self.quick_trainer:
-                    accuracy, loss = self.quick_trainer.train_and_evaluate(current_arch)
-                    base_reward = accuracy - self.reward_loss_weight * loss
-
-                    # Apply connectivity / isolation penalties on simulated architecture
-                    isolated = current_arch.count_isolated_neurons(ignore_ids=set(), only_hidden=True)
-                    total_hidden = max(1, sum(1 for n in current_arch.neurons.values() if n.neuron_type == NeuronType.HIDDEN))
-                    iso_term = isolated / total_hidden
-
-                    num_conn = current_arch.num_connections()
-                    num_neurons = max(1, current_arch.num_neurons())
-                    comp_term = num_conn / num_neurons
-
-                    value = base_reward - self.iso_weight * iso_term - self.comp_weight * comp_term
-                else:
-                    value = np.random.uniform(0.0, 0.5)  # Fallback if no trainer
-            else:
-                with torch.no_grad():
-                    graph_data = self._prepare_graph_data(current_arch)
-                    policy_value = self.policy_value_net(graph_data)
-                    value = policy_value['value'].item()
-        else:
-            with torch.no_grad():
-                graph_data = self._prepare_graph_data(current_arch)
-                policy_value = self.policy_value_net(graph_data)
-                value = policy_value['value'].item()
-
-        return value

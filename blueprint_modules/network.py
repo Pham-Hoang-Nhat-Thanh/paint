@@ -60,6 +60,9 @@ class NeuralArchitecture:
     
     def _initialize_mnist_base(self):
         """Create initial 784 input + 10 output neurons for MNIST"""
+        # Initialize connection set for O(1) duplicate checking
+        self._connection_set = set()
+        
         # Input neurons (784)
         for i in range(784):
             self.add_neuron(NeuronType.INPUT, ActivationType.LINEAR, layer_position=0.0)
@@ -68,16 +71,16 @@ class NeuralArchitecture:
         for i in range(10):
             self.add_neuron(NeuronType.OUTPUT, ActivationType.LINEAR, layer_position=1.0)
 
-        # Add initial random connections to enable basic functionality
-        import random
-        random.seed(42)
-        input_ids = list(range(784))
-        for output_id in range(784, 794):
-            num_connections = 5  # Average of 5 connections per output neuron
-            selected_inputs = random.sample(input_ids, num_connections)
-            for input_id in selected_inputs:
-                weight = random.uniform(-0.1, 0.1)
-                self.add_connection(input_id, output_id, weight)
+        # Add isolated hidden neuron to allow initial connections
+        for i in range(100):
+            layer_pos = torch.rand(1).item() * 0.8 + 0.1  # Random position between 0.1 and 0.9
+            self.add_neuron(NeuronType.HIDDEN, ActivationType.RELU, layer_position=layer_pos)
+
+        # Ensure each input has at least one outgoing connection (batch random generation)
+        target_ids = torch.randint(784, 784 + 10 + 100, (784,))
+        weights = torch.rand(784)
+        for input_id in range(784):
+            self.add_connection(input_id, target_ids[input_id].item(), weight=weights[input_id].item())
     
     def add_neuron(self, neuron_type: NeuronType, activation: ActivationType, layer_position: float) -> int:
         """Add a new neuron and return its ID"""
@@ -91,12 +94,16 @@ class NeuralArchitecture:
         if source_id not in self.neurons or target_id not in self.neurons:
             return False
         
-        # Check if connection already exists
-        for conn in self.connections:
-            if conn.source_id == source_id and conn.target_id == target_id:
-                return False
+        # Use set for O(1) lookup instead of O(n) iteration
+        if not hasattr(self, '_connection_set'):
+            self._connection_set = {(conn.source_id, conn.target_id) for conn in self.connections}
+        
+        conn_key = (source_id, target_id)
+        if conn_key in self._connection_set:
+            return False
         
         self.connections.append(Connection(source_id, target_id, weight))
+        self._connection_set.add(conn_key)
         return True
     
     def remove_neuron(self, neuron_id: int) -> bool:
@@ -107,6 +114,14 @@ class NeuralArchitecture:
         neuron = self.neurons[neuron_id]
         if neuron.neuron_type in [NeuronType.INPUT, NeuronType.OUTPUT]:
             return False
+        
+        # Update connection set if it exists
+        if hasattr(self, '_connection_set'):
+            # Remove all connections involving this neuron from set
+            self._connection_set = {
+                (src, tgt) for src, tgt in self._connection_set 
+                if src != neuron_id and tgt != neuron_id
+            }
         
         # Remove all connections involving this neuron
         self.connections = [
@@ -119,6 +134,12 @@ class NeuralArchitecture:
     
     def remove_connection(self, source_id: int, target_id: int) -> bool:
         """Remove a specific connection"""
+        conn_key = (source_id, target_id)
+        
+        # Update connection set if it exists
+        if hasattr(self, '_connection_set') and conn_key in self._connection_set:
+            self._connection_set.remove(conn_key)
+        
         initial_count = len(self.connections)
         self.connections = [
             conn for conn in self.connections 
@@ -144,25 +165,22 @@ class NeuralArchitecture:
             key=lambda x: (x[1].neuron_type.value, x[1].layer_position, x[1].activation.value, x[0])
         )
         
-        # Build neuron signature and ID mapping
-        neuron_sig_parts = []
+        # Build neuron signature and ID mapping in single pass
         id_to_canonical_idx = {}
-        for canonical_idx, (neuron_id, neuron) in enumerate(sorted_neurons):
-            neuron_sig_parts.append(
-                f"{neuron.neuron_type.name}:{neuron.activation.name}:{neuron.layer_position:.4f}"
-            )
-            id_to_canonical_idx[neuron_id] = canonical_idx
+        neuron_sig_parts = [
+            f"{neuron.neuron_type.name}:{neuron.activation.name}:{neuron.layer_position:.4f}"
+            for canonical_idx, (neuron_id, neuron) in enumerate(sorted_neurons)
+            if not (id_to_canonical_idx.__setitem__(neuron_id, canonical_idx))  # Side effect: populate mapping
+        ]
         
         neuron_sig = "|".join(neuron_sig_parts)
         
-        # Build connection signature using canonical indices
-        conn_sig_parts = []
-        for conn in sorted(self.connections, key=lambda c: (c.source_id, c.target_id)):
-            if conn.enabled:
-                src_idx = id_to_canonical_idx.get(conn.source_id)
-                tgt_idx = id_to_canonical_idx.get(conn.target_id)
-                if src_idx is not None and tgt_idx is not None:
-                    conn_sig_parts.append(f"{src_idx}->{tgt_idx}")
+        # Build connection signature using canonical indices - filter and map in one pass
+        conn_sig_parts = [
+            f"{id_to_canonical_idx[conn.source_id]}->{id_to_canonical_idx[conn.target_id]}"
+            for conn in sorted(self.connections, key=lambda c: (c.source_id, c.target_id))
+            if conn.enabled and conn.source_id in id_to_canonical_idx and conn.target_id in id_to_canonical_idx
+        ]
         
         conn_sig = ",".join(conn_sig_parts)
         
@@ -170,27 +188,31 @@ class NeuralArchitecture:
     
     def to_graph_representation(self) -> Dict:
         """Convert architecture to graph format for transformer"""
-        node_features = []
         node_ids = sorted(self.neurons.keys())
         id_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
         
-        # Node features
-        for node_id in node_ids:
-            neuron_obj = self.neurons[node_id]
-            node_features.append(neuron_obj.to_feature_vector())
+        # Vectorized node features using list comprehension
+        node_features = [self.neurons[node_id].to_feature_vector() for node_id in node_ids]
         
-        # Edge indices (connections) - optimized with list comprehensions
-        sources, targets, weights = [], [], []
-        for conn in self.connections:
-            if conn.enabled and conn.source_id in id_to_index and conn.target_id in id_to_index:
-                sources.append(id_to_index[conn.source_id])
-                targets.append(id_to_index[conn.target_id])
-                weights.append(conn.weight)
+        # Pre-filter connections and build edge data in single pass
+        edge_data = [
+            (id_to_index[conn.source_id], id_to_index[conn.target_id], conn.weight)
+            for conn in self.connections
+            if conn.enabled and conn.source_id in id_to_index and conn.target_id in id_to_index
+        ]
+        
+        if edge_data:
+            sources, targets, weights = zip(*edge_data)
+            edge_index = torch.LongTensor([list(sources), list(targets)])
+            edge_weights = torch.FloatTensor(weights)
+        else:
+            edge_index = torch.LongTensor([[], []])
+            edge_weights = torch.FloatTensor([])
         
         return {
             'node_features': torch.FloatTensor(node_features),
-            'edge_index': torch.LongTensor([sources, targets]),
-            'edge_weights': torch.FloatTensor(weights),
+            'edge_index': edge_index,
+            'edge_weights': edge_weights,
             'node_mapping': id_to_index,
             'performance': self.performance_metrics
         }
@@ -214,25 +236,26 @@ class NeuralArchitecture:
         if ignore_ids is None:
             ignore_ids = set()
 
-        # Initialize degree counters
-        incoming = {nid: 0 for nid in self.neurons.keys()}
-        outgoing = {nid: 0 for nid in self.neurons.keys()}
+        # Initialize degree counters using defaultdict for cleaner code
+        from collections import defaultdict
+        incoming = defaultdict(int)
+        outgoing = defaultdict(int)
 
+        # Single pass through connections
         for conn in self.connections:
-            if not conn.enabled:
-                continue
-            if conn.source_id in outgoing:
+            if conn.enabled:
                 outgoing[conn.source_id] += 1
-            if conn.target_id in incoming:
                 incoming[conn.target_id] += 1
 
+        # Count isolated neurons
         isolated = 0
         for nid, neuron in self.neurons.items():
             if nid in ignore_ids:
                 continue
             if only_hidden and neuron.neuron_type != NeuronType.HIDDEN:
                 continue
-            if incoming.get(nid, 0) == 0 or outgoing.get(nid, 0) == 0:
+            # Check if neuron has no connections (not in dicts or count is 0)
+            if incoming[nid] == 0 or outgoing[nid] == 0:
                 isolated += 1
 
         return isolated
@@ -252,10 +275,10 @@ class NeuralArchitecture:
     
     def get_neuron_count(self) -> Dict[NeuronType, int]:
         """Count neurons by type"""
-        counts = {neuron_type: 0 for neuron_type in NeuronType}
-        for neuron in self.neurons.values():
-            counts[neuron.neuron_type] += 1
-        return counts
+        from collections import Counter
+        counts = Counter(neuron.neuron_type for neuron in self.neurons.values())
+        # Ensure all neuron types are present in result
+        return {neuron_type: counts.get(neuron_type, 0) for neuron_type in NeuronType}
     
     def to_serializable_dict(self) -> dict:
         """Convert architecture to serializable dict for multiprocessing"""
