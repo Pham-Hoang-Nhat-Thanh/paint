@@ -1,4 +1,3 @@
-history = trainer.run_training()
 # PAINT — Playing Around In Network Topologies
 
 PAINT is a research-oriented Neural Architecture Search (NAS) framework that treats architecture design as a planning problem. It combines Monte Carlo Tree Search (MCTS) with learned graph representations (Graph Transformers) to discover efficient, compact, and novel neuron-level topologies.
