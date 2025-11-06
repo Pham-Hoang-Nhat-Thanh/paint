@@ -28,15 +28,20 @@ class ModelConfig:
 class MCTSConfig:
     """Configuration for AlphaZero-style Neural MCTS (no rollouts)"""
     # Search parameters
-    num_simulations: int = 100
+    num_simulations: int = 500
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 50
+    max_children: int = 30
     temperature: float = 1.0
     temperature_decay: float = 0.99
+    
+    # Loss weighting for MCTS KL vs supervised CE
+    mcts_policy_weight: float = 1.0  # Weight for KL divergence to MCTS visit distribution
+    component_ce_weight: float = 0.25  # Initial weight for supervised cross-entropy on policy components (source/target/activation)
+    ce_anneal_episodes: int = 500  # Number of episodes over which to anneal CE weight from component_ce_weight to 0.05
 
 @dataclass
 class ArchitectureSearchConfig:
@@ -49,17 +54,16 @@ class ArchitectureSearchConfig:
     # Evaluation
     quick_train_epochs: int = 1  # Reduced for faster evaluations
     final_train_epochs: int = 5  # Increased for more thorough final training
-    evaluation_batch_size: int = 32  # Increased for faster evaluation with larger batches
+    evaluation_batch_size: int = 64  # Increased for faster evaluation with larger batches
 
     # Termination conditions
     target_accuracy: float = 0.97
-    patience: int = 20
 
     # Reward configuration
     reward_loss_weight: float = 0.1  # Weight for loss in composite reward
     reward_complexity_weight: float = 0.05  # Weight for complexity penalty in reward
     reward_accuracy_weight: float = 1.0  # Weight for accuracy in composite reward
-    priority_surprise_weight = 0.5  # Default; increase for more emphasis on surprising/informative experiences
+    priority_surprise_weight = 0.8  # Default; increase for more emphasis on surprising/informative experiences
 
     # Action space balancing
     action_exploration_boost: float = 0.5  # Boost factor for underrepresented actions
@@ -107,7 +111,7 @@ class OverallConfig:
     
     # Monitoring
     eval_interval: int = 1
-    checkpoint_interval: int = 10
+    checkpoint_interval: int = 1
     log_interval: int = 1
     train_interval: int = 2  # Train every N episodes
 
@@ -117,5 +121,5 @@ class OverallConfig:
     enable_tf32: bool = True
 
     # Early stopping
-    early_stopping_patience: int = 5
+    early_stopping_patience: int = 10
     early_stopping_min_delta: float = 0.001

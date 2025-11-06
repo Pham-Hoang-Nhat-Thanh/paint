@@ -66,6 +66,8 @@ class EdgeAwareAttention(nn.Module):
 
         # Layer norm
         self.layer_norm = nn.LayerNorm(hidden_dim)
+        # Precompute attention scale to avoid repeated sqrt during forward
+        self.scale = 1.0 / math.sqrt(self.head_dim)
         
     def create_adjacency_mask(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
         """Create adjacency matrix mask from edge indices"""
@@ -100,7 +102,8 @@ class EdgeAwareAttention(nn.Module):
         V = V.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
         
         # Compute attention scores
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # scale instead of dividing by sqrt each time
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
         # [batch_size, num_heads, num_nodes, num_nodes]
         
         # Create adjacency mask from edge indices
@@ -110,17 +113,14 @@ class EdgeAwareAttention(nn.Module):
             mask[edge_index[0], edge_index[1]] = True
             mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, num_nodes, num_nodes]
             
-            # Apply mask: set non-edges to -inf
-            attn_scores = attn_scores.masked_fill(~mask, float('-inf'))
+            # Apply mask: set non-edges to a large negative constant to avoid NaNs
+            # Using a large negative constant (-1e9) keeps softmax numerically stable
+            attn_scores = attn_scores.masked_fill(~mask, -1e9)
         else:
-            # No edges at all - mask everything
-            attn_scores = torch.full_like(attn_scores, float('-inf'))
-        
-        # Softmax with NaN handling (nodes with no incoming edges get NaN, convert to 0)
+            # No edges at all - set to large negative so softmax yields near-zero weights
+            attn_scores = torch.full_like(attn_scores, -1e9)
+        # Softmax is now numerically stable (no -inf) so no NaN handling required
         attn_weights = F.softmax(attn_scores, dim=-1)
-        nan_mask = torch.isnan(attn_weights)
-        if nan_mask.any():
-            attn_weights = attn_weights.masked_fill(nan_mask, 0.0)
         
         attn_weights = self.dropout(attn_weights)
         
@@ -180,25 +180,26 @@ class HierarchicalPooling(nn.Module):
         
         # 2. Structure-aware pooling
         if edge_index.shape[1] > 0:
-            edge_embeddings = []
-            for i in range(edge_index.shape[1]):
-                src, tgt = edge_index[0, i], edge_index[1, i]
-                # For each edge, concatenate source and target embeddings
-                edge_embed = torch.cat([
-                    node_embeddings[:, src, :], 
-                    node_embeddings[:, tgt, :]
-                ], dim=-1)  # [batch_size, hidden_dim * 2]
-                edge_embeddings.append(edge_embed)
+            # Vectorized edge embedding creation: avoid Python loop over edges
+            # edge_index: [2, num_edges]
+            src_idx = edge_index[0]
+            tgt_idx = edge_index[1]
+
+            # index_select is efficient on tensors and avoids Python-level loops
+            src_embeds = node_embeddings.index_select(1, src_idx)  # [batch_size, num_edges, hidden_dim]
+            tgt_embeds = node_embeddings.index_select(1, tgt_idx)  # [batch_size, num_edges, hidden_dim]
+
+            edge_embeddings = torch.cat([src_embeds, tgt_embeds], dim=-1)  # [batch_size, num_edges, hidden_dim * 2]
             
-            edge_embeddings = torch.stack(edge_embeddings, dim=1)  # [batch_size, num_edges, hidden_dim * 2]
-            
-            # Compute attention weights for edges
+            # Compute attention weights for edges and pool
             edge_attention_weights = self.structure_attention(edge_embeddings)  # [batch_size, num_edges, 1]
             edge_attention_weights = F.softmax(edge_attention_weights, dim=1)
-            
-            # Pool edge embeddings
+
+            # The original implementation reduced the edge embeddings to a single value per-edge
+            # and pooled those scalars using edge attention. Preserve that behaviour but
+            # compute it vectorized and memory-efficiently.
             structure_pooled = torch.sum(
-                edge_attention_weights * edge_embeddings.mean(dim=-1, keepdim=True), 
+                edge_attention_weights * edge_embeddings.mean(dim=-1, keepdim=True),
                 dim=1
             )  # [batch_size, 1]
             

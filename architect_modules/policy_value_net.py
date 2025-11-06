@@ -247,7 +247,7 @@ class ActionManager:
         self._cache_key_size = 0
     
     def get_action_masks(self, architecture: NeuralArchitecture) -> Dict[str, torch.Tensor]:
-        """Get masks for invalid actions with balanced exploration incentives"""
+        """Get masks for invalid actions"""
         neurons = architecture.neurons
         
         # Optimized: filter hidden neurons once and cache neuron type info
@@ -265,24 +265,17 @@ class ActionManager:
         action_mask = torch.full((5,), -1e9)  # 5 action types
 
         # Base validity checks (vectorized where possible)
+        # We only set validity (0) or keep as heavily-penalized (-1e9).
+        # Removed explicit exploration "buffs" so the policy head is not manually nudged here.
         if num_neurons < self.max_neurons:
             action_mask[ActionType.ADD_NEURON.value] = 0
-            # Boost neuron actions if architecture is too small
-            if num_neurons < 10:
-                action_mask[ActionType.ADD_NEURON.value] += self.exploration_boost
 
         if num_hidden > 0:
             action_mask[ActionType.REMOVE_NEURON.value] = 0
             action_mask[ActionType.MODIFY_ACTIVATION.value] = 0
-            # Boost modification actions if architecture is stable
-            if num_connections > num_neurons:
-                action_mask[ActionType.MODIFY_ACTIVATION.value] += self.exploration_boost * 0.4
 
         if num_neurons >= 2:
             action_mask[ActionType.ADD_CONNECTION.value] = 0
-            # Boost connection actions if architecture has few connections relative to neurons
-            if num_connections < num_neurons * 2 and num_neurons >= 3:
-                action_mask[ActionType.ADD_CONNECTION.value] += self.exploration_boost * 0.6
 
         if num_connections > 0:
             action_mask[ActionType.REMOVE_CONNECTION.value] = 0
@@ -415,8 +408,9 @@ class ActionManager:
         
         if action_type == ActionType.ADD_CONNECTION:
             # Use helper to prepare logits efficiently
+            # Prepare source logits using the source_neurons mask (was incorrectly using target_neurons)
             source_logits = self._prepare_logits(
-                policy_output['source_logits'], tensor_size, masks['target_neurons']
+                policy_output['source_logits'], tensor_size, masks['source_neurons']
             )
             target_logits = self._prepare_logits(
                 policy_output['target_logits'], tensor_size, masks['target_neurons']
