@@ -68,11 +68,22 @@ PAINT replaces traditional evolutionary search with a neural-guided planning app
 
 ## Configuration
 
-All main hyperparameters and defaults are in `experiment_modules/config.py` (model sizes, MCTS settings, training stages, and search constraints). Typical knobs you may tune:
+All main hyperparameters and defaults are in `experiment_modules/config.py` (model sizes, MCTS settings, training, and search constraints). Key options:
 
-- `ModelConfig.node_feature_dim`, `hidden_dim`, `num_heads`
-- `MCTSConfig.num_simulations`, `exploration_weight`
-- `ArchitectureSearchConfig.max_neurons`, `target_accuracy`
+- `ModelConfig`: `node_feature_dim`, `hidden_dim`, `num_heads`, `max_neurons`, etc.
+- `MCTSConfig`: `num_simulations`, `exploration_weight`, `max_children`, `dirichlet_alpha`, etc.
+- `ArchitectureSearchConfig`: `max_neurons`, `max_connections`, `max_steps_per_episode`, `reward_accuracy_weight`, `reward_loss_weight`, `reward_complexity_weight`, `priority_surprise_weight`, etc.
+- `OverallConfig`: `batch_size`, `learning_rate`, `device`, `checkpoint_interval`, `train_interval`, `use_mixed_precision`, etc.
+
+The reward function is now:
+
+```
+reward = (accuracy_weight × accuracy)
+	- (loss_weight × loss)
+	- (complexity_weight × complexity)
+```
+
+Experience replay uses prioritized sampling and supports checkpointing and buffer clearing.
 
 ## Example Usage (Programmatic)
 
@@ -91,6 +102,8 @@ Adjust `config` before instantiating the trainer to change search limits, model 
 
 - **Shape mismatches** (e.g., `mat1 and mat2 shapes cannot be multiplied`) usually mean `ModelConfig.node_feature_dim` does not match the feature length produced in `blueprint_modules/network.py` (`Neuron.to_feature_vector()`).
 - **Policy/mask size mismatches** often relate to `max_neurons` vs actual indexed neuron IDs. The `ActionManager` in `architect_modules/policy_value_net.py` builds masks; inspect it for related errors.
+- **Prioritized Experience Replay**: Training uses prioritized sampling, buffer checkpointing, and memory-efficient sub-batching for large graphs.
+- **Reward and Logging**: Reward combines accuracy, loss, and complexity. Logging and checkpointing are robust and episode metrics are always saved.
 - **JIT and Mixed Precision**: The code supports TorchScript JIT and mixed precision for speed on modern GPUs.
 - **Checkpoints**: Training auto-resumes from the latest checkpoint in `checkpoints/` if available.
 
@@ -101,6 +114,7 @@ PAINT is a research prototype. In experiments, it aims to:
 - Discover compact architectures that reach competitive accuracy on small benchmarks (MNIST used as a sandbox)
 - Learn transferable priors that speed up search in subsequent runs
 - Produce novel connectivity patterns driven by planning rather than mutation operators
+- Efficiently utilize GPU memory and scale to large search spaces
 
 ## Contributing
 
