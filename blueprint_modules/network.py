@@ -538,18 +538,26 @@ class GraphNeuralNetwork(nn.Module):
     
     def _precompute_activations(self):
         """Precompute activation functions without inplace operations"""
-        self.activation_modules = nn.ModuleDict()
-        
+        # Build a cache of activation modules (ActivationType -> nn.Module)
+        self.activation_module_cache = {}
+        for act in ActivationType:
+            self.activation_module_cache[act.name] = self._get_activation_module(act).to(self.device)
+
+        # For each layer, build boolean masks that indicate which neurons use which activation
+        # This allows elementwise (per-neuron) activation application in the forward pass.
+        self.activation_masks = {}
         for layer_idx, neuron_ids in self.layer_indices.items():
             if not neuron_ids:
                 continue
-                
-            # Use most common activation in layer
+
             activations = [self.architecture.neurons[nid].activation for nid in neuron_ids]
-            most_common = max(set(activations), key=activations.count)
-            
-            # NO inplace operations to avoid gradient issues
-            self.activation_modules[str(layer_idx)] = self._get_activation_module(most_common)
+            layer_masks = {}
+            for act in set(activations):
+                # boolean mask over columns in this layer's output
+                mask = torch.tensor([1 if a == act else 0 for a in activations], dtype=torch.bool, device=self.device)
+                layer_masks[act.name] = mask
+
+            self.activation_masks[str(layer_idx)] = layer_masks
     
     def _get_activation_module(self, activation_type: ActivationType) -> nn.Module:
         """Convert activation type to PyTorch module - NO inplace operations"""
@@ -639,12 +647,23 @@ class GraphNeuralNetwork(nn.Module):
                 
                 # Apply activation (gradient-safe, no inplace)
                 activation_key = str(current_layer_idx)
-                if activation_key in self.activation_modules:
-                    if use_mixed_precision:
-                        with autocast('cuda'):
-                            current_output = self.activation_modules[activation_key](current_output)
-                    else:
-                        current_output = self.activation_modules[activation_key](current_output)
+                # Apply per-neuron activations by using precomputed masks and cached modules.
+                if hasattr(self, 'activation_masks') and activation_key in self.activation_masks:
+                    layer_act_masks = self.activation_masks[activation_key]
+                    # Create a new tensor for activated output to avoid in-place ops
+                    activated_output = current_output.new_zeros(current_output.shape)
+                    for act_name, mask in layer_act_masks.items():
+                        if mask.any():
+                            act_module = self.activation_module_cache[act_name]
+                            if use_mixed_precision:
+                                with autocast('cuda'):
+                                    activated_output[:, mask] = act_module(current_output[:, mask])
+                            else:
+                                activated_output[:, mask] = act_module(current_output[:, mask])
+                    current_output = activated_output
+                else:
+                    # Fallback: no per-neuron masks available (shouldn't happen) — apply identity
+                    current_output = current_output
 
                 layer_outputs[current_layer_idx] = current_output
             else:
