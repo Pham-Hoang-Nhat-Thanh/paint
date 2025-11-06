@@ -1,10 +1,4 @@
 import numpy as np
-import random
-from typing import List, Dict, Any, Tuple
-import torch
-
-import numpy as np
-import random
 from typing import List, Dict, Any, Tuple
 import torch
 
@@ -71,3 +65,32 @@ class ExperienceReplay:
     def is_ready(self, min_size: int) -> bool:
         """Check if buffer has enough samples for training"""
         return self.size >= min_size
+
+    def state_dict(self):
+        """Serialize buffer and priorities for checkpointing"""
+        return {
+            'capacity': self.capacity,
+            'alpha': self.alpha,
+            'beta': self.beta,
+            'buffer': self.buffer,
+            'priorities': self.priorities.tolist(),
+            'position': self.position,
+            'size': self.size
+        }
+
+    def load_state_dict(self, state):
+        """Restore buffer and priorities from checkpoint"""
+        self.capacity = state.get('capacity', 10000)
+        self.alpha = state.get('alpha', 0.6)
+        self.beta = state.get('beta', 0.4)
+        self.buffer = state.get('buffer', [])
+        self.priorities = np.array(state.get('priorities', [1.0]*self.capacity), dtype=np.float32)
+        self.position = state.get('position', 0)
+        self.size = state.get('size', len(self.buffer))
+
+    def clear(self):
+        """Clear all experiences from buffer"""
+        self.buffer = []
+        self.priorities = np.zeros(self.capacity, dtype=np.float32)
+        self.position = 0
+        self.size = 0

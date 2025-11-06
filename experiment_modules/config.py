@@ -1,6 +1,5 @@
 from dataclasses import dataclass, field
 from typing import List
-import torch
 
 @dataclass
 class ModelConfig:
@@ -45,19 +44,22 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 500  # Increased to allow more complex architectures
+    max_steps_per_episode: int = 250  # Increased to allow more complex architectures
 
     # Evaluation
-    quick_train_epochs: int = 0.1  # Reduced for faster evaluations
-    final_train_epochs: int = 10
-    evaluation_batch_size: int = 64  # Increased for faster evaluation with larger batches
+    quick_train_epochs: int = 1  # Reduced for faster evaluations
+    final_train_epochs: int = 5  # Increased for more thorough final training
+    evaluation_batch_size: int = 32  # Increased for faster evaluation with larger batches
 
     # Termination conditions
     target_accuracy: float = 0.97
     patience: int = 20
 
     # Reward configuration
-    reward_loss_weight: float = 0.1  # Weight for loss in composite reward (reward = accuracy - weight * loss)
+    reward_loss_weight: float = 0.1  # Weight for loss in composite reward
+    reward_complexity_weight: float = 0.05  # Weight for complexity penalty in reward
+    reward_accuracy_weight: float = 1.0  # Weight for accuracy in composite reward
+    priority_surprise_weight = 0.5  # Default; increase for more emphasis on surprising/informative experiences
 
     # Action space balancing
     action_exploration_boost: float = 0.5  # Boost factor for underrepresented actions
@@ -92,10 +94,10 @@ class OverallConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
-    max_episodes: int = 500
+    max_episodes: int = 300
     
     # System
-    device: str = "cuda:0"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:3"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000

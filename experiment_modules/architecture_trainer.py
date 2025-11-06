@@ -69,6 +69,7 @@ class ArchitectureTrainer:
             comp_weight=config.search.comp_weight if hasattr(config.search, 'comp_weight') else 0.0,
             early_stopping_patience=config.early_stopping_patience,
             early_stopping_min_delta=config.early_stopping_min_delta,
+            max_children=config.mcts.max_children if hasattr(config.mcts, 'max_children') else 50
         )
         
         # QuickTrainer for final episode evaluation
@@ -76,7 +77,7 @@ class ArchitectureTrainer:
             train_loader=train_loader,
             test_loader=test_loader,
             device=self.device,
-            max_epochs=10
+            max_epochs=self.config.search.final_train_epochs,
         )
         
         self.experience_buffer = ExperienceReplay(
@@ -102,14 +103,17 @@ class ArchitectureTrainer:
         self.log_path = os.path.join(config.log_dir, "training.log")
         self.metrics_path = os.path.join(config.log_dir, "training_metrics.jsonl")
 
-        # Configure logger (avoid duplicate handlers) - disabled for speed
-        self.logger = logging.getLogger(f"ArchitectureTrainer")
-        self.logger.setLevel(logging.WARNING)  # Only log warnings and errors
-        # Add file handler if not present
+        # Configure logger for episode metrics
+        self.logger = logging.getLogger(f"ArchitectureTrainer_{self.episode}_{time.time()}")
+        self.logger.setLevel(logging.INFO)  # Log INFO and above (INFO, WARNING, ERROR)
+        self.logger.propagate = False  # Don't propagate to root logger to avoid duplicate logs
+        
+        # Add file handler for training logs
         abs_log_path = os.path.abspath(self.log_path)
         if not any(isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, 'baseFilename', '')) == abs_log_path
                    for h in self.logger.handlers):
             fh = logging.FileHandler(self.log_path, mode='a', encoding='utf-8')
+            fh.setLevel(logging.INFO)
             fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             self.logger.addHandler(fh)
 
@@ -242,8 +246,22 @@ class ArchitectureTrainer:
         print(f"Final Architecture Evaluation: Accuracy={final_eval['final_accuracy']:.4f}, Loss={final_eval['final_loss']:.4f} ({final_eval['method']})")
         episode_metrics.update(final_eval)
         
-        # CRITICAL: Update all experiences with final episode reward (AlphaZero-style credit assignment)
-        final_reward = episode_rewards[-1] if episode_rewards else 0.0
+        # =====CALCULATING FINAL REWARD=====
+        # CRITICAL: Update all experiences with final episode reward (use true final evaluation)
+        accuracy = float(final_eval.get('final_accuracy', episode_rewards[-1] if episode_rewards else 0.0))
+        loss = float(final_eval.get('final_loss', 0.0))
+        # normalize loss to (0,1)
+        loss_norm = loss / (1.0 + loss)
+
+        num_neurons = len(current_arch.neurons)
+        num_connections = len(current_arch.connections)
+        max_neurons = getattr(self.config.search, 'max_neurons', 0)
+        max_connections = getattr(self.config.search, 'max_connections', 0)
+        complexity_norm = ((num_neurons / max_neurons) + (num_connections / max_connections)) / 2.0 if (max_neurons > 0 and max_connections > 0) else 0.0
+
+        raw_reward = self.config.search.reward_accuracy_weight * accuracy - self.config.search.reward_loss_weight * loss_norm - self.config.search.reward_complexity_weight * complexity_norm
+        final_reward = max(0.0, raw_reward)  # Ensure non-negative reward
+
         for exp in episode_experiences:
             exp['value_target'] = final_reward
         
@@ -255,10 +273,8 @@ class ArchitectureTrainer:
         # ===== LOG EPISODE RESULTS =====
         self._log_episode(episode_metrics)
         
-        # ===== SAVE CHECKPOINT IF BEST ACCURACY =====
-        if episode_metrics.get('is_best', False):
-            self._save_checkpoint()
-            print(f"New best accuracy! Checkpoint saved.")
+        # ===== SAVE CHECKPOINT =====
+        self._save_checkpoint()
 
         return episode_metrics
     
@@ -385,6 +401,9 @@ class ArchitectureTrainer:
         sorted_neuron_ids = graph_data['sorted_neuron_ids']
         layer_positions = [architecture.neurons[neuron_id].layer_position for neuron_id in sorted_neuron_ids]
         graph_data['layer_positions'] = torch.FloatTensor([layer_positions]).to(self.device)
+        
+        # For single graphs, num_graphs is always 1 (no 'batch' tensor needed)
+        # The network.forward() will detect this and not attempt batching
         
         return graph_data
     
@@ -553,14 +572,35 @@ class ArchitectureTrainer:
         return metrics
     
     def _compute_experience_priority(self, experience: Dict, episode_metrics: Dict) -> float:
-        """Compute priority for experience replay"""
-        reward = experience['reward']
+        """Compute priority for experience replay using outcome + surprise (TD-error proxy).
+        
+        Priority reflects two signals:
+        1. OUTCOME: experiences from high-value episodes are more important
+        2. SURPRISE: |value_target - immediate_reward| = prediction error, indicates informativeness
+        3. NOVELTY: bonus for larger/more complex architectures
+        
+        This ensures replay buffer learns from both good outcomes and surprising transitions.
+        """
+        # Get immediate reward (what PV net predicted during episode)
+        immediate_reward = experience['reward']
+        
+        # Get final ground truth (QuickTrainer result or fallback)
         final_accuracy = episode_metrics['final_accuracy']
         
-        # Higher priority for experiences that lead to good final accuracy
-        priority = reward + final_accuracy
+        # Compute surprise/TD-error: how wrong was the immediate prediction?
+        # Clamp to avoid extreme priority from noise
+        surprise = abs(final_accuracy - immediate_reward)
+        surprise = min(surprise, 1.0)  # Cap at 1.0
         
-        # Bonus for novel architectures (simple heuristic)
+        # Primary priority: outcome quality (good final results get higher priority)
+        outcome_priority = final_accuracy
+        
+        # Secondary priority: surprise/informativeness (prediction errors are valuable)
+        surprise_weight = getattr(self.config.search, 'priority_surprise_weight', 0.5)
+        
+        priority = outcome_priority + surprise_weight * surprise
+        
+        # Bonus for architectures of different sizes (encourage diversity)
         neuron_count = len(experience['state'].neurons)
         connection_count = len(experience['state'].connections)
         novelty_bonus = (neuron_count + connection_count) / 1000
@@ -609,164 +649,352 @@ class ArchitectureTrainer:
             'activation': activation_mask.to(self.device),
         }
 
-    def train_on_batch(self, batch_size: int = 32):
-        """Train policy-value network on a batch of experiences (AlphaZero-style)
+    def train_on_batch(self, batch_size: int = 32, sub_batch_size: int = 4):
+        """Train with proper gradient accumulation across sub-batches.
         
-        FIX #1: Uses MCTS visit distribution as policy target (π learning)
-        FIX #2: Trains on complete factorized policy (source, target, activation)
-        FIX #3: Masks illegal actions in loss computation
+        MEMORY EFFICIENT FLOW:
+        1. Sample batch_size experiences from replay buffer
+        2. Split into sub-batches of size sub_batch_size
+        3. For each sub-batch:
+           - Process graphs through network
+           - Compute loss for this sub-batch
+           - Backward (accumulate gradients in network parameters)
+           - Clear intermediate tensors from GPU
+        4. After all sub-batches: gradient clipping and optimizer.step()
+        5. Update priorities for all experiences
+        
+        Key benefit: Never keeps all batch_size graphs in memory simultaneously.
+        Memory peak is O(sub_batch_size * avg_nodes) instead of O(batch_size * avg_nodes).
+        
+        Args:
+            batch_size: Total number of experiences to sample
+            sub_batch_size: Number of graphs per training step (default 4)
+        
+        Returns:
+            Dictionary with accumulated losses
         """
-        if len(self.experience_buffer) < batch_size:
-            print(f"  [Training] Skipping: replay buffer has {len(self.experience_buffer)} experiences, need {batch_size}")
-            return None
-        
-        print(f"  [Training] Starting with {len(self.experience_buffer)} total experiences in buffer")
-            
-        # Sample batch
+        # Sample full batch from replay buffer
         experiences, indices, weights = self.experience_buffer.sample(batch_size)
         
         if not experiences:
             return None
         
-        # Group experiences by architecture size (number of neurons)
-        size_groups = {}  # size -> [(exp, weight, index), ...]
-        for exp, weight, idx in zip(experiences, weights, indices):
-            arch_size = len(exp['state'].neurons)
-            if arch_size not in size_groups:
-                size_groups[arch_size] = []
-            size_groups[arch_size].append((exp, weight, idx))
-        
-        # Accumulate gradients across all groups
-        total_loss = 0.0
+        # Initialize gradient accumulation across all sub-batches
+        self.optimizer.zero_grad()
+        total_loss_accum = 0.0
         policy_loss_accum = 0.0
         value_loss_accum = 0.0
         mcts_policy_loss_accum = 0.0
-        total_experiences = 0
+        num_processed = 0
+        valid_indices_list = []
+        valid_rewards_list = []
         
-        # Process each experience individually (graph transformer architecture doesn't support batching)
-        for arch_size, group_data in size_groups.items():
-            print(f"  [Training] Processing {len(group_data)} experiences with {arch_size} neurons")
-            for exp_idx, (exp, weight, idx) in enumerate(group_data):
-                # Prepare graph data and targets
-                graph_data = self._prepare_graph_data(exp['state'])
-                targets = self._create_targets(exp)
-                
-                # Forward pass for single experience
-                predictions = self.policy_value_net(graph_data)
-                
-                # ===== FIX #3: Get legal action mask =====
-                action_mask = self._get_legal_action_mask(exp['state'])
-                
-                # Compute losses: policy (complete) + value (MSE) + MCTS policy (KL divergence)
-                try:
-                    # ===== FIX #3: Apply masking to predictions =====
-                    masked_action_logits = predictions['action_type'].clone()
-                    masked_action_logits[:, action_mask['action_type'] == 0] = -1e9
-                    
-                    masked_source_logits = predictions['source_logits'].clone()
-                    masked_source_logits[:, action_mask['source_neuron'] == 0] = -1e9
-                    
-                    masked_target_logits = predictions['target_logits'].clone()
-                    masked_target_logits[:, action_mask['target_neuron'] == 0] = -1e9
-                    
-                    masked_activation_logits = predictions['activation_logits'].clone()
-                    masked_activation_logits[:, action_mask['activation'] == 0] = -1e9
-                    
-                    # ===== FIX #2: Complete factorized policy loss =====
-                    action_type_loss = F.cross_entropy(
-                        masked_action_logits,
-                        targets['action_type']
-                    )
-                    
-                    source_loss = F.cross_entropy(
-                        masked_source_logits,
-                        targets['source_neuron']
-                    ) if 'source_neuron' in targets else torch.tensor(0.0)
-                    
-                    target_loss = F.cross_entropy(
-                        masked_target_logits,
-                        targets['target_neuron']
-                    ) if 'target_neuron' in targets else torch.tensor(0.0)
-                    
-                    activation_loss = F.cross_entropy(
-                        masked_activation_logits,
-                        targets['activation']
-                    ) if 'activation' in targets else torch.tensor(0.0)
-                    
-                    # Combine all policy components
-                    total_policy_loss = (action_type_loss + source_loss + target_loss + activation_loss) / 4.0
-                    
-                    # ===== FIX #1: MCTS policy learning (KL divergence) =====
-                    # Network learns to predict MCTS-improved policy π(s)
-                    mcts_policy_loss = torch.tensor(0.0, device=self.device)
-                    if 'mcts_policy' in targets and targets['mcts_policy'] is not None:
-                        try:
-                            mcts_policy_tensor = targets['mcts_policy'].unsqueeze(0).to(self.device)
-                            # KL divergence: D_KL(MCTS || network)
-                            mcts_policy_loss = F.kl_div(
-                                F.log_softmax(masked_action_logits, dim=1),
-                                mcts_policy_tensor,
-                                reduction='batchmean'
-                            ) * 0.5  # Weight this loss component
-                            mcts_policy_loss_accum += mcts_policy_loss.item()
-                        except Exception as e:
-                            print(f"    [Warning] MCTS policy loss skipped: {e}")
-                    
-                    # Value loss (existing)
-                    value_loss = F.mse_loss(
-                        predictions['value'].squeeze(),
-                        targets['value'].squeeze()
-                    )
-                    
-                    # Total loss: policy + value + MCTS policy (AlphaZero)
-                    loss = (total_policy_loss + value_loss + mcts_policy_loss) * weight
-                    total_loss += loss
-                    
-                    policy_loss_accum += total_policy_loss.item()
-                    value_loss_accum += value_loss.item()
-                    
-                except Exception as e:
-                    print(f"    [ERROR] Loss computation failed for experience {exp_idx}/{len(group_data)}")
-                    print(f"    Predictions keys: {predictions.keys()}")
-                    print(f"    Targets keys: {targets.keys()}")
-                    raise
+        # Process batch in smaller sub-batches for true gradient accumulation
+        num_sub_batches = (len(experiences) + sub_batch_size - 1) // sub_batch_size
+        print(f"  [Training] Processing {len(experiences)} graphs in {num_sub_batches} sub-batches (size={sub_batch_size})")
+        
+        for sub_batch_idx in range(0, len(experiences), sub_batch_size):
+            sub_batch_end = min(sub_batch_idx + sub_batch_size, len(experiences))
+            sub_experiences = experiences[sub_batch_idx:sub_batch_end]
+            sub_weights = weights[sub_batch_idx:sub_batch_end]
+            sub_indices = indices[sub_batch_idx:sub_batch_end]
             
-            total_experiences += len(group_data)
+            # Process this sub-batch and accumulate losses
+            sub_result = self._process_sub_batch(sub_experiences, sub_weights, sub_indices)
+            
+            if sub_result is not None:
+                # Backward on this sub-batch (accumulates gradients)
+                sub_result['loss'].backward()
+                
+                # Accumulate metrics
+                total_loss_accum += sub_result['total_loss']
+                policy_loss_accum += sub_result['policy_loss']
+                value_loss_accum += sub_result['value_loss']
+                mcts_policy_loss_accum += sub_result['mcts_policy_loss']
+                num_processed += sub_result['num_graphs']
+                
+                # Track for priority updates
+                valid_indices_list.extend(sub_result['valid_indices'])
+                valid_rewards_list.extend(sub_result['valid_rewards'])
+            
+            # Clear cache after each sub-batch to prevent memory fragmentation
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
         
-        # Backward pass
-        self.optimizer.zero_grad()
-        total_loss.backward()
+        if num_processed == 0:
+            print(f"  [Training] No legal actions in batch, skipping")
+            return None
         
-        # Gradient clipping
+        # Single optimizer step after all sub-batches (where accumulated gradients apply)
         torch.nn.utils.clip_grad_norm_(
             self.policy_value_net.parameters(), 
             max_norm=1.0
         )
-        
         self.optimizer.step()
         
-        # Update priorities
-        new_priorities = [abs(exp['reward']) for exp in experiences]
-        self.experience_buffer.update_priorities(indices, new_priorities)
+        # Update priorities for all valid experiences
+        if valid_indices_list:
+            self.experience_buffer.update_priorities(valid_indices_list, valid_rewards_list)
         
-        out = {
-            'total_loss': total_loss.item() / total_experiences,
-            'policy_loss': policy_loss_accum / total_experiences,
-            'value_loss': value_loss_accum / total_experiences,
-            'mcts_policy_loss': mcts_policy_loss_accum / total_experiences if total_experiences > 0 else 0.0
+        # Return averaged metrics
+        metrics = {
+            'total_loss': total_loss_accum / num_processed if num_processed > 0 else 0.0,
+            'policy_loss': policy_loss_accum / num_processed if num_processed > 0 else 0.0,
+            'value_loss': value_loss_accum / num_processed if num_processed > 0 else 0.0,
+            'mcts_policy_loss': mcts_policy_loss_accum / num_processed if num_processed > 0 else 0.0,
+            'num_graphs': num_processed
         }
-        print(f"  [Training] Completed:")
-        print(f"    total_loss={out['total_loss']:.6f}, policy={out['policy_loss']:.6f}, value={out['value_loss']:.6f}, mcts_policy={out['mcts_policy_loss']:.6f}")
-        return out
+        
+        print(f"  [Training] Batch complete ({num_processed} graphs):")
+        print(f"    total_loss={metrics['total_loss']:.6f}, policy={metrics['policy_loss']:.6f}, value={metrics['value_loss']:.6f}, mcts_policy={metrics['mcts_policy_loss']:.6f}")
+        
+        return metrics
+    
+    def _process_sub_batch(self, experiences, weights, indices):
+        """Process a single sub-batch and compute loss for gradient accumulation.
+        
+        This method handles:
+        1. Preparing graph data
+        2. Checking action legality
+        3. Creating training targets
+        4. Running forward pass
+        5. Computing losses
+        
+        Returns the total loss WITHOUT doing backward - caller does backward for gradient accumulation.
+        
+        Args:
+            experiences: List of experience dicts
+            weights: List of sample weights for prioritized replay
+            indices: List of buffer indices for priority updates
+        
+        Returns:
+            Dict with:
+                - loss: scalar tensor (requires grad for backward)
+                - total_loss: float value
+                - policy_loss: float value
+                - value_loss: float value
+                - mcts_policy_loss: float value
+                - num_graphs: int (number of valid graphs)
+                - valid_indices: list of buffer indices for priority update
+                - valid_rewards: list of rewards for priority update
+        """
+        import math
+        
+        # Prepare graph data for this sub-batch
+        graph_data_list = []
+        targets_list = []
+        weights_list = []
+        action_masks_list = []
+        valid_indices_list = []
+        valid_experiences = []
+        
+        for exp_idx, (exp, weight, idx) in enumerate(zip(experiences, weights, indices)):
+            # Prepare graph data
+            graph_data = self._prepare_graph_data(exp['state'])
+            
+            # Check action legality
+            action_mask = self._get_legal_action_mask(exp['state'])
+            action = exp['action']
+            
+            # Validate action components
+            is_action_type_legal = action_mask['action_type'][action.action_type.value] > 0
+            if not is_action_type_legal:
+                continue
+            
+            is_source_legal = (action.source_neuron is None or 
+                             (action.source_neuron < len(action_mask['source_neuron']) and 
+                              action_mask['source_neuron'][action.source_neuron] > 0))
+            is_target_legal = (action.target_neuron is None or 
+                             (action.target_neuron < len(action_mask['target_neuron']) and 
+                              action_mask['target_neuron'][action.target_neuron] > 0))
+            is_activation_legal = (action.activation is None or action_mask['activation'].max() > 0)
+            
+            if not (is_source_legal and is_target_legal and is_activation_legal):
+                continue
+            
+            # Create targets
+            targets = self._create_targets(exp)
+            
+            # Store valid experience
+            valid_experiences.append(exp)
+            graph_data_list.append(graph_data)
+            targets_list.append(targets)
+            weights_list.append(weight.item() if isinstance(weight, torch.Tensor) else weight)
+            action_masks_list.append(action_mask)
+            valid_indices_list.append(idx)
+        
+        if not graph_data_list:
+            return None
+        
+        # Batch the graph data (only for this sub-batch)
+        batched_graph_data = self._batch_graph_data(graph_data_list)
+        num_graphs = len(graph_data_list)
+        
+        # Forward pass on sub-batch through network
+        # No internal sub-batching needed since sub-batch is already small
+        predictions = self.policy_value_net(batched_graph_data, sub_batch_size=num_graphs)
+        
+        # Compute losses for this sub-batch
+        total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        policy_loss_sum = 0.0
+        value_loss_sum = 0.0
+        mcts_policy_loss_sum = 0.0
+        
+        try:
+            action_type_logits = predictions['action_type']  # [num_graphs, 5]
+            source_logits = predictions['source_logits']      # [num_graphs, max_neurons]
+            target_logits = predictions['target_logits']      # [num_graphs, max_neurons]
+            activation_logits = predictions['activation_logits']  # [num_graphs, num_activations]
+            values = predictions['value']                      # [num_graphs, 1]
+            
+            graph_losses = []
+            
+            for graph_idx in range(num_graphs):
+                action_mask = action_masks_list[graph_idx]
+                targets = targets_list[graph_idx]
+                weight = weights_list[graph_idx]
+                
+                # Extract this graph's predictions
+                action_logits = action_type_logits[graph_idx:graph_idx+1]  # [1, 5]
+                source_pred = source_logits[graph_idx:graph_idx+1]  # [1, max_neurons]
+                target_pred = target_logits[graph_idx:graph_idx+1]  # [1, max_neurons]
+                activation_pred = activation_logits[graph_idx:graph_idx+1]  # [1, num_activations]
+                value_pred = values[graph_idx:graph_idx+1]  # [1, 1]
+                
+                # Apply action legality masking
+                masked_action_logits = action_logits.clone()
+                action_mask_bool = (action_mask['action_type'].to(self.device) == 0).unsqueeze(0)
+                masked_action_logits = masked_action_logits.masked_fill(action_mask_bool, -1e9)
+                
+                masked_source_logits = source_pred.clone()
+                source_mask_bool = (action_mask['source_neuron'].to(self.device) == 0).unsqueeze(0)
+                masked_source_logits = masked_source_logits.masked_fill(source_mask_bool, -1e9)
+                
+                masked_target_logits = target_pred.clone()
+                target_mask_bool = (action_mask['target_neuron'].to(self.device) == 0).unsqueeze(0)
+                masked_target_logits = masked_target_logits.masked_fill(target_mask_bool, -1e9)
+                
+                masked_activation_logits = activation_pred.clone()
+                activation_mask_bool = (action_mask['activation'].to(self.device) == 0).unsqueeze(0)
+                masked_activation_logits = masked_activation_logits.masked_fill(activation_mask_bool, -1e9)
+                
+                # Compute policy losses
+                action_type_target = torch.tensor([targets['action_type']], dtype=torch.long, device=self.device)
+                action_type_loss = F.cross_entropy(masked_action_logits, action_type_target)
+                
+                source_loss = torch.tensor(0.0, device=self.device)
+                if 'source_neuron' in targets:
+                    source_target = torch.tensor([targets['source_neuron']], dtype=torch.long, device=self.device)
+                    source_loss = (F.cross_entropy(masked_source_logits, source_target) / 
+                                  max(1.0, math.log(self.config.model.max_neurons)))
+                
+                target_loss = torch.tensor(0.0, device=self.device)
+                if 'target_neuron' in targets:
+                    target_target = torch.tensor([targets['target_neuron']], dtype=torch.long, device=self.device)
+                    target_loss = (F.cross_entropy(masked_target_logits, target_target) / 
+                                  max(1.0, math.log(self.config.model.max_neurons)))
+                
+                activation_loss = torch.tensor(0.0, device=self.device)
+                if 'activation' in targets:
+                    activation_target = torch.tensor([targets['activation']], dtype=torch.long, device=self.device)
+                    activation_loss = (F.cross_entropy(masked_activation_logits, activation_target) / 
+                                      max(1.0, math.log(len(ActivationType))))
+                
+                loss_count = sum([1, 
+                                 1 if 'source_neuron' in targets else 0,
+                                 1 if 'target_neuron' in targets else 0,
+                                 1 if 'activation' in targets else 0])
+                policy_loss = (action_type_loss + source_loss + target_loss + activation_loss) / max(1, loss_count)
+                
+                # Compute value loss
+                value_target = targets['value'].squeeze() if targets['value'].dim() > 1 else targets['value']
+                value_pred_squeezed = value_pred.squeeze()
+                if value_pred_squeezed.dim() == 0:
+                    value_pred_squeezed = value_pred_squeezed.unsqueeze(0)
+                if value_target.dim() == 0:
+                    value_target = value_target.unsqueeze(0)
+                value_loss = F.mse_loss(value_pred_squeezed, value_target)
+                
+                # Compute MCTS policy loss
+                mcts_policy_loss = torch.tensor(0.0, device=self.device)
+                if 'mcts_policy' in targets and targets['mcts_policy'] is not None:
+                    try:
+                        mcts_policy_target = targets['mcts_policy'].unsqueeze(0).to(self.device)
+                        mcts_policy_loss = (F.kl_div(
+                            F.log_softmax(masked_action_logits, dim=1),
+                            mcts_policy_target,
+                            reduction='mean'
+                        ) * 0.5)
+                        
+                        # Safeguard: detect pathological losses
+                        mcts_policy_loss_item = mcts_policy_loss.item()
+                        if mcts_policy_loss_item > 100.0:
+                            print(f"    [WARNING] Graph {graph_idx}: Pathological MCTS loss {mcts_policy_loss_item:.2f}, skipping")
+                            mcts_policy_loss = torch.tensor(0.0, device=self.device)
+                        else:
+                            mcts_policy_loss_sum += mcts_policy_loss_item
+                    except Exception as e:
+                        print(f"    [ERROR] Graph {graph_idx}: MCTS loss exception: {e}")
+                
+                # Combine losses for this graph
+                graph_loss = (policy_loss + value_loss + mcts_policy_loss) * weight
+                graph_losses.append(graph_loss)
+                
+                policy_loss_sum += policy_loss.item()
+                value_loss_sum += value_loss.item()
+            
+            # Sum all graph losses for this sub-batch
+            if graph_losses:
+                total_loss = sum(graph_losses)
+        
+        except Exception as e:
+            print(f"    [ERROR] Loss computation failed in sub-batch: {e}")
+            print(f"    Predictions shapes: {[(k, v.shape) for k, v in predictions.items()]}")
+            raise
+        
+        # Priorities for replay buffer update: outcome + surprise (TD-error proxy)
+        # Each experience used for training should have a priority reflecting:
+        # 1. The final outcome (value_target) it led to
+        # 2. The surprise/error: |value_target - immediate_reward|
+        valid_rewards = []
+        surprise_weight = getattr(self.config.search, 'priority_surprise_weight', 0.5)
+        for exp in valid_experiences:
+            # Get final target (ground truth for this experience)
+            value_target = exp.get('value_target', exp['reward'])
+            immediate_reward = exp['reward']
+            
+            # Surprise: how wrong was the network's prediction?
+            surprise = abs(value_target - immediate_reward)
+            surprise = min(surprise, 1.0)
+            
+            # Priority combines outcome quality + informativeness
+            priority = value_target + surprise_weight * surprise
+            valid_rewards.append(max(0.0, priority))
+        
+        return {
+            'loss': total_loss,
+            'total_loss': total_loss.item(),
+            'policy_loss': policy_loss_sum,
+            'value_loss': value_loss_sum,
+            'mcts_policy_loss': mcts_policy_loss_sum,
+            'num_graphs': num_graphs,
+            'valid_indices': valid_indices_list,
+            'valid_rewards': valid_rewards
+        }
     
     def _create_targets(self, experience: Dict) -> Dict:
         """Create training targets from experience (AlphaZero-style, complete factorized policy)
         
         AlphaZero trains on:
         1. Value target: final episode outcome z (credit assignment)
-        2. Policy target: MCTS visit distribution π(s) for each action component
-        3. All action parameters (not just action_type)
+        2. Policy target: MCTS visit distribution π(s) aggregated by action type
+        3. Action components (only those relevant to the action type)
+        
+        FIX: Only create targets for action components that are relevant to the action type.
+        This prevents training noise from "don't care" padding values.
         """
+        from blueprint_modules.action import ActionType
         action = experience['action']
 
         # Use final episode reward (value_target) instead of immediate reward
@@ -774,46 +1002,70 @@ class ArchitectureTrainer:
         value_target = experience.get('value_target', experience['reward'])
         
         # ===== VALUE TARGET =====
+        # Return scalar values (not wrapped in tensors) - will be wrapped later if needed
         targets = {
-            'action_type': torch.tensor([action.action_type.value]).to(self.device),
-            'value': torch.tensor([value_target]).to(self.device)  # Use final outcome, not immediate reward
+            'action_type': action.action_type.value,  # Scalar int, not tensor
+            'value': torch.tensor([value_target], dtype=torch.float32).to(self.device)  # [1] tensor for value
         }
 
-        # ===== COMPLETE FACTORIZED POLICY TARGETS =====
-        # Add targets for all action components (not just action_type)
-        # These allow the network to predict the complete action, not just its category
+        # ===== COMPLETE FACTORIZED POLICY TARGETS (RELEVANT ONLY) =====
+        # Only add targets for action components that are used by this action type
         
-        # Source neuron target
-        if action.source_neuron is not None:
-            targets['source_neuron'] = torch.tensor([action.source_neuron]).to(self.device)
-        else:
-            # Padding value for actions without source neuron
-            targets['source_neuron'] = torch.tensor([0]).to(self.device)
+        # Source neuron target (used by: ADD_CONNECTION, REMOVE_CONNECTION, MODIFY_ACTIVATION, REMOVE_NEURON)
+        if action.action_type in [ActionType.ADD_CONNECTION, ActionType.REMOVE_CONNECTION, 
+                                   ActionType.MODIFY_ACTIVATION, ActionType.REMOVE_NEURON]:
+            if action.source_neuron is not None:
+                targets['source_neuron'] = action.source_neuron  # Scalar int
         
-        # Target neuron target
-        if action.target_neuron is not None:
-            targets['target_neuron'] = torch.tensor([action.target_neuron]).to(self.device)
-        else:
-            # Padding value for actions without target neuron
-            targets['target_neuron'] = torch.tensor([0]).to(self.device)
+        # Target neuron target (used by: ADD_CONNECTION, REMOVE_CONNECTION)
+        if action.action_type in [ActionType.ADD_CONNECTION, ActionType.REMOVE_CONNECTION]:
+            if action.target_neuron is not None:
+                targets['target_neuron'] = action.target_neuron  # Scalar int
         
-        # Activation type target
-        if action.activation is not None:
-            try:
-                activation_idx = list(ActivationType).index(action.activation)
-                targets['activation'] = torch.tensor([activation_idx]).to(self.device)
-            except (ValueError, IndexError):
-                targets['activation'] = torch.tensor([0]).to(self.device)
-        else:
-            # Padding value for actions without activation
-            targets['activation'] = torch.tensor([0]).to(self.device)
+        # Activation type target (used by: MODIFY_ACTIVATION, ADD_NEURON)
+        if action.action_type in [ActionType.MODIFY_ACTIVATION, ActionType.ADD_NEURON]:
+            if action.activation is not None:
+                try:
+                    activation_idx = list(ActivationType).index(action.activation)
+                    targets['activation'] = activation_idx  # Scalar int
+                except (ValueError, IndexError):
+                    pass
 
-        # ===== MCTS POLICY TARGET =====
-        # Store MCTS visit distribution if available (CRITICAL for AlphaZero learning!)
-        # Network learns to predict MCTS-improved policy, not raw priors
+        # ===== MCTS POLICY TARGET (AGGREGATED BY ACTION TYPE) =====
+        # FIX: Aggregate visit distribution by action_type to match network output shape.
+        # This ensures the KL divergence is computed between same-shaped tensors.
+        # Added numerical stability: clamp to prevent log(0) and extreme KL divergence
         if 'mcts_policy' in experience and 'mcts_actions' in experience:
-            targets['mcts_policy'] = experience['mcts_policy']
-            targets['mcts_actions'] = experience['mcts_actions']
+            try:
+                mcts_policy = experience['mcts_policy']
+                mcts_actions = experience['mcts_actions']
+                
+                if mcts_policy is not None and mcts_actions is not None and len(mcts_policy) > 0:
+                    # Aggregate by action_type: sum visit probs for each action type
+                    num_action_types = len(ActionType)
+                    aggregated_policy = torch.zeros(num_action_types, dtype=torch.float32)
+                    
+                    for prob, act in zip(mcts_policy, mcts_actions):
+                        if act is not None:
+                            aggregated_policy[act.action_type.value] += float(prob)
+                    
+                    # Normalize to sum to 1 (in case of rounding)
+                    policy_sum = aggregated_policy.sum()
+                    if policy_sum > 0:
+                        aggregated_policy /= policy_sum
+                        # Clamp to prevent log(0) in KL divergence: min 1e-8, max 1-1e-8
+                        aggregated_policy = torch.clamp(aggregated_policy, min=1e-8, max=1.0 - 1e-8)
+                        # Re-normalize after clamping to ensure sum=1
+                        aggregated_policy /= aggregated_policy.sum()
+                        targets['mcts_policy'] = aggregated_policy.to(self.device)
+                    else:
+                        # Zero-sum aggregation (should be rare): use uniform distribution
+                        aggregated_policy = torch.ones(num_action_types, dtype=torch.float32) / num_action_types
+                        targets['mcts_policy'] = aggregated_policy.to(self.device)
+            except Exception as e:
+                # If aggregation fails, skip MCTS policy target
+                print(f"    [Warning] Failed to create MCTS policy target: {e}")
+                pass
 
         return targets
     
@@ -829,24 +1081,17 @@ class ArchitectureTrainer:
             train_interval = getattr(self.config, 'train_interval', 10)
             if self.episode > 0 and self.episode % train_interval == 0:
                 # Train on all accumulated experiences in the buffer
-                remaining = len(self.experience_buffer)
+                buffer_size = len(self.experience_buffer)
+                print(f"  [Training] Starting with {buffer_size} total experiences in buffer")
+                remaining = buffer_size
                 while remaining > 0:
                     batch_size = min(self.config.batch_size, remaining)
                     train_metrics = self.train_on_batch(batch_size)
                     if train_metrics:
                         episode_metrics.update(train_metrics)
-                    remaining = len(self.experience_buffer)
-
-            # Immediate logging and checkpoint on improvement so artifacts appear promptly
-            try:
-                # Log this episode right away (helps for debugging short runs)
-                self._log_episode(episode_metrics)
-                # If this episode produced a new best architecture, save a checkpoint immediately
-                if episode_metrics.get('is_best'):
-                    self._save_checkpoint()
-            except Exception as e:
-                print(f"Immediate log/checkpoint failed: {e}")
-                traceback.print_exc()
+                    remaining -= batch_size
+                # Clear buffer after training on all experiences
+                self.experience_buffer.clear()
 
             # Checkpoint periodically
             if self.episode > 0 and self.episode % self.config.checkpoint_interval == 0:
@@ -868,25 +1113,45 @@ class ArchitectureTrainer:
     
     def _log_episode(self, metrics: Dict):
         """Log episode metrics"""
-        if self.episode % self.config.log_interval == 0:
-            accuracy = metrics['final_accuracy']
-            neurons = metrics['total_neurons']
-            connections = metrics['total_connections']
-            
-            print(f"Episode {self.episode}: "
-                  f"Accuracy={accuracy:.4f}, Neurons={neurons}, "
-                  f"Connections={connections}, Best={self.best_accuracy:.4f}")
+        # Always log (removed interval check so every episode is logged)
+        accuracy = metrics['final_accuracy']
+        neurons = metrics['total_neurons']
+        connections = metrics['total_connections']
+        
+        # Console output
+        print(f"Episode {self.episode}: "
+              f"Accuracy={accuracy:.4f}, Neurons={neurons}, "
+              f"Connections={connections}, Best={self.best_accuracy:.4f}")
 
-            # Structured file logging
+        # Structured file logging
+        try:
+            # Log to file handler
+            log_message = (f"Episode {self.episode} Accuracy={accuracy:.4f} "
+                          f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}")
+            self.logger.info(log_message)
+            
+            # Force flush handlers to ensure writes
+            for handler in self.logger.handlers:
+                handler.flush()
+            
+            # Append JSONL metrics
+            with open(self.metrics_path, 'a', encoding='utf-8') as mf:
+                mf.write(json.dumps(metrics) + "\n")
+                mf.flush()  # Ensure write
+                
+        except Exception as e:
+            # Fall back to direct file write if logger fails
+            print(f"Logger failed: {e}, attempting direct file write...")
             try:
-                self.logger.info(f"Episode {self.episode} Accuracy={accuracy:.4f} "
-                                 f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}")
-                # Append JSONL metrics
+                with open(self.log_path, 'a', encoding='utf-8') as f:
+                    f.write(f"{time.time()} INFO Episode {self.episode} Accuracy={accuracy:.4f} "
+                           f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}\n")
+                    f.flush()
                 with open(self.metrics_path, 'a', encoding='utf-8') as mf:
                     mf.write(json.dumps(metrics) + "\n")
-            except Exception as e:
-                # Fall back to console error if file write fails
-                print(f"Failed to write logs: {e}")
+                    mf.flush()
+            except Exception as e2:
+                print(f"Direct file write also failed: {e2}")
                 traceback.print_exc()
     
     def _save_checkpoint(self):
@@ -903,7 +1168,8 @@ class ArchitectureTrainer:
             'optimizer_state': self.optimizer.state_dict(),
             'best_accuracy': self.best_accuracy,
             'training_history': self.training_history,
-            'config': self.config
+            'config': self.config,
+            'experience_buffer': self.experience_buffer.state_dict()
         }
 
         filename = f"checkpoint_ep{self.episode}.pth"
@@ -921,6 +1187,7 @@ class ArchitectureTrainer:
         self.best_accuracy = checkpoint['best_accuracy']
         self.training_history = checkpoint['training_history']
         self.episode = checkpoint['episode'] + 1  # Start next episode
+        self.experience_buffer.load_state_dict(checkpoint['experience_buffer'])
 
         print(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
 
@@ -936,17 +1203,13 @@ class ArchitectureTrainer:
         try:
             # Create directory
             os.makedirs(f'architecture_diagrams/ep{self.episode:03d}', exist_ok=True)
-            
-            # Quick exit if too many neurons (keep training fast)
-            if len(architecture.neurons) > 2000:
-                return
-            
+
             # Constants for layout
-            CANVAS_WIDTH = 1400
-            CANVAS_HEIGHT = 1000
+            CANVAS_WIDTH = 1200
+            CANVAS_HEIGHT = 900
             MARGIN = 50
             INPUT_OUTPUT_RADIUS = 3
-            HIDDEN_RADIUS = 6  # Make hidden nodes bigger for visibility
+            HIDDEN_RADIUS = 8  # Make hidden nodes bigger for visibility
             
             # Create image
             img = Image.new('RGB', (CANVAS_WIDTH, CANVAS_HEIGHT), color='white')

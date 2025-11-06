@@ -118,7 +118,9 @@ class EdgeAwareAttention(nn.Module):
         
         # Softmax with NaN handling (nodes with no incoming edges get NaN, convert to 0)
         attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = torch.where(torch.isnan(attn_weights), torch.zeros_like(attn_weights), attn_weights)
+        nan_mask = torch.isnan(attn_weights)
+        if nan_mask.any():
+            attn_weights = attn_weights.masked_fill(nan_mask, 0.0)
         
         attn_weights = self.dropout(attn_weights)
         
@@ -253,18 +255,26 @@ class GraphTransformer(nn.Module):
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
-        
+
     def forward(self, graph_data: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
         """
+        Forward pass - handles both single and batched graphs.
+        
+        For single graphs (from MCTS/eval): Works as before
+        For batched graphs (from training): Processes concatenated graph as single batch
+        
         graph_data: {
-            'node_features': [batch_size, num_nodes, node_feature_dim],
+            'node_features': [1, num_nodes, node_feature_dim],
             'edge_index': [2, num_edges], 
             'edge_weights': [num_edges],
-            'layer_positions': [batch_size, num_nodes]  # normalized 0-1
+            'layer_positions': [1, num_nodes]
+            'batch': [total_nodes] - optional, for batching info (ignored here)
+            'num_graphs': int - optional, for batching info (ignored here)
         }
+        
         Returns: 
-            global_embedding: [batch_size, hidden_dim * 2]
-            node_embeddings: [batch_size, num_nodes, hidden_dim]
+            global_embedding: [1, hidden_dim * 2]
+            node_embeddings: [1, num_nodes, hidden_dim]
         """
         node_features = graph_data['node_features']
         edge_index = graph_data['edge_index']

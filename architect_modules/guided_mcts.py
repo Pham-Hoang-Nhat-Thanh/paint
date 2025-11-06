@@ -69,7 +69,7 @@ class NeuralMCTS(MCTS):
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
                  device: str = 'cpu', exploration_weight: float = 1.0,
                  iso_weight: float = 0.01, comp_weight: float = 0.0, 
-                 early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001):
+                 early_stopping_patience: int = 5, early_stopping_min_delta: float = 0.001, max_children: int = 50):
         super().__init__(action_space, None, exploration_weight)
         self.policy_value_net = policy_value_net
         self.device = device
@@ -84,6 +84,7 @@ class NeuralMCTS(MCTS):
         self.current_cycle = EvolutionaryCycle()
         # Reusable ActionManager instance
         self.action_manager = ActionManager(action_space=self.action_space)
+        self.max_children = max_children
 
     def cleanup(self):
         """Clean up resources used by NeuralMCTS"""
@@ -329,9 +330,13 @@ class NeuralMCTS(MCTS):
 
         # Cache valid actions for this node if not already cached
         if node._valid_actions_cache is None:
-            node._valid_actions_cache = self.action_space.get_valid_actions(
+            all_valid_actions = self.action_space.get_valid_actions(
                 node.architecture, current_step=0, evolutionary_cycle=self.current_cycle
             )
+            if len(all_valid_actions) > self.max_children:
+                # Truncate or sample valid actions to max_children
+                all_valid_actions = all_valid_actions[:self.max_children]
+            node._valid_actions_cache = all_valid_actions
         all_valid_actions = node._valid_actions_cache
 
         # Filter out actions that already have children
