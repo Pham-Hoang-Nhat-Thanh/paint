@@ -58,6 +58,7 @@ class NeuralArchitecture:
         # Cache for optimization - invalidate when structure changes
         self._sorted_neuron_ids = None
         self._connectivity_cache = None  # {'has_incoming': set, 'has_outgoing': set}
+        self._topological_layers_cache = None  # {neuron_id: layer}
         
         # Initialize with MNIST base structure
         self._initialize_mnist_base()
@@ -111,8 +112,13 @@ class NeuralArchitecture:
         
         self.connections.append(Connection(source_id, target_id, weight))
         self._connection_set.add(conn_key)
-        # Invalidate connectivity cache
+        # Invalidate connectivity cache (but keep topological for local update)
         self._connectivity_cache = None
+        # Locally update both source and target: 
+        # - target may move from isolated to connected (gained incoming)
+        # - source may move from isolated to connected (has outgoing now)
+        if hasattr(self, '_topological_layers_cache') and self._topological_layers_cache is not None:
+            self.recalculate_affected_layers({source_id, target_id})
         return True
     
     def remove_neuron(self, neuron_id: int) -> bool:
@@ -123,6 +129,14 @@ class NeuralArchitecture:
         neuron = self.neurons[neuron_id]
         if neuron.neuron_type in [NeuronType.INPUT, NeuronType.OUTPUT]:
             return False
+        
+        # Collect neurons affected by this removal (both sources and targets)
+        affected_neurons = set()
+        for conn in self.connections:
+            if conn.source_id == neuron_id:
+                affected_neurons.add(conn.target_id)  # Targets lose incoming
+            elif conn.target_id == neuron_id:
+                affected_neurons.add(conn.source_id)  # Sources lose outgoing
         
         # Update connection set if it exists
         if hasattr(self, '_connection_set'):
@@ -142,6 +156,8 @@ class NeuralArchitecture:
         # Invalidate caches
         self._sorted_neuron_ids = None
         self._connectivity_cache = None
+        # Invalidate topological layers cache (structure changed)
+        self._topological_layers_cache = None
         return True
     
     def remove_connection(self, source_id: int, target_id: int) -> bool:
@@ -157,9 +173,13 @@ class NeuralArchitecture:
             conn for conn in self.connections 
             if not (conn.source_id == source_id and conn.target_id == target_id)
         ]
-        # Invalidate connectivity cache
+        # Invalidate caches when connection removed
         if len(self.connections) < initial_count:
             self._connectivity_cache = None
+            # Invalidate topological layers cache - connection removal affects layer assignments
+            # Safer to force full recomputation than risk stale local updates
+            if hasattr(self, '_topological_layers_cache'):
+                self._topological_layers_cache = None
         return len(self.connections) < initial_count
     
     def compute_signature(self) -> str:
@@ -269,6 +289,172 @@ class NeuralArchitecture:
                 has_outgoing.add(conn.source_id)
             self._connectivity_cache = {'has_incoming': has_incoming, 'has_outgoing': has_outgoing}
         return self._connectivity_cache
+    
+    def compute_topological_layers(self) -> Dict[int, int]:
+        """Compute deterministic topological layers based on graph connectivity.
+        
+        Layer assignment:
+        - Input neurons: layer 0 (no incoming connections)
+        - Layer k (k > 0): neurons where max(layer_indices of incoming neurons) == k-1
+        - Isolated HIDDEN neurons: layer -1 (no incoming OR no outgoing connections, but only for hidden neurons)
+        - Output neurons: automatically assigned highest layer among all neurons
+        
+        Returns:
+            Dict[neuron_id, layer] where layer is int (-1 for isolated hidden neurons, 0+ for connected)
+        """
+        # Initialize cache attribute if it doesn't exist (for backward compatibility with deserialized objects)
+        if not hasattr(self, '_topological_layers_cache'):
+            self._topological_layers_cache = None
+        
+        # Return cached result if available
+        if self._topological_layers_cache is not None:
+            return self._topological_layers_cache
+        
+        # Build connectivity tracking
+        incoming_neighbors = {nid: [] for nid in self.neurons}
+        outgoing_neighbors = {nid: [] for nid in self.neurons}
+        
+        for conn in self.connections:
+            if conn.enabled:
+                incoming_neighbors[conn.target_id].append(conn.source_id)
+                outgoing_neighbors[conn.source_id].append(conn.target_id)
+        
+        # Find isolated HIDDEN neurons (missing incoming OR outgoing, but only hidden neurons)
+        isolated_neurons = set()
+        for nid, neuron in self.neurons.items():
+            if neuron.neuron_type == NeuronType.HIDDEN:
+                if len(incoming_neighbors[nid]) == 0 or len(outgoing_neighbors[nid]) == 0:
+                    isolated_neurons.add(nid)
+        
+        # Assign layer -1 to isolated hidden neurons
+        layers = {nid: -1 for nid in isolated_neurons}
+        
+        # For non-isolated neurons, compute layers iteratively
+        non_isolated = {nid: neuron for nid, neuron in self.neurons.items() if nid not in isolated_neurons}
+        
+        # Input neurons (no incoming connections)
+        for nid in non_isolated:
+            if len(incoming_neighbors[nid]) == 0:
+                layers[nid] = 0
+        
+        # Iteratively assign layers based on max layer of incoming neighbors
+        max_iterations = len(non_isolated) + 1  # Prevent infinite loops
+        for iteration in range(max_iterations):
+            prev_assigned = len([nid for nid in non_isolated if nid in layers and layers[nid] >= 0])
+            
+            for nid in non_isolated:
+                if nid not in layers or layers[nid] < 0:
+                    # Check if all incoming neighbors have assigned layers (including isolated neurons with layer -1)
+                    if len(incoming_neighbors[nid]) == 0:
+                        # No incoming; should not happen in non_isolated, but handle gracefully
+                        layers[nid] = 0
+                    else:
+                        # All incoming neighbors must have assigned layers (may include -1 for isolated)
+                        incoming_layers = [layers[src] for src in incoming_neighbors[nid] if src in layers]
+                        
+                        if len(incoming_layers) == len(incoming_neighbors[nid]):
+                            # All incoming neighbors assigned; compute max layer + 1
+                            # Note: if all incomings are isolated (layer -1), max is -1, so layer becomes 0
+                            max_incoming_layer = max(incoming_layers)
+                            layers[nid] = max_incoming_layer + 1
+            
+            curr_assigned = len([nid for nid in non_isolated if nid in layers and layers[nid] >= 0])
+            if curr_assigned == prev_assigned:
+                # No progress; stop
+                break
+        
+        # Cache the result
+        self._topological_layers_cache = layers
+        return layers
+    
+    def recalculate_affected_layers(self, affected_neuron_ids: set) -> Dict[int, int]:
+        """Efficiently recalculate layers for affected neurons only (local update).
+        
+        This is more efficient than full recalculation when only a few neurons are changed.
+        Used after add_connection, remove_connection, or remove_neuron to update affected neurons.
+        
+        Args:
+            affected_neuron_ids: set of neuron IDs whose layers may have changed
+            
+        Returns:
+            Updated layers dict (full state)
+        """
+        # Initialize cache attribute if it doesn't exist (for backward compatibility)
+        if not hasattr(self, '_topological_layers_cache'):
+            self._topological_layers_cache = None
+        
+        # Start with current cached layers (don't call compute_topological_layers to avoid full recomputation)
+        if self._topological_layers_cache is None:
+            # If not cached, do full computation
+            return self.compute_topological_layers()
+        
+        layers = self._topological_layers_cache
+        
+        # Build connectivity tracking
+        incoming_neighbors = {nid: [] for nid in self.neurons}
+        outgoing_neighbors = {nid: [] for nid in self.neurons}
+        
+        for conn in self.connections:
+            if conn.enabled:
+                incoming_neighbors[conn.target_id].append(conn.source_id)
+                outgoing_neighbors[conn.source_id].append(conn.target_id)
+        
+        # Recompute layers for affected neurons and their downstream dependents
+        # Propagate changes forward: if a neuron's layer changes, its targets may need recalculation
+        to_process = set(affected_neuron_ids)
+        processed = set()
+        
+        max_iterations = len(self.neurons) + 1
+        for iteration in range(max_iterations):
+            if not to_process:
+                break
+            
+            next_to_process = set()
+            
+            for nid in to_process:
+                if nid in processed:
+                    continue
+                
+                old_layer = layers.get(nid, -1)
+                neuron = self.neurons[nid]
+                
+                # Recompute layer for this neuron
+                # Only HIDDEN neurons can be isolated (layer -1)
+                if neuron.neuron_type == NeuronType.HIDDEN and (len(incoming_neighbors[nid]) == 0 or len(outgoing_neighbors[nid]) == 0):
+                    # Isolated hidden neuron
+                    new_layer = -1
+                elif len(incoming_neighbors[nid]) == 0:
+                    # No incoming connections: this is an input neuron
+                    new_layer = 0
+                else:
+                    # Non-isolated: compute max of incoming layers + 1
+                    incoming_layers = [layers.get(src, -1) for src in incoming_neighbors[nid]]
+                    max_in = max(incoming_layers) if incoming_layers else -1
+                    
+                    if max_in >= 0:
+                        new_layer = max_in + 1
+                    else:
+                        # Unresolved dependencies; keep old layer for now
+                        new_layer = old_layer
+                
+                layers[nid] = new_layer
+                
+                # If layer changed, mark downstream neurons for recomputation
+                if new_layer != old_layer:
+                    next_to_process.update(outgoing_neighbors[nid])
+                
+                processed.add(nid)
+            
+            to_process = next_to_process - processed
+        
+        # Update cache with new layers
+        self._topological_layers_cache = layers
+        return layers
+    
+    def get_layer_for_neuron(self, neuron_id: int) -> int:
+        """Get topological layer for a single neuron. Returns -1 if isolated or not found."""
+        layers = self.compute_topological_layers()
+        return layers.get(neuron_id, -1)
 
     # --- Utility helpers for architecture statistics (used by MCTS reward shaping) ---
     def num_neurons(self) -> int:
@@ -370,6 +556,7 @@ class NeuralArchitecture:
         # Initialize caches
         arch._sorted_neuron_ids = None
         arch._connectivity_cache = None
+        arch._topological_layers_cache = None
         arch._connection_set = set()
 
         # Reconstruct neurons

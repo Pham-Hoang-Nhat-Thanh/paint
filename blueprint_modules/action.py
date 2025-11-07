@@ -65,7 +65,7 @@ class ActionSpace:
             self._add_cycle_aware_actions(valid_actions, architecture, current_step, evolutionary_cycle)
         else:
             # Fallback: simple prioritization for policy network compatibility
-            self._add_simple_prioritized_actions(valid_actions, architecture, current_step)
+            self._add_simple_prioritized_actions(valid_actions, architecture)
 
         return valid_actions
     
@@ -73,9 +73,11 @@ class ActionSpace:
         """Apply an action to the architecture, return success status"""
         try:
             if action.action_type == ActionType.ADD_NEURON:
-                # Add hidden neuron at random layer position between input and output
-                layer_pos = np.random.uniform(0.1, 0.9)
-                architecture.add_neuron(NeuronType.HIDDEN, action.activation, layer_pos)
+                # New neurons are added as isolated (layer -1)
+                # Layer will be recalculated on-demand when connections are added/removed
+                # Use a placeholder layer_position (will be ignored for isolated neurons)
+                layer_position = 0.5
+                architecture.add_neuron(NeuronType.HIDDEN, action.activation, layer_position)
                 return True
                 
             elif action.action_type == ActionType.REMOVE_NEURON:
@@ -114,7 +116,6 @@ class ActionSpace:
         """Add actions with evolutionary cycle-aware prioritization"""
         neurons = architecture.neurons
         num_neurons = len(neurons)
-        num_connections = len(architecture.connections)
         
         # Filter hidden neurons once
         hidden_neurons = [nid for nid, neuron in neurons.items()
@@ -156,12 +157,10 @@ class ActionSpace:
                     target_neuron=conn.target_id
                 ))
 
-    def _add_simple_prioritized_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture,
-                                       current_step: int):
+    def _add_simple_prioritized_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture):
         """Add actions with simple prioritization for policy network compatibility"""
         neurons = architecture.neurons
         num_neurons = len(neurons)
-        num_connections = len(architecture.connections)
         
         # Filter hidden neurons once
         hidden_neurons = [nid for nid, neuron in neurons.items()
