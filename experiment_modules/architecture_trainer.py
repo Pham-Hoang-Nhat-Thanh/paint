@@ -95,6 +95,7 @@ class ArchitectureTrainer:
         self.episode = 0
         self.best_accuracy = 0.0
         self.training_history = []
+        self.final_architecture = None
         
         # Create directories
         os.makedirs(config.log_dir, exist_ok=True)
@@ -262,6 +263,8 @@ class ArchitectureTrainer:
         # ===== LOG EPISODE RESULTS =====
         self._log_episode(episode_metrics)
 
+        # ===== Save final architecture =====
+        self.final_architecture = current_arch
         return episode_metrics
     
     
@@ -1557,7 +1560,7 @@ class ArchitectureTrainer:
             'training_history': self.training_history,
             'config': self.config,
             'experience_buffer': self.experience_buffer.state_dict(),
-            'final_architecture': final_architecture.to_serializable_dict() if final_architecture is not None else None
+            'final_architecture': self.final_architecture.to_serializable_dict() if final_architecture is not None else None
         }
 
         filename = f"checkpoint_ep{self.episode}.pth"
