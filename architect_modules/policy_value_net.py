@@ -42,16 +42,30 @@ class UnifiedPolicyValueNetwork(nn.Module):
         )
         
         # Policy heads (factorized action space) - no biases for faster computation
-        self.action_type_head = nn.Linear(hidden_dim // 2, num_actions, bias=False)
-        self.source_neuron_head = nn.Linear(hidden_dim // 2, max_neurons, bias=False)
-        self.target_neuron_head = nn.Linear(hidden_dim // 2, max_neurons, bias=False)
-        self.activation_head = nn.Linear(hidden_dim // 2, num_activations, bias=False)
+        self.action_type_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 4, num_actions, bias=False)
+        )
+        self.source_neuron_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 4, max_neurons, bias=False)
+        )
+        self.target_neuron_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 4, max_neurons, bias=False)
+        )
+        self.activation_head = nn.Sequential(
+            nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim // 4, num_activations, bias=False)
+        )
         
         # Value head - optimized
         self.value_head = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim // 4, 1, bias=False),
+            nn.Linear(hidden_dim // 2, 1, bias=False),
             nn.Tanh()  # Output between -1 and 1
         )
         
@@ -102,14 +116,13 @@ class UnifiedPolicyValueNetwork(nn.Module):
         elif sub_batch_size >= num_graphs:
             # Small batch case: no internal sub-batching needed
             # Trainer has already split into small sub-batches, so process entire sub-batch
-            global_embedding, _ = self.graph_transformer(graph_data)
-            # global_embedding: [1, hidden_dim * 2]
-            # Now decompose into individual graphs
+            # Call transformer once and reuse both global and node embeddings
+            global_embedding, node_embeddings = self.graph_transformer(graph_data)
+            # global_embedding: [num_graphs, hidden_dim * 2] OR [1, hidden_dim*2]
+            # node_embeddings: [1, total_nodes, hidden_dim]
             global_embeddings = []
             batch_indices = graph_data['batch']  # [total_nodes]
             node_features = graph_data['node_features']  # [1, total_nodes, features]
-            _, node_embeddings = self.graph_transformer(graph_data)
-            # node_embeddings: [1, total_nodes, hidden_dim]
             node_embeddings_squeezed = node_embeddings.squeeze(0)  # [total_nodes, hidden_dim]
             
             # Pool embeddings per graph

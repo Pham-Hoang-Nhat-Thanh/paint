@@ -261,9 +261,6 @@ class ArchitectureTrainer:
 
         # ===== LOG EPISODE RESULTS =====
         self._log_episode(episode_metrics)
-        
-        # ===== SAVE CHECKPOINT =====
-        self._save_checkpoint()
 
         return episode_metrics
     
@@ -1349,7 +1346,7 @@ class ArchitectureTrainer:
             
             # Train on batch(s) if we have enough experiences
             train_interval = getattr(self.config, 'train_interval', 10)
-            if self.episode > 0 and self.episode % train_interval == 0:
+            if (self.episode + 1) % train_interval == 0:
                 # We will sample batches from the replay buffer. The buffer.sample()
                 # method is prioritized and probabilistic, so multiple sample() calls
                 # can return overlapping indices. Instead of attempting to track
@@ -1402,7 +1399,7 @@ class ArchitectureTrainer:
                     self.experience_buffer.clear()
 
             # Checkpoint periodically
-            if self.episode > 0 and self.episode % self.config.checkpoint_interval == 0:
+            if (self.episode + 1) % self.config.checkpoint_interval == 0:
                 self._save_checkpoint()
 
             # Update episode counter
@@ -1544,7 +1541,7 @@ class ArchitectureTrainer:
                 print(f"Direct file write also failed: {e2}")
                 traceback.print_exc()
     
-    def _save_checkpoint(self):
+    def _save_checkpoint(self, final_architecture=None):
         """Save training checkpoint (AlphaZero-style, no curriculum)
         
         Note: MCTS tree state (mcts_root) is NOT saved because:
@@ -1559,7 +1556,8 @@ class ArchitectureTrainer:
             'best_accuracy': self.best_accuracy,
             'training_history': self.training_history,
             'config': self.config,
-            'experience_buffer': self.experience_buffer.state_dict()
+            'experience_buffer': self.experience_buffer.state_dict(),
+            'final_architecture': final_architecture.to_serializable_dict() if final_architecture is not None else None
         }
 
         filename = f"checkpoint_ep{self.episode}.pth"
@@ -1578,6 +1576,11 @@ class ArchitectureTrainer:
         self.training_history = checkpoint['training_history']
         self.episode = checkpoint['episode'] + 1  # Start next episode
         self.experience_buffer.load_state_dict(checkpoint['experience_buffer'])
+
+        # Restore final architecture if present
+        self.final_architecture = None
+        if 'final_architecture' in checkpoint and checkpoint['final_architecture'] is not None:
+            self.final_architecture = NeuralArchitecture.from_serializable_dict(checkpoint['final_architecture'])
 
         print(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
 

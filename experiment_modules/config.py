@@ -6,9 +6,9 @@ class ModelConfig:
     """Configuration for the Graph Transformer and Policy-Value Network"""
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
-    hidden_dim: int = 64
+    hidden_dim: int = 128
     num_heads: int = 4
-    num_layers: int = 3
+    num_layers: int = 5
     dropout: float = 0.1
     use_edge_features: bool = True
     
@@ -56,8 +56,8 @@ class ArchitectureSearchConfig:
     final_train_epochs: int = 3  # Increased for more thorough final training
     evaluation_batch_size: int = 64  # Increased for faster evaluation with larger batches
 
-    # Sub-batch size for processing multiple architectures
-    sub_batch_size: int = 2
+    # Sub-batch size for training
+    sub_batch_size: int = 4
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -116,7 +116,7 @@ class OverallConfig:
     eval_interval: int = 1
     checkpoint_interval: int = 1
     log_interval: int = 1
-    train_interval: int = 10  # Train every N episodes
+    train_interval: int = 5  # Train every N episodes
 
     # GPU optimizations
     use_mixed_precision: bool = True
@@ -124,5 +124,5 @@ class OverallConfig:
     enable_tf32: bool = True
 
     # Early stopping
-    early_stopping_patience: int = 10
+    early_stopping_patience: int = 25
     early_stopping_min_delta: float = 0.001

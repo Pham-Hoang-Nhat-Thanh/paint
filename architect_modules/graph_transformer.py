@@ -4,6 +4,13 @@ import torch.nn.functional as F
 import math
 from typing import Dict, Tuple
 
+# Try to import torch_scatter for efficient sparse attention
+try:
+    from torch_scatter import scatter_add, scatter_softmax
+    HAS_TORCH_SCATTER = True
+except ImportError:
+    HAS_TORCH_SCATTER = False
+
 # Enable TF32 for faster matrix multiplications on Ampere+ GPUs
 if torch.cuda.is_available():
     torch.backends.cuda.matmul.fp32_precision = 'tf32'
@@ -42,13 +49,19 @@ class PositionalEncoding(nn.Module):
         return node_features + pos_encoding
 
 class EdgeAwareAttention(nn.Module):
-    """Multi-head attention with edge feature integration"""
+    """Multi-head attention with edge feature integration
+    
+    Supports both dense masked attention and sparse edge-indexed attention via torch-scatter.
+    Automatically selects the more efficient implementation based on graph density.
+    """
 
-    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1, 
+                 use_sparse_attention: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
+        self.use_sparse_attention = use_sparse_attention and HAS_TORCH_SCATTER
 
         assert self.head_dim * num_heads == hidden_dim, "hidden_dim must be divisible by num_heads"
 
@@ -75,6 +88,133 @@ class EdgeAwareAttention(nn.Module):
         mask[edge_index[0], edge_index[1]] = True
         return mask
     
+    def _sparse_attention_torch_scatter(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+                                        edge_index: torch.Tensor, edge_weights: torch.Tensor,
+                                        num_nodes: int) -> torch.Tensor:
+        """Sparse edge-indexed attention using torch_scatter for efficient scatter_softmax.
+        
+        Input shapes (after reshaping to multi-head):
+        - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
+        - edge_index: [2, num_edges]
+        - edge_weights: [num_edges]
+        
+        Computes attention only over edges: for each edge (src->tgt), compute Q[src]·K[tgt].
+        Then softmax per source node over its outgoing edges, and aggregate V.
+        """
+        batch_size, num_heads, _, head_dim = Q.shape
+        device = Q.device
+        num_edges = edge_index.shape[1]
+        
+        if num_edges == 0:
+            # No edges: return zeros
+            return torch.zeros(batch_size, num_heads, num_nodes, head_dim, device=device)
+        
+        src_idx = edge_index[0]  # [num_edges]
+        
+        # Gather Q and K for each edge
+        # Q[src] and K[tgt] for each edge (where tgt is edge_index[1])
+        Q_e = Q[:, :, src_idx, :]  # [batch_size, num_heads, num_edges, head_dim]
+        K_e = K[:, :, edge_index[1], :]  # [batch_size, num_heads, num_edges, head_dim]
+        V_e = V[:, :, edge_index[1], :]  # [batch_size, num_heads, num_edges, head_dim]
+        
+        # Compute per-edge scores: (Q_e * K_e).sum(-1) * scale
+        scores_e = (Q_e * K_e).sum(-1) * self.scale  # [batch_size, num_heads, num_edges]
+        
+        # Add edge bias if using edge weights
+        if edge_weights is not None and edge_weights.shape[0] > 0:
+            edge_bias = self.edge_encoder(edge_weights.unsqueeze(-1))  # [num_edges, num_heads]
+            scores_e = scores_e + edge_bias.t().unsqueeze(0)  # [batch_size, num_heads, num_edges]
+        
+        # Reshape for scatter operations: flatten batch and head dims
+        scores_flat = scores_e.reshape(batch_size * num_heads, num_edges)  # [B*H, E]
+        V_flat = V_e.reshape(batch_size * num_heads, num_edges, head_dim)  # [B*H, E, D]
+        
+        # Replicate src_idx for each batch and head
+        src_idx_expanded = src_idx.unsqueeze(0).expand(batch_size * num_heads, -1)  # [B*H, E]
+        
+        # Compute per-source-node softmax using torch_scatter.scatter_softmax
+        attn_weights_flat = scatter_softmax(scores_flat, src_idx_expanded, dim=1, dim_size=num_nodes)
+        # [B*H, E]
+        
+        # Apply dropout to attention weights
+        attn_weights_flat = self.dropout(attn_weights_flat)
+        
+        # Aggregate V: weighted_V_e = attn * V_e, then scatter_add per source node
+        weighted_V_flat = attn_weights_flat.unsqueeze(-1) * V_flat  # [B*H, E, D]
+        
+        # Flatten for scatter_add: [B*H*E, D]
+        weighted_V_flat_2d = weighted_V_flat.reshape(batch_size * num_heads * num_edges, head_dim)
+        src_idx_2d = src_idx_expanded.unsqueeze(-1).expand(-1, -1, head_dim).reshape(
+            batch_size * num_heads * num_edges
+        )  # [B*H*E]
+        
+        # Scatter-add to aggregate per source node
+        aggregated_flat = scatter_add(weighted_V_flat_2d, src_idx_2d, dim=0, dim_size=batch_size * num_heads * num_nodes)
+        # [B*H*N, D]
+        
+        # Reshape back to [batch_size, num_heads, num_nodes, head_dim]
+        attn_output = aggregated_flat.reshape(batch_size, num_heads, num_nodes, head_dim)
+        
+        return attn_output
+    
+    def _sparse_attention_pure_pytorch(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+                                       edge_index: torch.Tensor, edge_weights: torch.Tensor,
+                                       num_nodes: int) -> torch.Tensor:
+        """Sparse edge-indexed attention using pure PyTorch (no torch_scatter dependency).
+        
+        Slower than torch_scatter but avoids external dependency.
+        Groups edges by source node and computes softmax per group.
+        """
+        batch_size, num_heads, _, head_dim = Q.shape
+        device = Q.device
+        num_edges = edge_index.shape[1]
+        
+        if num_edges == 0:
+            return torch.zeros(batch_size, num_heads, num_nodes, head_dim, device=device)
+        
+        src_idx = edge_index[0]  # [num_edges]
+        
+        # Gather Q and K for each edge
+        Q_e = Q[:, :, src_idx, :]  # [batch_size, num_heads, num_edges, head_dim]
+        K_e = K[:, :, edge_index[1], :]  # [batch_size, num_heads, num_edges, head_dim]
+        V_e = V[:, :, edge_index[1], :]  # [batch_size, num_heads, num_edges, head_dim]
+        
+        # Compute per-edge scores
+        scores_e = (Q_e * K_e).sum(-1) * self.scale  # [batch_size, num_heads, num_edges]
+        
+        # Add edge bias
+        if edge_weights is not None and edge_weights.shape[0] > 0:
+            edge_bias = self.edge_encoder(edge_weights.unsqueeze(-1))  # [num_edges, num_heads]
+            scores_e = scores_e + edge_bias.t().unsqueeze(0)
+        
+        # Initialize output
+        attn_output = torch.zeros(batch_size, num_heads, num_nodes, head_dim, device=device)
+        
+        # Group edges by source node and compute softmax per group
+        unique_src = torch.unique(src_idx)
+        
+        for src in unique_src:
+            # Find all edges with this source node
+            mask = (src_idx == src)
+            
+            # Extract scores and values for this group
+            scores_group = scores_e[:, :, mask]  # [batch_size, num_heads, group_size]
+            V_group = V_e[:, :, mask, :]  # [batch_size, num_heads, group_size, head_dim]
+            
+            # Compute softmax per group
+            attn_weights_group = F.softmax(scores_group, dim=-1)
+            attn_weights_group = self.dropout(attn_weights_group)
+            
+            # Aggregate V: sum over group dimension
+            aggregated = torch.matmul(attn_weights_group.unsqueeze(-2), V_group)  
+            # [batch_size, num_heads, 1, head_dim]
+            aggregated = aggregated.squeeze(-2)  # [batch_size, num_heads, head_dim]
+            
+            # Store in output at source node position
+            attn_output[:, :, src, :] = aggregated
+        
+        return attn_output
+    
     def forward(self, node_embeddings: torch.Tensor, edge_index: torch.Tensor, 
                 edge_weights: torch.Tensor) -> torch.Tensor:
         """
@@ -82,8 +222,9 @@ class EdgeAwareAttention(nn.Module):
         edge_index: [2, num_edges]
         edge_weights: [num_edges]
         
-        Uses masked attention: computes full O(n²) attention but zeros out non-edges.
-        More efficient than full dense for sparse graphs while maintaining exact equivalence.
+        Automatically selects between sparse (torch_scatter) and dense masked attention.
+        Sparse attention computes only over edges (O(E) complexity).
+        Dense attention computes full QK^T and masks non-edges (O(N^2) complexity).
         """
         batch_size, num_nodes, hidden_dim = node_embeddings.shape
         device = node_embeddings.device
@@ -101,31 +242,19 @@ class EdgeAwareAttention(nn.Module):
         K = K.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
         V = V.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Compute attention scores
-        # scale instead of dividing by sqrt each time
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        # [batch_size, num_heads, num_nodes, num_nodes]
-        
-        # Create adjacency mask from edge indices
-        if edge_index.shape[1] > 0:
-            # Build mask: [num_nodes, num_nodes]
-            mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool, device=device)
-            mask[edge_index[0], edge_index[1]] = True
-            mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, num_nodes, num_nodes]
-            
-            # Apply mask: set non-edges to a large negative constant to avoid NaNs
-            # Using a large negative constant (-1e9) keeps softmax numerically stable
-            attn_scores = attn_scores.masked_fill(~mask, -1e9)
+        # Choose attention implementation based on graph density and availability
+        if self.use_sparse_attention and edge_index.shape[1] > 0:
+            # Use sparse edge-indexed attention via torch_scatter
+            attn_output = self._sparse_attention_torch_scatter(Q, K, V, edge_index, edge_weights, num_nodes)
+            # [batch_size, num_heads, num_nodes, head_dim]
+        elif self.use_sparse_attention and not HAS_TORCH_SCATTER and edge_index.shape[1] > 0:
+            # Fallback to pure PyTorch sparse attention (slower but no dependency)
+            attn_output = self._sparse_attention_pure_pytorch(Q, K, V, edge_index, edge_weights, num_nodes)
+            # [batch_size, num_heads, num_nodes, head_dim]
         else:
-            # No edges at all - set to large negative so softmax yields near-zero weights
-            attn_scores = torch.full_like(attn_scores, -1e9)
-        # Softmax is now numerically stable (no -inf) so no NaN handling required
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, V)  # [batch_size, num_heads, num_nodes, head_dim]
+            # Use dense masked attention (original implementation)
+            attn_output = self._dense_attention_masked(Q, K, V, edge_index, edge_weights, num_nodes)
+            # [batch_size, num_heads, num_nodes, head_dim]
         
         # Concatenate heads - [batch_size, num_nodes, hidden_dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(
@@ -140,6 +269,46 @@ class EdgeAwareAttention(nn.Module):
         output = self.layer_norm(output + residual)
         
         return output
+    
+    def _dense_attention_masked(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
+                                edge_index: torch.Tensor, edge_weights: torch.Tensor,
+                                num_nodes: int) -> torch.Tensor:
+        """Dense masked attention (original implementation): computes full QK^T and masks non-edges.
+        
+        Input shapes (after reshaping to multi-head):
+        - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
+        - edge_index: [2, num_edges]
+        - edge_weights: [num_edges]
+        
+        Returns: [batch_size, num_heads, num_nodes, head_dim]
+        """
+        device = Q.device
+        
+        # Compute attention scores: Q @ K^T
+        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
+        # [batch_size, num_heads, num_nodes, num_nodes]
+        
+        # Create adjacency mask from edge indices
+        if edge_index.shape[1] > 0:
+            # Build mask: [num_nodes, num_nodes]
+            mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool, device=device)
+            mask[edge_index[0], edge_index[1]] = True
+            mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, num_nodes, num_nodes]
+            
+            # Apply mask: set non-edges to a large negative constant
+            attn_scores = attn_scores.masked_fill(~mask, -1e9)
+        else:
+            # No edges: set to large negative
+            attn_scores = torch.full_like(attn_scores, -1e9)
+        
+        # Softmax and dropout
+        attn_weights = F.softmax(attn_scores, dim=-1)
+        attn_weights = self.dropout(attn_weights)
+        
+        # Apply attention to values
+        attn_output = torch.matmul(attn_weights, V)  # [batch_size, num_heads, num_nodes, head_dim]
+        
+        return attn_output
 
 class HierarchicalPooling(nn.Module):
     """Hierarchical attention pooling for graph-level representation"""
@@ -218,10 +387,11 @@ class GraphTransformer(nn.Module):
     """Complete Graph Transformer for neural architecture encoding"""
     
     def __init__(self, node_feature_dim: int, hidden_dim: int = 128, num_heads: int = 8, 
-                 num_layers: int = 3, dropout: float = 0.1):
+                 num_layers: int = 3, dropout: float = 0.1, use_sparse_attention: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
+        self.use_sparse_attention = use_sparse_attention
         
         # Input projection - optimized
         self.input_projection = nn.Linear(node_feature_dim, hidden_dim, bias=False)
@@ -231,7 +401,7 @@ class GraphTransformer(nn.Module):
         
         # Transformer layers
         self.layers = nn.ModuleList([
-            EdgeAwareAttention(hidden_dim, num_heads, dropout)
+            EdgeAwareAttention(hidden_dim, num_heads, dropout, use_sparse_attention=use_sparse_attention)
             for _ in range(num_layers)
         ])
         

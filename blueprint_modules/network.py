@@ -77,10 +77,10 @@ class NeuralArchitecture:
         for i in range(10):
             self.add_neuron(NeuronType.OUTPUT, ActivationType.LINEAR, layer_position=1.0)
 
-        # Add 10 hidden neurons and place them at the center (0.5)
+        # Add 50 hidden neurons and place them at the center (0.5)
         # Using 0.5 makes them match the default isolated position and group
         # them into the middle layer for the GNN without adding connections yet.
-        num_hidden = 10
+        num_hidden = 50
         for _ in range(num_hidden):
             # Default activation for initial hidden neurons: RELU
             self.add_neuron(NeuronType.HIDDEN, ActivationType.RELU)
