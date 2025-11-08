@@ -154,13 +154,11 @@ class NeuralArchitecture:
         
         self.connections.append(Connection(source_id, target_id, weight))
         self._connection_set.add(conn_key)
-        # Invalidate connectivity cache (but keep topological for local update)
+        # CRITICAL: Invalidate topological cache - the topology has changed!
+        # This ensures compute_topological_layers() will recompute with the new connection
+        self._topological_layers_cache = None
+        # Also invalidate connectivity cache
         self._connectivity_cache = None
-        # Locally update both source and target: 
-        # - target may move from isolated to connected (gained incoming)
-        # - source may move from isolated to connected (has outgoing now)
-        if hasattr(self, '_topological_layers_cache') and self._topological_layers_cache is not None:
-            self.recalculate_affected_layers({source_id, target_id})
         # Synchronize layer_position floats with updated topology
         self.sync_layer_positions_from_topology()
         return True
@@ -543,7 +541,7 @@ class NeuralArchitecture:
             # OUTPUT neurons: always position 1.0
             elif neuron.neuron_type == NeuronType.OUTPUT:
                 neuron.layer_position = 1.0
-            # HIDDEN neurons: map topological layer to (0, 1)
+            # HIDDEN neurons: map topological layer to (0.01, 0.99) EXCLUSIVE of INPUT/OUTPUT positions
             else:
                 layer = layers.get(neuron_id, -1)
                 if layer == -1:
@@ -553,9 +551,12 @@ class NeuralArchitecture:
                     # No connected hidden neurons (edge case); use center
                     neuron.layer_position = center_for_isolated
                 else:
-                    # Map hidden layer to (0, 1) proportionally
+                    # Map hidden layer to (0.01, 0.99) proportionally
+                    # This ensures HIDDEN neurons NEVER overlap with INPUT (0.0) or OUTPUT (1.0)
                     hidden_range = max(1, max_hidden_layer - min_hidden_layer)
-                    neuron.layer_position = float((layer - min_hidden_layer) / hidden_range)
+                    normalized = float((layer - min_hidden_layer) / hidden_range)  # Now in [0, 1]
+                    # Scale to (0.01, 0.99) to stay away from INPUT/OUTPUT positions
+                    neuron.layer_position = 0.01 + (0.98 * normalized)
     
     def get_layer_for_neuron(self, neuron_id: int) -> int:
         """Get topological layer for a single neuron. Returns -1 if isolated or not found."""
@@ -743,18 +744,20 @@ class GraphNeuralNetwork(nn.Module):
         self._precompute_activations()
     
     def _group_neurons_by_layer(self) -> Dict[float, List[Neuron]]:
-        """Group neurons by topological layer (not by layer_position float).
+        """Group neurons by topological layer, ensuring neuron type purity.
         
-        This uses the computed topological layers to group neurons, which is more robust
-        than relying on layer_position floats that can get out of sync.
+        CRITICAL: INPUT and OUTPUT neurons MUST NEVER be grouped with HIDDEN neurons,
+        regardless of topological layer assignments. This method ensures type-safe grouping.
+        
+        Grouping strategy:
+        - INPUT neurons (all types with neuron_type==INPUT) -> position 0.0 (exact)
+        - OUTPUT neurons (all types with neuron_type==OUTPUT) -> position 1.0 (exact)
+        - HIDDEN neurons (all types with neuron_type==HIDDEN) -> positions in (0.0, 1.0) exclusive
+          * Isolated HIDDEN (topo_layer == -1) -> position 0.5
+          * Connected HIDDEN -> position scaled from topological layer, constrained to (0.01, 0.99)
         
         Returns:
             Dict mapping float position -> list of neurons
-            Position is derived from topological layer:
-            - INPUT (layer 0) -> position 0.0
-            - OUTPUT (highest layer) -> position 1.0
-            - HIDDEN (layer k) -> position proportional to k
-            - Isolated HIDDEN (layer -1) -> position 0.5
         """
         # Get topological layers from architecture
         topological_layers = self.architecture.compute_topological_layers()
@@ -770,20 +773,32 @@ class GraphNeuralNetwork(nn.Module):
         for neuron_id, neuron in self.architecture.neurons.items():
             topo_layer = topological_layers.get(neuron_id, -1)
             
-            # Convert topological layer to position for grouping key
+            # Assign position based on NEURON TYPE (not topology alone)
+            # This guarantees INPUT/OUTPUT are never mixed with HIDDEN
             if neuron.neuron_type == NeuronType.INPUT:
+                # INPUT neurons always at 0.0 (exact match, no tolerance)
                 position = 0.0
             elif neuron.neuron_type == NeuronType.OUTPUT:
+                # OUTPUT neurons always at 1.0 (exact match, no tolerance)
                 position = 1.0
-            elif topo_layer == -1:
-                # Isolated hidden neuron
-                position = 0.5
-            else:
-                # Map hidden layer to (0, 1) proportionally
-                if max_layer > 0:
-                    position = float(topo_layer) / float(max_layer)
-                else:
+            elif neuron.neuron_type == NeuronType.HIDDEN:
+                # HIDDEN neurons must be in (0.0, 1.0) exclusive
+                if topo_layer == -1:
+                    # Isolated: not connected to anything
                     position = 0.5
+                else:
+                    # Connected HIDDEN: map topological layer to (0.01, 0.99)
+                    # This ensures they never overlap with INPUT (0.0) or OUTPUT (1.0)
+                    if max_layer > 0:
+                        # Scale from [0, max_layer] to (0.01, 0.99)
+                        # Minimum position is 0.01 (never 0.0)
+                        # Maximum position is 0.99 (never 1.0)
+                        position = 0.01 + (0.98 * float(topo_layer) / float(max_layer))
+                    else:
+                        position = 0.5
+            else:
+                # Fallback (shouldn't happen with standard neuron types)
+                position = 0.5
             
             if position not in layer_groups:
                 layer_groups[position] = []
