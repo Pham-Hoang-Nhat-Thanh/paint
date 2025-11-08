@@ -245,9 +245,12 @@ class ArchitectureTrainer:
         max_connections = getattr(self.config.search, 'max_connections', 0)
         complexity_norm = ((num_neurons / max_neurons) + (num_connections / max_connections)) / 2.0 if (max_neurons > 0 and max_connections > 0) else 0.0
 
-        raw_reward = self.config.search.reward_accuracy_weight * accuracy - self.config.search.reward_loss_weight * loss_norm - self.config.search.reward_complexity_weight * complexity_norm
+        accuracy_deviation = self.config.search.target_accuracy - accuracy
+        raw_reward = self.config.search.reward_accuracy_weight * np.exp(-accuracy_deviation) * accuracy\
+                    - self.config.search.reward_loss_weight * loss_norm \
+                    - self.config.search.reward_complexity_weight * complexity_norm
         final_reward = max(0.0, raw_reward)  # Ensure non-negative reward
-
+        print(f"Final Reward Calculation: Raw={raw_reward:.4f}, Final={final_reward:.4f} (Accuracy Dev={accuracy_deviation:.4f}, Loss Norm={loss_norm:.4f}, Complexity Norm={complexity_norm:.4f})")
         for exp in episode_experiences:
             exp['value_target'] = final_reward
         
@@ -621,9 +624,6 @@ class ArchitectureTrainer:
                     # Returns Dict with keys 'mcts_policy_action_type', 'mcts_policy_source', etc. (CPU lists)
                     marginals = self._precompute_mcts_marginals(visit_distribution, experience['mcts_actions'])
                     experience.update(marginals)  # Merge marginals into experience
-                    
-                    if len(visit_distribution) <= 10:
-                        print(f"    MCTS Policy stored: π(s) from {len(search_root.children)} children")
             except Exception as e:
                 print(f"    [Warning] Failed to extract MCTS policy: {e}")
                 # Continue without policy - will train only on value
@@ -906,11 +906,9 @@ class ArchitectureTrainer:
                 - valid_indices: list of buffer indices for priority update
                 - valid_rewards: list of rewards for priority update
         """
-        import math
-        
         # Cache normalization constants (used in multiple CE loss calculations)
-        log_max_neurons = math.log(max(1.0, self.config.model.max_neurons))
-        log_num_activations = math.log(max(1.0, len(ActivationType)))
+        log_max_neurons = np.log(max(1.0, self.config.model.max_neurons))
+        log_num_activations = np.log(max(1.0, len(ActivationType)))
         
         # Prepare graph data for this sub-batch
         graph_data_list = []
@@ -1349,21 +1347,59 @@ class ArchitectureTrainer:
             # Run training episode
             episode_metrics = self.run_training_episode()
             
-            # Train on batch if we have enough experiences
+            # Train on batch(s) if we have enough experiences
             train_interval = getattr(self.config, 'train_interval', 10)
             if self.episode > 0 and self.episode % train_interval == 0:
-                # Train on all accumulated experiences in the buffer
+                # We will sample batches from the replay buffer. The buffer.sample()
+                # method is prioritized and probabilistic, so multiple sample() calls
+                # can return overlapping indices. Instead of attempting to track
+                # unique indices (expensive), estimate expected coverage using the
+                # per-item sampling probabilities and decrement an expected-remaining
+                # measure. This preserves prioritized sampling while estimating when
+                # we've 'likely' seen most of the buffer.
                 buffer_size = len(self.experience_buffer)
                 print(f"  [Training] Starting with {buffer_size} total experiences in buffer")
-                remaining = buffer_size
-                while remaining > 0:
-                    batch_size = min(self.config.batch_size, remaining)
-                    train_metrics = self.train_on_batch(batch_size)
-                    if train_metrics:
-                        episode_metrics.update(train_metrics)
-                    remaining -= batch_size
-                # Clear buffer after training on all experiences
-                self.experience_buffer.clear()
+
+                if buffer_size > 0:
+                    # Get current priority-based sampling probabilities
+                    priorities = self.experience_buffer.priorities[:buffer_size].astype(np.float64)
+                    # Protect against zero-sum
+                    if priorities.sum() <= 0:
+                        probs = np.ones(buffer_size, dtype=np.float64) / float(buffer_size)
+                    else:
+                        probs = priorities ** getattr(self.experience_buffer, 'alpha', 1.0)
+                        probs = probs / probs.sum()
+
+                    # Track per-item probability of NOT having been sampled yet (start = 1)
+                    not_sampled_prob = np.ones(buffer_size, dtype=np.float64)
+
+                    # Bound iterations to avoid pathological long loops; default: 3x full coverage
+                    max_iters = max(1, int(np.ceil(buffer_size / max(1, self.config.batch_size) * 3)))
+                    iters = 0
+
+                    # Stop when expected remaining items is tiny or max iters reached
+                    while iters < max_iters and not_sampled_prob.sum() > 1e-3:
+                        # We'll issue a prioritized sampled batch (with configured batch size)
+                        batch_size = min(self.config.batch_size, buffer_size)
+
+                        # Approximate per-item selection probability for this batch.
+                        # Treat the batch as b independent draws with replacement using probs
+                        # as an approximation; this gives s_i = 1 - (1 - p_i)^b
+                        b = float(batch_size)
+                        s = 1.0 - np.power(1.0 - probs, b)
+                        
+                        # Run one sampled training batch (prioritized sampling with replacement across batches)
+                        train_metrics = self.train_on_batch(batch_size, sub_batch_size=self.config.search.sub_batch_size)
+                        if train_metrics:
+                            episode_metrics.update(train_metrics)
+
+                        # Update not-sampled probabilities (probabilistic bookkeeping)
+                        not_sampled_prob = not_sampled_prob * (1.0 - s)
+
+                        iters += 1
+
+                    # After loop, clear buffer to keep behavior consistent with previous code
+                    self.experience_buffer.clear()
 
             # Checkpoint periodically
             if self.episode > 0 and self.episode % self.config.checkpoint_interval == 0:
@@ -1386,41 +1422,123 @@ class ArchitectureTrainer:
     def _log_episode(self, metrics: Dict):
         """Log episode metrics"""
         # Always log (removed interval check so every episode is logged)
-        accuracy = metrics['final_accuracy']
-        neurons = metrics['total_neurons']
-        connections = metrics['total_connections']
-        
-        # Console output
-        print(f"Episode {self.episode}: "
-              f"Accuracy={accuracy:.4f}, Neurons={neurons}, "
-              f"Connections={connections}, Best={self.best_accuracy:.4f}")
+        # Sanitize and extract commonly used metrics for readable logs
+        def _sanitize(v):
+            # Convert torch tensors / numpy scalars / numpy arrays into python types
+            try:
+                import torch as _torch
+            except Exception:
+                _torch = None
 
-        # Structured file logging
+            # Torch tensor
+            if _torch is not None and isinstance(v, _torch.Tensor):
+                try:
+                    if v.numel() == 1:
+                        return float(v.item())
+                    return v.detach().cpu().tolist()
+                except Exception:
+                    return None
+
+            # Numpy types
+            try:
+                import numpy as _np
+                if isinstance(v, (_np.floating, _np.integer)):
+                    return float(v)
+                if isinstance(v, _np.ndarray):
+                    return v.tolist()
+            except Exception:
+                pass
+
+            # Common container types
+            if isinstance(v, (list, tuple)):
+                return [_sanitize(x) for x in v]
+            if isinstance(v, dict):
+                return {str(k): _sanitize(val) for k, val in v.items()}
+
+            # Fallback: primitive
+            try:
+                if isinstance(v, (int, float, str, bool)):
+                    return v
+            except Exception:
+                pass
+
+            # Last resort
+            try:
+                return float(v)
+            except Exception:
+                return str(v)
+
+        accuracy = float(_sanitize(metrics.get('final_accuracy', 0.0)))
+        avg_reward = _sanitize(metrics.get('average_reward', 0.0))
+        steps = int(_sanitize(metrics.get('steps', 0)))
+        neurons = int(_sanitize(metrics.get('total_neurons', 0)))
+        connections = int(_sanitize(metrics.get('total_connections', 0)))
+        experiences = int(_sanitize(metrics.get('experiences', 0)))
+        is_best = bool(_sanitize(metrics.get('is_best', False)))
+
+        # Console output: richer summary
+        print(
+            f"Episode {self.episode}: acc={accuracy:.4f}, avg_reward={avg_reward:.4f}, "
+            f"steps={steps}, experiences={experiences}, neurons={neurons}, "
+            f"conns={connections}, best={self.best_accuracy:.4f}, is_best={is_best}"
+        )
+
+        # Prepare structured log dict with selected fields (sanitize all values)
+        log_dict = {
+            'timestamp': time.time(),
+            'episode': int(self.episode),
+            'final_accuracy': accuracy,
+            'average_reward': _sanitize(avg_reward),
+            'steps': steps,
+            'experiences': experiences,
+            'total_neurons': neurons,
+            'total_connections': connections,
+            'best_accuracy': float(_sanitize(self.best_accuracy)),
+            'is_best': is_best
+        }
+
+        # Include training metrics if present (losses, num_graphs, etc.)
+        for k in ('total_loss', 'policy_loss', 'value_loss', 'mcts_policy_loss',
+                  'weighted_policy_loss', 'weighted_mcts_policy_loss', 'num_graphs'):
+            if k in metrics:
+                log_dict[k] = _sanitize(metrics[k])
+
+        # Structured file logging (JSONL) + logger info line
         try:
-            # Log to file handler
-            log_message = (f"Episode {self.episode} Accuracy={accuracy:.4f} "
-                          f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}")
-            self.logger.info(log_message)
-            
-            # Force flush handlers to ensure writes
-            for handler in self.logger.handlers:
-                handler.flush()
-            
-            # Append JSONL metrics
+            # Log a compact one-line message to configured logger if available
+            try:
+                self.logger.info(f"Episode {self.episode}: final_acc={accuracy:.4f}, steps={steps}, experiences={experiences}")
+            except Exception:
+                # If logger isn't set up, ignore and proceed to JSONL
+                pass
+
+            # Force flush handlers to ensure writes (if logger exists)
+            try:
+                for handler in getattr(self, 'logger', type('X', (), {'handlers': []})) and getattr(self.logger, 'handlers', []):
+                    try:
+                        handler.flush()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # Append sanitized JSONL metrics to metrics_path
             with open(self.metrics_path, 'a', encoding='utf-8') as mf:
-                mf.write(json.dumps(metrics) + "\n")
-                mf.flush()  # Ensure write
-                
+                mf.write(json.dumps(log_dict) + "\n")
+                mf.flush()
+
         except Exception as e:
-            # Fall back to direct file write if logger fails
-            print(f"Logger failed: {e}, attempting direct file write...")
+            # Fall back to direct file write if logger/metrics file fails
+            print(f"Logger/metrics write failed: {e}, attempting direct file write...")
             try:
                 with open(self.log_path, 'a', encoding='utf-8') as f:
-                    f.write(f"{time.time()} INFO Episode {self.episode} Accuracy={accuracy:.4f} "
-                           f"Neurons={neurons} Connections={connections} Best={self.best_accuracy:.4f}\n")
+                    f.write(f"{time.time()} INFO Episode {self.episode} final_acc={accuracy:.4f} "
+                           f"steps={steps} experiences={experiences} neurons={neurons} conns={connections} best={self.best_accuracy:.4f}\n")
                     f.flush()
+
+                # Also attempt metrics JSONL write as last resort
                 with open(self.metrics_path, 'a', encoding='utf-8') as mf:
-                    mf.write(json.dumps(metrics) + "\n")
+                    mf.write(json.dumps(log_dict) + "\n")
                     mf.flush()
             except Exception as e2:
                 print(f"Direct file write also failed: {e2}")

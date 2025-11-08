@@ -123,7 +123,8 @@ class ActionSpace:
 
         # Always allow structural changes (add/remove neurons)
         if num_neurons < self.max_neurons:
-            for activation in [ActivationType.RELU, ActivationType.TANH]:
+            # Propose adding neurons with any available activation type
+            for activation in ActivationType:
                 valid_actions.append(Action(
                     action_type=ActionType.ADD_NEURON,
                     activation=activation
@@ -168,7 +169,8 @@ class ActionSpace:
 
         # Always allow structural changes
         if num_neurons < self.max_neurons:
-            for activation in [ActivationType.RELU, ActivationType.TANH]:
+            # Propose adding neurons with all activation types supported by the network
+            for activation in ActivationType:
                 valid_actions.append(Action(
                     action_type=ActionType.ADD_NEURON,
                     activation=activation
@@ -323,7 +325,8 @@ class ActionSpace:
             sample_neurons = np.random.choice(hidden_neurons, size=min(3, len(hidden_neurons)), replace=False)
             for neuron_id in sample_neurons:
                 current_activation = neurons[neuron_id].activation
-                for new_activation in [ActivationType.RELU, ActivationType.TANH, ActivationType.SIGMOID]:
+                # Allow modifying activation to any supported ActivationType (except current)
+                for new_activation in ActivationType:
                     if new_activation != current_activation:
                         valid_actions.append(Action(
                             action_type=ActionType.MODIFY_ACTIVATION,

@@ -26,6 +26,8 @@ class NeuralMCTSNode(MCTSNode):
         self._dirichlet_applied = False
         # Incremental set of expanded actions for O(1) filtering (vectorized action filtering)
         self._expanded_actions_set = set()
+        # Cache action masks to avoid recomputation across _compute_action_prior calls
+        self._cached_masks = None
     
     def is_fully_expanded(self) -> bool:
         """Check if all valid actions have been expanded as children.
@@ -118,64 +120,89 @@ class NeuralMCTS(MCTS):
         
         return graph_data
 
-    def _batch_graph_data_for_eval(self, parent_graph: Dict, child_graph: Dict) -> Dict:
-        """Batch two graph data dicts (parent + child) for joint evaluation.
+    def _batch_graph_data_for_eval(self, parent_graph: Dict, child_graphs) -> Dict:
+        """Batch graph data dicts for joint evaluation.
         
-        Follows PyG batching: concatenate graphs into single disconnected graph.
-        Enables single policy_value_net forward pass for both parent and child.
+        Flexible batching: supports parent + single child (Dict) or parent + multiple children (List[Dict]).
+        Follows PyG batching: concatenate graphs into single disconnected graph with batch tensor.
+        Enables single policy_value_net forward pass for all graphs.
+        
+        Args:
+            parent_graph: Dict with graph data for parent
+            child_graphs: Dict (single child) or List[Dict] (multiple children)
         
         Returns:
-            Batched graph dict with num_graphs=2, batch tensor tracking which nodes belong to which graph
+            Batched graph dict with num_graphs indicator, batch tensor tracking graph membership
         """
+        # Normalize child_graphs to list
+        if isinstance(child_graphs, dict):
+            child_graphs = [child_graphs]
+        
+        num_graphs = 1 + len(child_graphs)
+        
         # Collect node features, layer positions
         parent_nodes = parent_graph['node_features'].squeeze(0)  # [num_nodes_parent, features]
-        child_nodes = child_graph['node_features'].squeeze(0)    # [num_nodes_child, features]
-        all_node_features = torch.cat([parent_nodes, child_nodes], dim=0)  # [total_nodes, features]
-        
         parent_pos = parent_graph['layer_positions'].squeeze(0)  # [num_nodes_parent]
-        child_pos = child_graph['layer_positions'].squeeze(0)    # [num_nodes_child]
-        all_layer_positions = torch.cat([parent_pos, child_pos], dim=0)  # [total_nodes]
         
-        # Build batch tensor: 0 for parent nodes, 1 for child nodes
-        num_parent_nodes = parent_nodes.shape[0]
-        num_child_nodes = child_nodes.shape[0]
-        batch_tensor = torch.cat([
-            torch.zeros(num_parent_nodes, dtype=torch.long, device=self.device),
-            torch.ones(num_child_nodes, dtype=torch.long, device=self.device)
-        ], dim=0)  # [total_nodes]
+        all_node_features = [parent_nodes]
+        all_layer_positions = [parent_pos]
+        node_offsets = [0, parent_nodes.shape[0]]  # Track cumulative node counts for edge offset
         
-        # Merge edge indices with offset for child edges
+        for child_graph in child_graphs:
+            child_nodes = child_graph['node_features'].squeeze(0)  # [num_nodes_child, features]
+            child_pos = child_graph['layer_positions'].squeeze(0)  # [num_nodes_child]
+            all_node_features.append(child_nodes)
+            all_layer_positions.append(child_pos)
+            node_offsets.append(node_offsets[-1] + child_nodes.shape[0])
+        
+        # Concatenate all node features and positions
+        all_node_features_cat = torch.cat(all_node_features, dim=0)  # [total_nodes, features]
+        all_layer_positions_cat = torch.cat(all_layer_positions, dim=0)  # [total_nodes]
+        
+        # Build batch tensor: graph_id for each node
+        batch_list = []
+        for graph_id in range(num_graphs):
+            num_nodes = node_offsets[graph_id + 1] - node_offsets[graph_id]
+            batch_list.append(torch.full((num_nodes,), graph_id, dtype=torch.long, device=self.device))
+        batch_tensor = torch.cat(batch_list, dim=0)  # [total_nodes]
+        
+        # Merge edge indices with offsets for each child
+        all_edges = []
+        all_weights = []
+        
         parent_edges = parent_graph['edge_index']  # [2, num_edges_parent]
-        child_edges = child_graph['edge_index'] + num_parent_nodes  # [2, num_edges_child] with offset
-        if parent_edges.shape[1] > 0 and child_edges.shape[1] > 0:
-            all_edge_indices = torch.cat([parent_edges, child_edges], dim=1)
-        elif parent_edges.shape[1] > 0:
-            all_edge_indices = parent_edges
-        elif child_edges.shape[1] > 0:
-            all_edge_indices = child_edges
+        parent_weights = parent_graph['edge_weights']
+        if parent_edges.shape[1] > 0:
+            all_edges.append(parent_edges)
+            all_weights.append(parent_weights)
+        
+        for i, child_graph in enumerate(child_graphs):
+            offset = node_offsets[i + 1]
+            child_edges = child_graph['edge_index']  # [2, num_edges_child]
+            child_weights = child_graph['edge_weights']
+            
+            if child_edges.shape[1] > 0:
+                # Add offset to child edge indices
+                child_edges_offset = child_edges + offset
+                all_edges.append(child_edges_offset)
+                all_weights.append(child_weights)
+        
+        if all_edges:
+            all_edge_indices = torch.cat(all_edges, dim=1)
+            all_edge_weights = torch.cat(all_weights, dim=0)
         else:
             all_edge_indices = torch.empty((2, 0), dtype=torch.long, device=self.device)
-        
-        # Merge edge weights
-        parent_weights = parent_graph['edge_weights']
-        child_weights = child_graph['edge_weights']
-        if parent_weights.shape[0] > 0 and child_weights.shape[0] > 0:
-            all_edge_weights = torch.cat([parent_weights, child_weights], dim=0)
-        elif parent_weights.shape[0] > 0:
-            all_edge_weights = parent_weights
-        elif child_weights.shape[0] > 0:
-            all_edge_weights = child_weights
-        else:
             all_edge_weights = torch.empty((0,), dtype=torch.float, device=self.device)
         
-        # Return batched format [1, total_nodes, features] to match expected input
+        # Return batched format
         return {
-            'node_features': all_node_features.unsqueeze(0),  # [1, total_nodes, features]
-            'edge_index': all_edge_indices,                   # [2, total_edges]
-            'edge_weights': all_edge_weights,                 # [total_edges]
-            'layer_positions': all_layer_positions.unsqueeze(0),  # [1, total_nodes]
-            'batch': batch_tensor,  # [total_nodes] - 0 for parent, 1 for child
-            'num_graphs': 2
+            'node_features': all_node_features_cat.unsqueeze(0),  # [1, total_nodes, features]
+            'edge_index': all_edge_indices,                       # [2, total_edges]
+            'edge_weights': all_edge_weights,                     # [total_edges]
+            'layer_positions': all_layer_positions_cat.unsqueeze(0),  # [1, total_nodes]
+            'batch': batch_tensor,  # [total_nodes] - graph_id per node
+            'node_offsets': node_offsets,  # Offsets for extracting per-graph outputs
+            'num_graphs': num_graphs
         }
 
 
@@ -300,8 +327,6 @@ class NeuralMCTS(MCTS):
                     action_str += ")"
             elif final_node.action.activation is not None:
                 action_str += f"({final_node.action.activation.name})"
-            print(f"MCTS FINAL ACTION: {action_str} (value: {final_node.value/final_node.visits:.3f}, visits: {final_node.visits})")
-            print(f"MCTS tree stats: {root.visits} total visits, {len(root.children)} children at root")
             print("MCTS search completed successfully")
             
             # Return tuple: (selected_child, search_root)
@@ -405,24 +430,26 @@ class NeuralMCTS(MCTS):
             node.policy_value, valid_actions, node.architecture, k=self.max_children
         )
 
-        # Use policy network to select from top-K actions (policy-guided sampling)
-        action = self.action_manager.select_action(
-            node.policy_value, node.architecture, exploration=True, use_policy=True
-        )
-        
-        # Ensure selected action is in top-K and unexpanded; if not, resample or fallback
-        max_resamples = 5
-        for attempt in range(max_resamples):
-            if action in top_k_actions:
-                break
-            # Resample: try policy again or fallback to random from top-K
-            if attempt < max_resamples - 1:
-                action = self.action_manager.select_action(
-                    node.policy_value, node.architecture, exploration=True, use_policy=True
-                )
-            else:
-                # Final fallback: uniform random from top-K actions
-                action = top_k_actions[np.random.randint(len(top_k_actions))]
+        # Compute full priors only for the top-K candidates (expensive masked softmax)
+        # This avoids computing full priors for all valid actions.
+        candidate_priors = []
+        for cand in top_k_actions:
+            try:
+                p = self._compute_action_prior(node.policy_value, cand, node.architecture, top_k_actions, node=node)
+            except Exception:
+                p = 0.0
+            candidate_priors.append(float(p))
+
+        # Normalize priors into a probability distribution (fallback to uniform if all zeros)
+        priors_tensor = torch.tensor(candidate_priors, dtype=torch.float32)
+        if priors_tensor.sum().item() <= 0.0:
+            probs = torch.ones_like(priors_tensor) / float(len(priors_tensor))
+        else:
+            probs = priors_tensor / priors_tensor.sum()
+
+        # Sample one action from the top-K according to the computed priors (AlphaZero-style)
+        selected_idx = Categorical(probs=probs).sample().item()
+        action = top_k_actions[int(selected_idx)]
 
         # Apply action to a copied architecture
         new_architecture = node._copy_architecture()
@@ -431,43 +458,27 @@ class NeuralMCTS(MCTS):
         if not success:
             return (node, node.policy_value['value'].item())
 
-        # Create child node with vectorized prior computation
-        child = NeuralMCTSNode(new_architecture, parent=node, action=action)
-        # Compute prior for this specific action using masked logits (vectorized for all valid actions)
-        child.prior_prob = self._compute_action_prior(
-            node.policy_value, action, node.architecture, top_k_actions
-        )
-
-        # OPTIMIZATION 1 + 2: Batch evaluate parent + child in single forward pass
-        # Prepare both graphs for joint evaluation
+        # Evaluate the sampled child architecture
         with torch.no_grad():
-            parent_graph = self._prepare_graph_data(node.architecture)
             child_graph = self._prepare_graph_data(new_architecture)
-            
-            # Batch the graphs: parent (num_nodes_parent) + child (num_nodes_child)
-            batched_graph = self._batch_graph_data_for_eval(parent_graph, child_graph)
-            
-            # Single forward pass for both (2x speedup vs two separate forwards)
-            batched_output = self.policy_value_net(batched_graph)
-            
-            # Extract predictions for parent and child from batched output
-            # The network outputs are in shape [num_graphs, ...] where num_graphs=2
-            # We need to extract outputs for graph 0 (parent) and graph 1 (child)
-            child.policy_value = {
-                'action_type': batched_output['action_type'][1:2],  # Extract child output [1, num_actions]
-                'source_logits': batched_output['source_logits'][1:2],  # [1, max_neurons]
-                'target_logits': batched_output['target_logits'][1:2],  # [1, max_neurons]
-                'activation_logits': batched_output['activation_logits'][1:2],  # [1, num_activations]
-                'value': batched_output['value'][1:2]  # [1, 1]
-            }
+            child_policy = self.policy_value_net(child_graph)
+            child_value = child_policy['value'].item()
+
+        # Create child node with the sampled action and evaluated policy
+        child = NeuralMCTSNode(new_architecture, parent=node, action=action)
+        child.policy_value = child_policy
         
-        value = child.policy_value['value'].item()
+        # Compute prior for the child using cached masks (used by PUCT in future tree traversals)
+        try:
+            child.prior_prob = float(self._compute_action_prior(node.policy_value, action, node.architecture, top_k_actions, node=node))
+        except Exception:
+            child.prior_prob = 1.0 / len(top_k_actions)  # Uniform fallback
         
         # Update incremental expanded actions set for vectorized filtering
         node._expanded_actions_set.add(action)
         node.children.append(child)
         
-        return (child, value)  # Return both child node and its value
+        return (child, child_value)
 
     def _apply_dirichlet_noise_to_policy(self, policy_output: Dict, num_actions: int, 
                                          epsilon: float = 0.25, alpha: float = 0.3):
@@ -506,17 +517,27 @@ class NeuralMCTS(MCTS):
         policy_output['action_type'] = torch.tensor(mixed_logits, dtype=action_type_logits.dtype, device=action_type_logits.device).unsqueeze(0)
 
     def _compute_action_prior(self, policy_output: Dict, action: Action, 
-                                        architecture: NeuralArchitecture, valid_actions: List[Action]) -> float:
+                                        architecture: NeuralArchitecture, valid_actions: List[Action],
+                                        node: 'NeuralMCTSNode' = None) -> float:
         """Vectorized prior computation using masked logits (consistent with ActionManager masking).
         
         Computes the prior probability as the softmax probability of the action under the policy,
         using the same masks that ActionManager applies when sampling.
         
         This ensures priors match the policy distribution over valid actions only.
+        
+        If node is provided and has cached masks, reuse them to avoid recomputation.
         """
-        # Get action masks to identify valid choices
-        masks = self.action_manager.get_action_masks(architecture)
-        tensor_size = masks.pop('tensor_size')
+        # Retrieve or compute action masks (cache on node if provided)
+        if node is not None and node._cached_masks is not None:
+            masks = node._cached_masks.copy()
+            tensor_size = masks.pop('tensor_size')
+        else:
+            masks = self.action_manager.get_action_masks(architecture)
+            tensor_size = masks.pop('tensor_size')
+            # Cache masks on node if provided
+            if node is not None:
+                node._cached_masks = {'tensor_size': tensor_size, **masks}
         
         # Move masks to policy device
         device = policy_output['action_type'].device
@@ -599,7 +620,6 @@ class NeuralMCTS(MCTS):
         
         # Get masks for action types
         masks = self.action_manager.get_action_masks(architecture)
-        tensor_size = masks.pop('tensor_size')
         device = policy_output['action_type'].device
         masks['action_type'] = masks['action_type'].to(device)
         
@@ -612,27 +632,43 @@ class NeuralMCTS(MCTS):
         masked_logits = action_type_logits + masks['action_type']  # [num_action_types]
         action_type_probs = F.softmax(masked_logits, dim=-1)  # [num_action_types]
         
-        # Score each valid action by its action_type probability (fast heuristic)
-        # This ignores source/target/activation, but is 20x faster and good enough for top-K filtering
-        action_scores = []
-        for action in valid_actions:
-            action_type_score = action_type_probs[action.action_type.value].item()
-            # Simple secondary heuristic: prefer actions with fewer parameters (lower entropy)
-            secondary_score = 0.0
-            if action.source_neuron is not None:
-                secondary_score += 0.1  # Slight penalty for source neuron (adds complexity)
-            if action.target_neuron is not None:
-                secondary_score += 0.1
-            if action.activation is not None:
-                secondary_score += 0.05
-            
-            # Combined score: primary (action_type) dominates, secondary breaks ties
-            score = action_type_score - secondary_score
-            action_scores.append((action, score))
-        
-        # Sort by score descending and take top-K
-        action_scores.sort(key=lambda x: x[1], reverse=True)
-        top_k_actions = [action for action, _ in action_scores[:k]]
+        # Torch-based vectorized scoring: compute primary scores by indexing the
+        # action_type probability tensor and apply small secondary penalties.
+        # Use torch.topk on-device to avoid CPU roundtrips.
+        num_actions = len(valid_actions)
+        device = action_type_probs.device
+
+        # Ensure action_type_probs is 1-D on correct device
+        if action_type_probs.dim() > 1 and action_type_probs.shape[0] == 1:
+            action_type_probs = action_type_probs.squeeze(0)
+
+        # Build tensor of action_type indices for all valid actions
+        action_type_idx = torch.tensor([a.action_type.value for a in valid_actions], dtype=torch.long, device=device)
+
+        # Primary scores: gather probabilities for each action's type
+        primary_scores = action_type_probs[action_type_idx]  # [num_actions]
+
+        # Secondary heuristic: vectorized via boolean masks converted to a tensor
+        has_source = torch.tensor([1 if a.source_neuron is not None else 0 for a in valid_actions],
+                                  dtype=primary_scores.dtype, device=device)
+        has_target = torch.tensor([1 if a.target_neuron is not None else 0 for a in valid_actions],
+                                  dtype=primary_scores.dtype, device=device)
+        has_activation = torch.tensor([1 if a.activation is not None else 0 for a in valid_actions],
+                                      dtype=primary_scores.dtype, device=device)
+
+        secondary_scores = 0.1 * has_source + 0.1 * has_target + 0.05 * has_activation
+
+        combined_scores = primary_scores - secondary_scores
+
+        if k < num_actions:
+            topk = torch.topk(combined_scores, k=k, largest=True)
+            topk_idx = topk.indices  # already sorted by score desc
+        else:
+            # k >= num_actions: sort all
+            topk_idx = torch.argsort(combined_scores, descending=True)
+
+        # Convert indices to Python ints and select actions
+        top_k_actions = [valid_actions[int(i.item())] for i in topk_idx]
         
         return top_k_actions
 

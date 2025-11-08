@@ -369,7 +369,7 @@ class ActionManager:
             
             return Action(
                 action_type=action_type,
-                activation=list(ActivationType)[activation_idx % 4]
+                activation=list(ActivationType)[activation_idx % len(ActivationType)]
             )
         
         if action_type == ActionType.REMOVE_NEURON:
@@ -403,7 +403,7 @@ class ActionManager:
             return Action(
                 action_type=action_type,
                 source_neuron=source_idx,
-                activation=list(ActivationType)[activation_idx % 4]
+                activation=list(ActivationType)[activation_idx % len(ActivationType)]
             )
         
         if action_type == ActionType.ADD_CONNECTION:

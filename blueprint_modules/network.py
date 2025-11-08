@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import Enum
 import torch.nn as nn
 from torch.amp import autocast
+import random
 
 class NeuronType(Enum):
     INPUT = "input"
@@ -76,25 +77,58 @@ class NeuralArchitecture:
         for i in range(10):
             self.add_neuron(NeuronType.OUTPUT, ActivationType.LINEAR, layer_position=1.0)
 
-        # Add isolated hidden neuron to allow initial connections
-        for i in range(100):
-            layer_pos = torch.rand(1).item() * 0.8 + 0.1  # Random position between 0.1 and 0.9
-            self.add_neuron(NeuronType.HIDDEN, ActivationType.RELU, layer_position=layer_pos)
+        # Add 10 hidden neurons and place them at the center (0.5)
+        # Using 0.5 makes them match the default isolated position and group
+        # them into the middle layer for the GNN without adding connections yet.
+        num_hidden = 10
+        for _ in range(num_hidden):
+            # Default activation for initial hidden neurons: RELU
+            self.add_neuron(NeuronType.HIDDEN, ActivationType.RELU)
 
-        # Ensure each input has at least one outgoing connection (batch random generation)
-        target_ids = torch.randint(784, 784 + 10 + 100, (784,))
-        weights = torch.rand(784)
-        for input_id in range(784):
-            self.add_connection(input_id, target_ids[input_id].item(), weight=weights[input_id].item())
-    
-    def add_neuron(self, neuron_type: NeuronType, activation: ActivationType, layer_position: float) -> int:
-        """Add a new neuron and return its ID"""
+        # Ensure all input neurons are connected to at least one hidden neuron
+        input_ids = [nid for nid, neuron in self.neurons.items() if neuron.neuron_type == NeuronType.INPUT]
+        hidden_ids = [nid for nid, neuron in self.neurons.items() if neuron.neuron_type == NeuronType.HIDDEN]
+        for input_id in input_ids:
+            # Connect each input neuron to a random hidden neuron
+            target_hidden_id = random.choice(hidden_ids)
+            self.add_connection(input_id, target_hidden_id, weight=0.1)
+        
+    def add_neuron(self, neuron_type: NeuronType, activation: ActivationType, layer_position: Optional[float] = None) -> int:
+        """Add a new neuron and return its ID.
+
+        If `layer_position` is None the neuron is inserted with a safe placeholder
+        position and the topology is recomputed to derive a proper normalized
+        float position for all neurons (via `sync_layer_positions_from_topology`).
+
+        This ensures callers can create neurons without explicitly choosing a
+        float position and still obtain consistent positional encodings.
+        """
         neuron_id = self.next_neuron_id
-        self.neurons[neuron_id] = Neuron(neuron_id, neuron_type, activation, layer_position)
+        # Use a sensible placeholder while the neuron exists in the graph so
+        # topology computations can include it. For isolates this matches the
+        # default used by sync_layer_positions_from_topology().
+        placeholder_pos = 0.5 if layer_position is None else layer_position
+        self.neurons[neuron_id] = Neuron(neuron_id, neuron_type, activation, placeholder_pos)
         self.next_neuron_id += 1
-        # Invalidate caches
+
+        # Invalidate caches (topology changed)
         self._sorted_neuron_ids = None
         self._connectivity_cache = None
+        # Invalidate topological layers cache so next computation is fresh
+        self._topological_layers_cache = None
+
+        # If caller didn't provide a float position, compute it from topology
+        # so integer topological layers are mapped to normalized floats.
+        if layer_position is None:
+            try:
+                # This will call compute_topological_layers() internally and
+                # rewrite all neuron.layer_position values accordingly.
+                self.sync_layer_positions_from_topology()
+            except Exception:
+                # Keep placeholder if sync fails for any reason; caller can
+                # call sync_layer_positions_from_topology() later.
+                pass
+
         return neuron_id
     
     def add_connection(self, source_id: int, target_id: int, weight: float = 0.1) -> bool:
@@ -119,6 +153,8 @@ class NeuralArchitecture:
         # - source may move from isolated to connected (has outgoing now)
         if hasattr(self, '_topological_layers_cache') and self._topological_layers_cache is not None:
             self.recalculate_affected_layers({source_id, target_id})
+        # Synchronize layer_position floats with updated topology
+        self.sync_layer_positions_from_topology()
         return True
     
     def remove_neuron(self, neuron_id: int) -> bool:
@@ -158,6 +194,8 @@ class NeuralArchitecture:
         self._connectivity_cache = None
         # Invalidate topological layers cache (structure changed)
         self._topological_layers_cache = None
+        # Synchronize layer_position floats with updated topology
+        self.sync_layer_positions_from_topology()
         return True
     
     def remove_connection(self, source_id: int, target_id: int) -> bool:
@@ -180,6 +218,8 @@ class NeuralArchitecture:
             # Safer to force full recomputation than risk stale local updates
             if hasattr(self, '_topological_layers_cache'):
                 self._topological_layers_cache = None
+            # Synchronize layer_position floats with updated topology
+            self.sync_layer_positions_from_topology()
         return len(self.connections) < initial_count
     
     def compute_signature(self) -> str:
@@ -450,6 +490,64 @@ class NeuralArchitecture:
         # Update cache with new layers
         self._topological_layers_cache = layers
         return layers
+    
+    def sync_layer_positions_from_topology(self, center_for_isolated: float = 0.5) -> None:
+        """Synchronize neuron layer_position floats (0..1) with computed topological integer layers.
+        
+        This maps topological layers to normalized float positions:
+        - INPUT neurons: layer 0 -> position 0.0 (FIXED, never changed)
+        - OUTPUT neurons: highest layer -> position 1.0 (FIXED, never changed)
+        - HIDDEN neurons: intermediate layers mapped proportionally to (0, 1)
+        - Isolated HIDDEN neurons (layer -1): fixed at center_for_isolated (default 0.5)
+        
+        Call this after structural changes (add/remove connections, remove neurons) to keep
+        layer_position consistent with the graph topology. Without this, layer_position can
+        drift out of sync with the actual computed layers, breaking positional encodings and
+        layout computations.
+        
+        Args:
+            center_for_isolated: float in [0, 1], position to assign isolated hidden neurons (default 0.5)
+        """
+        # Get current topological layer assignments
+        layers = self.compute_topological_layers()
+
+        # Quickly determine min/max layer for HIDDEN neurons only (excluding isolates == -1 and fixed I/O neurons)
+        min_hidden_layer = None
+        max_hidden_layer = None
+        for neuron_id, layer in layers.items():
+            neuron = self.neurons[neuron_id]
+            # Skip INPUT (fixed at 0.0) and OUTPUT (fixed at 1.0) neurons
+            if neuron.neuron_type in (NeuronType.INPUT, NeuronType.OUTPUT):
+                continue
+            # Skip isolated hidden neurons (layer -1)
+            if layer == -1:
+                continue
+            if min_hidden_layer is None or layer < min_hidden_layer:
+                min_hidden_layer = layer
+            if max_hidden_layer is None or layer > max_hidden_layer:
+                max_hidden_layer = layer
+
+        # Assign positions in a single pass over neurons
+        for neuron_id, neuron in self.neurons.items():
+            # INPUT neurons: always position 0.0
+            if neuron.neuron_type == NeuronType.INPUT:
+                neuron.layer_position = 0.0
+            # OUTPUT neurons: always position 1.0
+            elif neuron.neuron_type == NeuronType.OUTPUT:
+                neuron.layer_position = 1.0
+            # HIDDEN neurons: map topological layer to (0, 1)
+            else:
+                layer = layers.get(neuron_id, -1)
+                if layer == -1:
+                    # Isolated hidden neuron
+                    neuron.layer_position = center_for_isolated
+                elif min_hidden_layer is None or max_hidden_layer is None:
+                    # No connected hidden neurons (edge case); use center
+                    neuron.layer_position = center_for_isolated
+                else:
+                    # Map hidden layer to (0, 1) proportionally
+                    hidden_range = max(1, max_hidden_layer - min_hidden_layer)
+                    neuron.layer_position = float((layer - min_hidden_layer) / hidden_range)
     
     def get_layer_for_neuron(self, neuron_id: int) -> int:
         """Get topological layer for a single neuron. Returns -1 if isolated or not found."""
@@ -800,19 +898,7 @@ class GraphNeuralNetwork(nn.Module):
         # Process input layer
         input_layer_idx = 0
         input_neuron_ids = self.layer_indices[input_layer_idx]
-        
-        if len(input_neuron_ids) != 784:
-            # Handle case where input layer doesn't match expected size
-            # This can happen during architecture search
-            if len(input_neuron_ids) > 784:
-                # Too many input neurons, take first 784
-                input_data = x
-            else:
-                # Too few input neurons, pad with zeros
-                padding = torch.zeros(batch_size, 784 - len(input_neuron_ids), device=self.device)
-                input_data = torch.cat([x[:, :len(input_neuron_ids)], padding], dim=1)
-        else:
-            input_data = x
+        input_data = x[:, :len(input_neuron_ids)]  # Assume input layer matches first N neurons
         
         layer_outputs[input_layer_idx] = input_data
         

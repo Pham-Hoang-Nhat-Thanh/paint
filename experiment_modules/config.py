@@ -28,13 +28,13 @@ class ModelConfig:
 class MCTSConfig:
     """Configuration for AlphaZero-style Neural MCTS (no rollouts)"""
     # Search parameters
-    num_simulations: int = 500
+    num_simulations: int = 1000
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 30
+    max_children: int = 50
     temperature: float = 1.0
     temperature_decay: float = 0.99
     
@@ -49,12 +49,15 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 250  # Increased to allow more complex architectures
+    max_steps_per_episode: int = 500  # Increased to allow more complex architectures
 
     # Evaluation
     quick_train_epochs: int = 1  # Reduced for faster evaluations
-    final_train_epochs: int = 5  # Increased for more thorough final training
+    final_train_epochs: int = 3  # Increased for more thorough final training
     evaluation_batch_size: int = 64  # Increased for faster evaluation with larger batches
+
+    # Sub-batch size for processing multiple architectures
+    sub_batch_size: int = 2
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -93,15 +96,15 @@ class OverallConfig:
     # Architecture search
     search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
     
-    # Training parameters (unified, no staged configs)
-    batch_size: int = 32
+    # Training parameters 
+    batch_size: int = 64
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
     max_episodes: int = 300
     
     # System
-    device: str = "cuda:3"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:1"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000
@@ -113,7 +116,7 @@ class OverallConfig:
     eval_interval: int = 1
     checkpoint_interval: int = 1
     log_interval: int = 1
-    train_interval: int = 2  # Train every N episodes
+    train_interval: int = 10  # Train every N episodes
 
     # GPU optimizations
     use_mixed_precision: bool = True

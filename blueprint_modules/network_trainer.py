@@ -141,6 +141,7 @@ class QuickTrainer:
         criterion = nn.CrossEntropyLoss()
 
         with torch.no_grad():
+            batch_count = 0
             for batch_idx, (data, target) in enumerate(self.test_loader):
                 # Move inputs to the trainer device before any model call
                 data, target = data.to(self.device), target.to(self.device)
@@ -148,6 +149,9 @@ class QuickTrainer:
                 output = model(data, use_mixed_precision=self.use_mixed_precision)
                 batch_loss = criterion(output, target)
                 loss += batch_loss.item()
+
+                # Count batches for robust averaging
+                batch_count += 1
 
                 pred = output.argmax(dim=1)
                 correct += (pred == target).sum().item()
@@ -157,7 +161,7 @@ class QuickTrainer:
                 if self.eval_samples is not None and total >= self.eval_samples:
                     break
 
-        avg_loss = loss / max(1, total // (self.test_loader.batch_size if hasattr(self.test_loader, 'batch_size') else 64))
+        avg_loss = loss / max(1, batch_count)
         return (correct / total if total > 0 else 0.0), avg_loss
 
     def update_architecture(self, architecture: NeuralArchitecture):
