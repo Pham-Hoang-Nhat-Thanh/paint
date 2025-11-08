@@ -831,7 +831,7 @@ class GraphNeuralNetwork(nn.Module):
             self.weight_matrices[key] = param
             self.weight_masks[key] = mask_matrix.to(self.device)
 
-        # Build bias vectors for each layer
+        # Build bias vectors for each layer (including disconnected layers)
         for layer_idx, neuron_ids in self.layer_indices.items():
             biases = torch.zeros(len(neuron_ids))
             for i, neuron_id in enumerate(neuron_ids):
@@ -960,10 +960,18 @@ class GraphNeuralNetwork(nn.Module):
 
                 layer_outputs[current_layer_idx] = current_output
             else:
-                # If no connections to this layer, initialize with zeros
-                num_neurons = len(self.layer_indices[current_layer_idx])
-                layer_outputs[current_layer_idx] = torch.zeros(batch_size, num_neurons,
-                                                             device=self.device)
+                # If no connections to this layer, use learnable bias vector to maintain gradient flow
+                # CRITICAL: Must use actual parameters to keep computation graph connected
+                bias_key = f"biases_{current_layer_idx}"
+                if bias_key in self.bias_vectors:
+                    num_neurons = len(self.layer_indices[current_layer_idx])
+                    zeros = torch.zeros(batch_size, num_neurons, device=self.device)
+                    layer_outputs[current_layer_idx] = zeros + self.bias_vectors[bias_key].unsqueeze(0)
+                else:
+                    # Fallback: create zeros with requires_grad from a dummy parameter
+                    num_neurons = len(self.layer_indices[current_layer_idx])
+                    layer_outputs[current_layer_idx] = torch.zeros(batch_size, num_neurons,
+                                                                 device=self.device)
 
         # Extract output from last layer
         output_layer_idx = len(self.layer_positions) - 1
@@ -973,9 +981,18 @@ class GraphNeuralNetwork(nn.Module):
         if final_output.shape[1] > 10:
             final_output = final_output[:, :10]  # Take first 10 neurons
         elif final_output.shape[1] < 10:
-            # Pad with zeros if needed (gradient-safe)
-            padding = torch.zeros(batch_size, 10 - final_output.shape[1],
-                                device=self.device)
+            # Pad with learnable parameters to maintain gradient flow
+            # CRITICAL: Use bias vectors as learnable padding to keep computation graph connected
+            padding_size = 10 - final_output.shape[1]
+            # Create a learnable padding from output layer's bias vector (padded portion)
+            output_layer_idx = len(self.layer_positions) - 1
+            bias_key = f"biases_{output_layer_idx}"
+            if bias_key in self.bias_vectors and self.bias_vectors[bias_key].shape[0] >= 10:
+                # Use the last padding_size elements from bias vector
+                padding = self.bias_vectors[bias_key][-padding_size:].unsqueeze(0).expand(batch_size, -1)
+            else:
+                # Fallback: create zeros with batch dimension
+                padding = torch.zeros(batch_size, padding_size, device=self.device)
             final_output = torch.cat([final_output, padding], dim=1)
         
         return final_output
