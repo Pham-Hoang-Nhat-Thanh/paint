@@ -88,10 +88,18 @@ class NeuralArchitecture:
         # Ensure all input neurons are connected to at least one hidden neuron
         input_ids = [nid for nid, neuron in self.neurons.items() if neuron.neuron_type == NeuronType.INPUT]
         hidden_ids = [nid for nid, neuron in self.neurons.items() if neuron.neuron_type == NeuronType.HIDDEN]
+        output_ids = [nid for nid, neuron in self.neurons.items() if neuron.neuron_type == NeuronType.OUTPUT]
+        
         for input_id in input_ids:
             # Connect each input neuron to a random hidden neuron
             target_hidden_id = random.choice(hidden_ids)
             self.add_connection(input_id, target_hidden_id, weight=0.1)
+        
+        # CRITICAL: Connect hidden neurons to output neurons to complete the circuit
+        # Each output neuron should receive input from at least one hidden neuron
+        for output_id in output_ids:
+            source_hidden_id = random.choice(hidden_ids)
+            self.add_connection(source_hidden_id, output_id, weight=0.1)
         
     def add_neuron(self, neuron_type: NeuronType, activation: ActivationType, layer_position: Optional[float] = None) -> int:
         """Add a new neuron and return its ID.
@@ -735,26 +743,53 @@ class GraphNeuralNetwork(nn.Module):
         self._precompute_activations()
     
     def _group_neurons_by_layer(self) -> Dict[float, List[Neuron]]:
-        """Optimized neuron grouping"""
-        layers = {}
-        tolerance = 0.1
+        """Group neurons by topological layer (not by layer_position float).
         
-        # Pre-sort neurons by position for better grouping
-        sorted_neurons = sorted(self.architecture.neurons.values(), 
-                              key=lambda n: n.layer_position)
+        This uses the computed topological layers to group neurons, which is more robust
+        than relying on layer_position floats that can get out of sync.
         
-        for neuron in sorted_neurons:
-            found_layer = False
-            for layer_pos in list(layers.keys()):
-                if abs(neuron.layer_position - layer_pos) <= tolerance:
-                    layers[layer_pos].append(neuron)
-                    found_layer = True
-                    break
+        Returns:
+            Dict mapping float position -> list of neurons
+            Position is derived from topological layer:
+            - INPUT (layer 0) -> position 0.0
+            - OUTPUT (highest layer) -> position 1.0
+            - HIDDEN (layer k) -> position proportional to k
+            - Isolated HIDDEN (layer -1) -> position 0.5
+        """
+        # Get topological layers from architecture
+        topological_layers = self.architecture.compute_topological_layers()
+        
+        # Find the highest layer (for OUTPUT neurons)
+        max_layer = 0
+        for layer in topological_layers.values():
+            if layer >= 0:  # Ignore isolated neurons (layer -1)
+                max_layer = max(max_layer, layer)
+        
+        # Group neurons by their topological layer
+        layer_groups = {}
+        for neuron_id, neuron in self.architecture.neurons.items():
+            topo_layer = topological_layers.get(neuron_id, -1)
             
-            if not found_layer:
-                layers[neuron.layer_position] = [neuron]
+            # Convert topological layer to position for grouping key
+            if neuron.neuron_type == NeuronType.INPUT:
+                position = 0.0
+            elif neuron.neuron_type == NeuronType.OUTPUT:
+                position = 1.0
+            elif topo_layer == -1:
+                # Isolated hidden neuron
+                position = 0.5
+            else:
+                # Map hidden layer to (0, 1) proportionally
+                if max_layer > 0:
+                    position = float(topo_layer) / float(max_layer)
+                else:
+                    position = 0.5
+            
+            if position not in layer_groups:
+                layer_groups[position] = []
+            layer_groups[position].append(neuron)
         
-        return {pos: layers[pos] for pos in sorted(layers.keys())}
+        return {pos: layer_groups[pos] for pos in sorted(layer_groups.keys())}
     
     def _precompute_layer_mappings(self):
         """Precompute efficient layer-to-layer mappings"""

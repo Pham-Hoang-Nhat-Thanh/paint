@@ -1595,8 +1595,8 @@ class ArchitectureTrainer:
             os.makedirs(f'architecture_diagrams/ep{self.episode:03d}', exist_ok=True)
 
             # Constants for layout
-            CANVAS_WIDTH = 1200
-            CANVAS_HEIGHT = 900
+            CANVAS_WIDTH = 1000
+            CANVAS_HEIGHT = 800
             MARGIN = 50
             INPUT_OUTPUT_RADIUS = 3
             HIDDEN_RADIUS = 8  # Make hidden nodes bigger for visibility
