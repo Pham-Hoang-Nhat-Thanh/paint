@@ -192,7 +192,8 @@ class ArchitectureTrainer:
                 raise RuntimeError("Action application failed")
 
             # Draw architecture diagram after action (save every step for debugging)
-            self._draw_architecture_diagram(new_arch, step)
+            if self.episode % self.config.diagram_save_interval == 0:
+                self._draw_architecture_diagram(new_arch, step)
             reward = self._evaluate_architecture(new_arch)
 
             # Calculate timing information
@@ -1693,9 +1694,7 @@ class ArchitectureTrainer:
             
             # Save with minimal compression
             diagram_file = f'architecture_diagrams/ep{self.episode:03d}/step{step:03d}.jpg'
-            img.save(diagram_file, quality=70, optimize=False)
-            
-            print(f"      Architecture diagram saved: {diagram_file}", flush=True)
+            img.save(diagram_file, quality=70, optimize=True)
 
         except ImportError:
             print("      PIL not available, skipping diagram")

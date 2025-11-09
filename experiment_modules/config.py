@@ -115,6 +115,7 @@ class OverallConfig:
     # Monitoring
     eval_interval: int = 1
     checkpoint_interval: int = 1
+    diagram_save_interval: int = 50
     log_interval: int = 1
     train_interval: int = 5  # Train every N episodes
 

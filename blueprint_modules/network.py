@@ -339,11 +339,16 @@ class NeuralArchitecture:
     def compute_topological_layers(self) -> Dict[int, int]:
         """Compute deterministic topological layers based on graph connectivity.
         
-        Layer assignment:
+        Layer assignment with proper handling of isolated neurons:
         - Input neurons: layer 0 (no incoming connections)
         - Layer k (k > 0): neurons where max(layer_indices of incoming neurons) == k-1
-        - Isolated HIDDEN neurons: layer -1 (no incoming OR no outgoing connections, but only for hidden neurons)
-        - Output neurons: automatically assigned highest layer among all neurons
+        - Isolated HIDDEN neurons: layer -1 (no incoming OR no outgoing connections, by YOUR DEFINITION)
+        
+        CRITICAL: Isolated classification happens AFTER computing layers based on connectivity.
+        This ensures:
+        1. Neurons with only incoming connections get proper layers based on their sources
+        2. When an isolated neuron gains outgoing connections, it can be reassigned to a proper layer
+        3. Outgoing connections from such neurons go to higher layers (enforced by action mask)
         
         Returns:
             Dict[neuron_id, layer] where layer is int (-1 for isolated hidden neurons, 0+ for connected)
@@ -365,49 +370,50 @@ class NeuralArchitecture:
                 incoming_neighbors[conn.target_id].append(conn.source_id)
                 outgoing_neighbors[conn.source_id].append(conn.target_id)
         
-        # Find isolated HIDDEN neurons (missing incoming OR outgoing, but only hidden neurons)
-        isolated_neurons = set()
-        for nid, neuron in self.neurons.items():
-            if neuron.neuron_type == NeuronType.HIDDEN:
-                if len(incoming_neighbors[nid]) == 0 or len(outgoing_neighbors[nid]) == 0:
-                    isolated_neurons.add(nid)
+        # STEP 1: Compute layers based on connectivity (ignore isolation for now)
+        layers = {}
         
-        # Assign layer -1 to isolated hidden neurons
-        layers = {nid: -1 for nid in isolated_neurons}
-        
-        # For non-isolated neurons, compute layers iteratively
-        non_isolated = {nid: neuron for nid, neuron in self.neurons.items() if nid not in isolated_neurons}
-        
-        # Input neurons (no incoming connections)
-        for nid in non_isolated:
+        # Assign layer 0 to all neurons with no incoming connections
+        for nid in self.neurons:
             if len(incoming_neighbors[nid]) == 0:
                 layers[nid] = 0
         
-        # Iteratively assign layers based on max layer of incoming neighbors
-        max_iterations = len(non_isolated) + 1  # Prevent infinite loops
+        # Iteratively assign layers to remaining neurons based on their incoming neighbors
+        max_iterations = len(self.neurons) + 1
         for iteration in range(max_iterations):
-            prev_assigned = len([nid for nid in non_isolated if nid in layers and layers[nid] >= 0])
+            prev_count = len(layers)
             
-            for nid in non_isolated:
-                if nid not in layers or layers[nid] < 0:
-                    # Check if all incoming neighbors have assigned layers (including isolated neurons with layer -1)
-                    if len(incoming_neighbors[nid]) == 0:
-                        # No incoming; should not happen in non_isolated, but handle gracefully
-                        layers[nid] = 0
-                    else:
-                        # All incoming neighbors must have assigned layers (may include -1 for isolated)
-                        incoming_layers = [layers[src] for src in incoming_neighbors[nid] if src in layers]
-                        
-                        if len(incoming_layers) == len(incoming_neighbors[nid]):
-                            # All incoming neighbors assigned; compute max layer + 1
-                            # Note: if all incomings are isolated (layer -1), max is -1, so layer becomes 0
-                            max_incoming_layer = max(incoming_layers)
-                            layers[nid] = max_incoming_layer + 1
+            for nid in self.neurons:
+                if nid in layers:
+                    continue  # Already assigned
+                
+                # Check if all incoming neighbors have assigned layers
+                incoming_layers = [layers[src] for src in incoming_neighbors[nid] if src in layers]
+                
+                if len(incoming_layers) == len(incoming_neighbors[nid]) and len(incoming_neighbors[nid]) > 0:
+                    # All incoming neighbors have layers; assign this neuron one level deeper
+                    max_incoming_layer = max(incoming_layers)
+                    layers[nid] = max_incoming_layer + 1
             
-            curr_assigned = len([nid for nid in non_isolated if nid in layers and layers[nid] >= 0])
-            if curr_assigned == prev_assigned:
-                # No progress; stop
-                break
+            if len(layers) == prev_count:
+                break  # No progress; stop
+        
+        # Ensure all neurons have a layer (safety fallback)
+        for nid in self.neurons:
+            if nid not in layers:
+                layers[nid] = 0
+        
+        # STEP 2: Reclassify isolated HIDDEN neurons to layer -1
+        # YOUR DEFINITION: isolated = no incoming OR no outgoing (not both)
+        # This is done AFTER layer assignment so we know proper layers for non-isolated neurons
+        for nid, neuron in self.neurons.items():
+            if neuron.neuron_type == NeuronType.HIDDEN:
+                has_incoming = len(incoming_neighbors[nid]) > 0
+                has_outgoing = len(outgoing_neighbors[nid]) > 0
+                
+                # Isolated if missing incoming OR outgoing (your original definition)
+                if not has_incoming or not has_outgoing:
+                    layers[nid] = -1
         
         # Cache the result
         self._topological_layers_cache = layers
@@ -503,8 +509,12 @@ class NeuralArchitecture:
         This maps topological layers to normalized float positions:
         - INPUT neurons: layer 0 -> position 0.0 (FIXED, never changed)
         - OUTPUT neurons: highest layer -> position 1.0 (FIXED, never changed)
-        - HIDDEN neurons: intermediate layers mapped proportionally to (0, 1)
+        - HIDDEN neurons: intermediate layers mapped proportionally to (0, 1), with per-neuron jitter
         - Isolated HIDDEN neurons (layer -1): fixed at center_for_isolated (default 0.5)
+        
+        CRITICAL FIX: Within each topological layer, add deterministic per-neuron jitter based on ID
+        to break symmetry. Without this, all neurons in the same layer get identical positions,
+        and the graph transformer can't distinguish between them, preventing effective policy learning.
         
         Call this after structural changes (add/remove connections, remove neurons) to keep
         layer_position consistent with the graph topology. Without this, layer_position can
@@ -533,6 +543,15 @@ class NeuralArchitecture:
             if max_hidden_layer is None or layer > max_hidden_layer:
                 max_hidden_layer = layer
 
+        # Count hidden neurons per layer to compute jitter range
+        hidden_per_layer = {}
+        for neuron_id, layer in layers.items():
+            neuron = self.neurons[neuron_id]
+            if neuron.neuron_type == NeuronType.HIDDEN and layer >= 0:
+                if layer not in hidden_per_layer:
+                    hidden_per_layer[layer] = []
+                hidden_per_layer[layer].append(neuron_id)
+
         # Assign positions in a single pass over neurons
         for neuron_id, neuron in self.neurons.items():
             # INPUT neurons: always position 0.0
@@ -551,12 +570,34 @@ class NeuralArchitecture:
                     # No connected hidden neurons (edge case); use center
                     neuron.layer_position = center_for_isolated
                 else:
-                    # Map hidden layer to (0.01, 0.99) proportionally
-                    # This ensures HIDDEN neurons NEVER overlap with INPUT (0.0) or OUTPUT (1.0)
-                    hidden_range = max(1, max_hidden_layer - min_hidden_layer)
-                    normalized = float((layer - min_hidden_layer) / hidden_range)  # Now in [0, 1]
-                    # Scale to (0.01, 0.99) to stay away from INPUT/OUTPUT positions
-                    neuron.layer_position = 0.01 + (0.98 * normalized)
+                    # Map hidden layer to (0.01, 0.99) using BIN CENTERS so integer layers
+                    # are positioned at the centers of equally sized bins. This avoids
+                    # mapping the minimum layer to the left extreme and the maximum to
+                    # the right extreme when there are only a few integer layers.
+                    #
+                    # Compute normalized center for the integer layer:
+                    #   normalized = (layer - min + 0.5) / (num_layers)
+                    # where num_layers = max_hidden_layer - min_hidden_layer + 1
+                    if max_hidden_layer == min_hidden_layer:
+                        normalized = 0.5
+                    else:
+                        num_layers = float(max_hidden_layer - min_hidden_layer + 1)
+                        normalized = float(layer - min_hidden_layer + 0.5) / num_layers
+
+                    # Base position within the allocated range (avoid exact 0.0/1.0)
+                    base_pos = 0.01 + (0.98 * normalized)
+
+                    # Add deterministic per-neuron jitter within the layer to break symmetry
+                    # This ensures neurons in the same topological layer have slightly different
+                    # positions, allowing the graph transformer to distinguish them in embeddings.
+                    neurons_in_layer = hidden_per_layer.get(layer, [])
+                    if len(neurons_in_layer) > 1:
+                        max_jitter = 0.002  # ±0.002 spread within each layer
+                        jitter = (neuron_id % len(neurons_in_layer)) / max(1, len(neurons_in_layer) - 1)
+                        jitter = (jitter - 0.5) * 2 * max_jitter  # Center around 0, scale to ±max_jitter
+                        neuron.layer_position = max(0.0, min(1.0, base_pos + jitter))
+                    else:
+                        neuron.layer_position = base_pos
     
     def get_layer_for_neuron(self, neuron_id: int) -> int:
         """Get topological layer for a single neuron. Returns -1 if isolated or not found."""
