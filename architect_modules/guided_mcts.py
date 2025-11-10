@@ -8,8 +8,8 @@ from typing import Dict, List
 import torch
 import math
 import numpy as np
-import time
 import torch.nn.functional as F
+from collections import deque
 
 class NeuralMCTSNode(MCTSNode):
     """MCTS node enhanced with neural network predictions"""
@@ -255,7 +255,7 @@ class NeuralMCTS(MCTS):
             root.policy_value = policy_value
 
         # Early stopping tracking
-        best_values = []
+        best_values = deque(maxlen=self.early_stopping_patience)
         no_improvement_count = 0
         initial_visits = root.visits  # Track starting visits for reused trees
         
@@ -288,10 +288,9 @@ class NeuralMCTS(MCTS):
             current_best = root.value / root.visits if root.visits > 0 else 0.0
             best_values.append(current_best)
 
-            # Check for improvement over the last patience iterations
-            if len(best_values) >= self.early_stopping_patience:
-                recent_best = max(best_values[-self.early_stopping_patience:])
-                oldest_recent = min(best_values[-self.early_stopping_patience:])
+            if len(best_values) == self.early_stopping_patience:
+                recent_best = max(best_values)
+                oldest_recent = min(best_values)
                 improvement = recent_best - oldest_recent
 
                 if improvement < self.early_stopping_min_delta:
@@ -299,7 +298,6 @@ class NeuralMCTS(MCTS):
                 else:
                     no_improvement_count = 0
 
-                # Early stopping condition
                 if no_improvement_count >= self.early_stopping_patience:
                     print(f"Early stopping at iteration {i + 1}: no significant improvement in last {self.early_stopping_patience} iterations")
                     break
@@ -401,7 +399,7 @@ class NeuralMCTS(MCTS):
         # Cache valid actions for this node if not already cached
         if node._valid_actions_cache is None:
             all_valid_actions = self.action_space.get_valid_actions(
-                node.architecture, current_step=0, evolutionary_cycle=self.current_cycle
+                node.architecture, evolutionary_cycle=self.current_cycle
             )
             node._valid_actions_cache = all_valid_actions
         all_valid_actions = node._valid_actions_cache

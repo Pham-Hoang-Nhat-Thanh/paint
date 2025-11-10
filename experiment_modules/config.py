@@ -57,7 +57,7 @@ class ArchitectureSearchConfig:
     evaluation_batch_size: int = 64  # Increased for faster evaluation with larger batches
 
     # Sub-batch size for training
-    sub_batch_size: int = 4
+    sub_batch_size: int = 8
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -125,5 +125,5 @@ class OverallConfig:
     enable_tf32: bool = True
 
     # Early stopping
-    early_stopping_patience: int = 25
+    early_stopping_patience: int = 100
     early_stopping_min_delta: float = 0.001

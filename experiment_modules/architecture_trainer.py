@@ -18,8 +18,8 @@ warnings.filterwarnings("ignore", message="Please use the new API settings to co
 
 # Enable TF32 for faster matrix multiplications on Ampere+ GPUs
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.fp32_precision = 'tf32'
-    torch.backends.cudnn.conv.fp32_precision = 'tf32'
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
 
 from blueprint_modules.network import NeuralArchitecture, ActivationType
 from blueprint_modules.action import ActionSpace, Action
@@ -149,7 +149,6 @@ class ArchitectureTrainer:
         episode_experiences = []
         episode_rewards = []
         episode_steps = 0
-        step_times = []  # Track time for each step
         
         # Initialize MCTS tree reuse (for persistent tree across steps WITHIN this episode)
         mcts_root = None  # Will store the selected child node for next iteration
@@ -199,7 +198,6 @@ class ArchitectureTrainer:
             # Calculate timing information
             step_end_time = time.time()
             step_duration = step_end_time - step_start_time
-            step_times.append(step_duration)
 
             print(f"Step completed: Reward = {reward:.4f} | Step time: {step_duration:.2f}s")
 

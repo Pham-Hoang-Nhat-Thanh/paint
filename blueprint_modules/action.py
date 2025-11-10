@@ -50,23 +50,18 @@ class ActionSpace:
         self.max_steps_per_episode = max_steps_per_episode
         self.connection_candidate_multiplier = connection_candidate_multiplier
     
-    def get_valid_actions(self, architecture: NeuralArchitecture, current_step: int = 0,
+    def get_valid_actions(self, architecture: NeuralArchitecture,
                          evolutionary_cycle: Optional['EvolutionaryCycle'] = None) -> List[Action]:
         """Get all valid actions for the current architecture state with optimized constraints"""
         valid_actions = []
 
-        # Check episode step limit
-        if current_step >= self.max_steps_per_episode:
-            return valid_actions  # No more actions allowed
-
         # Determine prioritization strategy based on evolutionary cycle
         if evolutionary_cycle is not None:
             # Cycle-aware prioritization: evolutionary cycling behavior
-            self._add_cycle_aware_actions(valid_actions, architecture, current_step, evolutionary_cycle)
+            self._add_cycle_aware_actions(valid_actions, architecture, evolutionary_cycle)
         else:
             # Fallback: simple prioritization for policy network compatibility
-            self._add_simple_prioritized_actions(valid_actions, architecture)
-
+            self._add_simple_prioritized_actions(valid_actions, architecture) 
         return valid_actions
     
     def apply_action(self, architecture: NeuralArchitecture, action: Action) -> bool:
@@ -112,7 +107,7 @@ class ActionSpace:
         return False
 
     def _add_cycle_aware_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture,
-                                current_step: int, evolutionary_cycle: 'EvolutionaryCycle'):
+                                evolutionary_cycle: 'EvolutionaryCycle'):
         """Add actions with evolutionary cycle-aware prioritization"""
         neurons = architecture.neurons
         num_neurons = len(neurons)
@@ -265,8 +260,9 @@ class ActionSpace:
                               if not details['has_in'] and not details['has_out']]
 
         # Pre-slice neuron lists for better performance
-        input_sample = input_neurons[:5]
-        output_sample = output_neurons[:5]
+        input_sample = input_neurons[:len(input_neurons)//2 + 1]
+        output_sample = output_neurons[:len(output_neurons)//2 + 1]
+        hidden_sample = hidden_neurons[:len(hidden_neurons)//2 + 1]
         
         for isolated_id in completely_isolated:
             # Try to connect to inputs and outputs first
@@ -276,6 +272,15 @@ class ActionSpace:
                 if conn_key not in existing_connections and conn_key not in added:
                     candidates.append(conn_key)  # input->hidden always valid
                     added.add(conn_key)
+
+            # Connect from hidden to hidden
+            for hidden_id in hidden_sample:
+                if hidden_id != isolated_id:
+                    conn_key = (hidden_id, isolated_id)
+                    if conn_key not in existing_connections and conn_key not in added:
+                        if self._is_valid_connection(neurons, hidden_id, isolated_id):
+                            candidates.append(conn_key)
+                            added.add(conn_key)
 
             for output_id in output_sample:
                 conn_key = (isolated_id, output_id)
@@ -340,7 +345,7 @@ class ActionSpace:
             existing_connections = {(conn.source_id, conn.target_id) for conn in architecture.connections}
 
             # Pre-compute number of attempts
-            num_attempts = min(15, len(all_neuron_ids) ** 2 // 10)
+            num_attempts = len(all_neuron_ids) ** 2 // 1000 * self.connection_candidate_multiplier # Adjusted for efficiency
             candidates = []
             added_in_loop = set()
             
@@ -354,7 +359,7 @@ class ActionSpace:
                         candidates.append(conn_key)
                         added_in_loop.add(conn_key)
 
-            for source_id, target_id in candidates[:5]:  # Limit for efficiency
+            for source_id, target_id in candidates: 
                 valid_actions.append(Action(
                     action_type=ActionType.ADD_CONNECTION,
                     source_neuron=source_id,

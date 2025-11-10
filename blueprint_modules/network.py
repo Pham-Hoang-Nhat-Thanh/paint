@@ -757,8 +757,8 @@ class GraphNeuralNetwork(nn.Module):
             if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
                 # Use new API for TF32 precision
                 torch.set_float32_matmul_precision('high')
-                torch.backends.cudnn.conv.fp32_precision = 'tf32'
-                torch.backends.cuda.matmul.fp32_precision = 'tf32'
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.backends.cudnn.allow_tf32 = True
 
         # Build optimized network structure
         self._build_optimized_network()
