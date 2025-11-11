@@ -310,10 +310,15 @@ class NeuralArchitecture:
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_weights = torch.empty((0,), dtype=torch.float)
 
+        # Compute layer positions from sorted neuron IDs
+        # This ensures layer_positions is always available for network forward pass
+        layer_positions = torch.FloatTensor([neurons[neuron_id].layer_position for neuron_id in node_ids])
+
         return {
             'node_features': node_features,
             'edge_index': edge_index,
             'edge_weights': edge_weights,
+            'layer_positions': layer_positions,
             'node_mapping': id_to_index,
             'performance': self.performance_metrics,
             'sorted_neuron_ids': node_ids  # Return sorted IDs for reuse

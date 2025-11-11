@@ -18,7 +18,8 @@ class UnifiedPolicyValueNetwork(nn.Module):
     
     def __init__(self, node_feature_dim: int, hidden_dim: int = 128,
                  max_neurons: int = 1000, num_actions: int = 5,
-                 num_activations: int = 4):
+                 num_activations: int = 4, self_attention_heads: int = 8,
+                 transformer_layers: int = 3):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_neurons = max_neurons
@@ -28,7 +29,9 @@ class UnifiedPolicyValueNetwork(nn.Module):
         # Graph transformer backbone
         self.graph_transformer = GraphTransformer(
             node_feature_dim=node_feature_dim,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            num_heads=self_attention_heads,
+            num_layers=transformer_layers
         )
         
         # Shared backbone MLP - optimized for speed (removed biases for faster computation)
@@ -108,124 +111,33 @@ class UnifiedPolicyValueNetwork(nn.Module):
         }
         """
         num_graphs = graph_data.get('num_graphs', 1)
+        for k, v in graph_data.items():
+            if torch.is_tensor(v):
+                assert v.device.type == 'cuda', f"{k} is not on CUDA!"
         
         # Single graph case: process directly
         if num_graphs == 1:
             global_embedding, _ = self.graph_transformer(graph_data)
             # global_embedding: [1, hidden_dim * 2]
         elif sub_batch_size >= num_graphs:
-            # Small batch case: no internal sub-batching needed
-            # Trainer has already split into small sub-batches, so process entire sub-batch
-            # Call transformer once and reuse both global and node embeddings
+            # Small batch case: vectorized pooling for speed and GPU utilization
             global_embedding, node_embeddings = self.graph_transformer(graph_data)
-            # global_embedding: [num_graphs, hidden_dim * 2] OR [1, hidden_dim*2]
-            # node_embeddings: [1, total_nodes, hidden_dim]
-            global_embeddings = []
             batch_indices = graph_data['batch']  # [total_nodes]
-            node_features = graph_data['node_features']  # [1, total_nodes, features]
             node_embeddings_squeezed = node_embeddings.squeeze(0)  # [total_nodes, hidden_dim]
-            
-            # Pool embeddings per graph
-            for graph_idx in range(num_graphs):
-                mask = (batch_indices == graph_idx)
-                if mask.any():
-                    graph_embedding = node_embeddings_squeezed[mask].mean(dim=0)  # [hidden_dim]
-                    global_embeddings.append(graph_embedding)
-                else:
-                    global_embeddings.append(torch.zeros(self.hidden_dim, device=node_embeddings.device, dtype=node_embeddings.dtype))
-            
-            # Stack embeddings: [num_graphs, hidden_dim]
-            if global_embeddings:
-                global_embedding = torch.stack(global_embeddings, dim=0)
-                # Expand to match expected shape [num_graphs, hidden_dim * 2]
-                global_embedding = torch.cat([global_embedding, global_embedding], dim=-1)  # [num_graphs, hidden_dim * 2]
-            else:
-                global_embedding = torch.zeros(num_graphs, self.hidden_dim * 2, device=node_features.device, dtype=node_features.dtype)
+
+            # Vectorized pooling: create one-hot assignment matrix [total_nodes, num_graphs]
+            assign_matrix = (batch_indices.unsqueeze(-1) == torch.arange(num_graphs, device=batch_indices.device).unsqueeze(0)).float()  # [total_nodes, num_graphs]
+            # Sum node embeddings per graph
+            summed_embeddings = torch.matmul(assign_matrix.t(), node_embeddings_squeezed)  # [num_graphs, hidden_dim]
+            # Count nodes per graph
+            node_counts = assign_matrix.sum(dim=0).clamp(min=1).unsqueeze(-1)  # [num_graphs, 1]
+            # Mean pool
+            pooled_embeddings = summed_embeddings / node_counts  # [num_graphs, hidden_dim]
+
+            global_embedding = torch.cat([pooled_embeddings, pooled_embeddings], dim=-1)  # [num_graphs, hidden_dim * 2]
         else:
-            # Large batch case: use internal sub-batching to avoid OOM in transformer attention
-            # Key: Process sub-batches through transformer, but decompose into individual graphs
-            global_embeddings = []
-            batch_indices = graph_data['batch']  # [total_nodes]
-            node_features = graph_data['node_features']  # [1, total_nodes, features]
-            edge_index = graph_data['edge_index']
-            edge_weights = graph_data['edge_weights']
-            layer_positions = graph_data['layer_positions']  # [1, total_nodes]
-            
-            # Process graphs in sub-batches through transformer
-            for sub_batch_start in range(0, num_graphs, sub_batch_size):
-                sub_batch_end = min(sub_batch_start + sub_batch_size, num_graphs)
-                graphs_in_sub_batch = list(range(sub_batch_start, sub_batch_end))
-                
-                # Create mask for nodes in this sub-batch
-                sub_batch_mask = torch.zeros(len(batch_indices), dtype=torch.bool, device=batch_indices.device)
-                for graph_idx in graphs_in_sub_batch:
-                    sub_batch_mask |= (batch_indices == graph_idx)
-                
-                # Extract node indices for this sub-batch
-                sub_batch_node_indices = torch.where(sub_batch_mask)[0]
-                
-                # Create mapping from old indices to new indices
-                sub_batch_index_map = torch.full((len(batch_indices),), -1, dtype=torch.long, device=batch_indices.device)
-                for new_idx, old_idx in enumerate(sub_batch_node_indices):
-                    sub_batch_index_map[old_idx] = new_idx
-                
-                # Extract edges that are within this sub-batch
-                valid_edges = torch.ones(edge_index.shape[1], dtype=torch.bool, device=edge_index.device)
-                for edge_idx in range(edge_index.shape[1]):
-                    src, tgt = edge_index[0, edge_idx], edge_index[1, edge_idx]
-                    if sub_batch_index_map[src] == -1 or sub_batch_index_map[tgt] == -1:
-                        valid_edges[edge_idx] = False
-                
-                # Remap edge indices for sub-batch
-                sub_edge_index = edge_index[:, valid_edges].clone()
-                for i in range(sub_edge_index.shape[1]):
-                    sub_edge_index[0, i] = sub_batch_index_map[sub_edge_index[0, i]]
-                    sub_edge_index[1, i] = sub_batch_index_map[sub_edge_index[1, i]]
-                
-                sub_edge_weights = edge_weights[valid_edges] if valid_edges.any() else edge_weights[:0]
-                
-                # Create sub-batch graph data (still contains multiple graphs)
-                sub_batch_graph_data = {
-                    'node_features': node_features[:, sub_batch_mask, :],  # [1, sub_batch_nodes, features]
-                    'edge_index': sub_edge_index,
-                    'edge_weights': sub_edge_weights,
-                    'layer_positions': layer_positions[:, sub_batch_mask],  # [1, sub_batch_nodes]
-                }
-                
-                # Now we need to decompose the sub-batch back into individual graphs
-                # Get node embeddings from transformer to pool per-graph
-                _, node_embeddings = self.graph_transformer(sub_batch_graph_data)
-                # node_embeddings: [1, sub_batch_nodes, hidden_dim]
-                node_embeddings_squeezed = node_embeddings.squeeze(0)  # [sub_batch_nodes, hidden_dim]
-                
-                # Create a mapping from sub-batch nodes back to graph indices
-                sub_batch_node_to_graph = torch.full((len(sub_batch_node_indices),), -1, dtype=torch.long, device=batch_indices.device)
-                for local_idx, global_idx in enumerate(sub_batch_node_indices):
-                    graph_id = batch_indices[global_idx].item()
-                    # Find position of this graph in graphs_in_sub_batch
-                    pos_in_sub_batch = graphs_in_sub_batch.index(graph_id)
-                    sub_batch_node_to_graph[local_idx] = pos_in_sub_batch
-                
-                # Pool embeddings per graph within this sub-batch
-                num_graphs_in_sub_batch = len(graphs_in_sub_batch)
-                for local_graph_idx in range(num_graphs_in_sub_batch):
-                    mask = (sub_batch_node_to_graph == local_graph_idx)
-                    if mask.any():
-                        # Mean pool the node embeddings for this graph
-                        graph_embedding = node_embeddings_squeezed[mask].mean(dim=0)  # [hidden_dim]
-                        global_embeddings.append(graph_embedding)
-                    else:
-                        # Empty graph (shouldn't happen), use zeros
-                        global_embeddings.append(torch.zeros(self.hidden_dim, device=node_embeddings.device, dtype=node_embeddings.dtype))
-            
-            # Stack embeddings: [num_graphs, hidden_dim]
-            if global_embeddings:
-                global_embedding = torch.stack(global_embeddings, dim=0)
-                # Expand to match expected shape [num_graphs, hidden_dim * 2]
-                # by concatenating with itself (simple approach) or creating proper dual embedding
-                global_embedding = torch.cat([global_embedding, global_embedding], dim=-1)  # [num_graphs, hidden_dim * 2]
-            else:
-                global_embedding = torch.zeros(num_graphs, self.hidden_dim * 2, device=node_features.device, dtype=node_features.dtype)
+            # Large batch case: Raise error for not sub-batching
+            raise NotImplementedError("Please use sub-batching for large batches.")
         
         # Shared processing - applied to full batch (cheap linear ops, fits in memory)
         shared_features = self.shared_backbone(global_embedding)

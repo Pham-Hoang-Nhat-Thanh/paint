@@ -7,8 +7,8 @@ class ModelConfig:
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
     hidden_dim: int = 128
-    num_heads: int = 4
-    num_layers: int = 5
+    num_heads: int = 8
+    num_layers: int = 3
     dropout: float = 0.1
     use_edge_features: bool = True
     
@@ -97,14 +97,14 @@ class OverallConfig:
     search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
     
     # Training parameters 
-    batch_size: int = 64
+    batch_size: int = 32
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
     max_episodes: int = 300
     
     # System
-    device: str = "cuda:1"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:3"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000

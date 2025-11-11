@@ -288,7 +288,7 @@ class NeuralMCTS(MCTS):
             current_best = root.value / root.visits if root.visits > 0 else 0.0
             best_values.append(current_best)
 
-            if len(best_values) == self.early_stopping_patience:
+            if len(best_values) == self.early_stopping_patience and i > iterations // 2:
                 recent_best = max(best_values)
                 oldest_recent = min(best_values)
                 improvement = recent_best - oldest_recent
@@ -316,15 +316,6 @@ class NeuralMCTS(MCTS):
             if final_node.action.action_type in [ActionType.ADD_NEURON, ActionType.REMOVE_NEURON]:
                 self.current_cycle.reset()
 
-            action_str = f"{final_node.action.action_type.name}"
-            if final_node.action.source_neuron is not None:
-                action_str += f"({final_node.action.source_neuron}"
-                if final_node.action.target_neuron is not None:
-                    action_str += f"->{final_node.action.target_neuron})"
-                else:
-                    action_str += ")"
-            elif final_node.action.activation is not None:
-                action_str += f"({final_node.action.activation.name})"
             print("MCTS search completed successfully")
             
             # Return tuple: (selected_child, search_root)

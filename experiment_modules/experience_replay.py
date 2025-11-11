@@ -1,6 +1,7 @@
 import numpy as np
 from typing import List, Dict, Any, Tuple
 import torch
+import copy
 
 class ExperienceReplay:
     """Stores and samples training experiences with prioritization"""
@@ -42,10 +43,10 @@ class ExperienceReplay:
         
         # Sample indices
         indices = np.random.choice(self.size, batch_size, p=probs, replace=False)
-        
-        # Get experiences
-        experiences = [self.buffer[i] for i in indices]
-        
+
+        # Get experiences (return deep copies to avoid accidental in-place mutation
+        # of items stored in the buffer, which can introduce device inconsistencies)
+        experiences = [copy.deepcopy(self.buffer[i]) for i in indices]
         # Calculate importance sampling weights
         weights = (self.size * probs[indices]) ** -self.beta
         weights = weights / weights.max()

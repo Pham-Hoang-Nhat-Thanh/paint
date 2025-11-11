@@ -11,13 +11,6 @@ try:
 except ImportError:
     HAS_TORCH_SCATTER = False
 
-# Try to import Triton for ultra-fast sparse attention
-try:
-    import triton
-    import triton.language as tl
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
 
 # Enable TF32 for faster matrix multiplications on Ampere+ GPUs
 if torch.cuda.is_available():
@@ -73,7 +66,10 @@ class EdgeAwareAttention(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
         self.head_dim = hidden_dim // num_heads
-        self.use_sparse_attention = use_sparse_attention and HAS_TORCH_SCATTER
+        # Keep the user intent separate from which optional libraries are available.
+        # This lets us pick the best available sparse implementation at runtime.
+        self.use_sparse_attention = use_sparse_attention
+        self.has_torch_scatter = HAS_TORCH_SCATTER
 
         assert self.head_dim * num_heads == hidden_dim, "hidden_dim must be divisible by num_heads"
 
@@ -101,8 +97,7 @@ class EdgeAwareAttention(nn.Module):
         return mask
     
     def _sparse_attention_torch_scatter(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-                                        edge_index: torch.Tensor, edge_weights: torch.Tensor,
-                                        num_nodes: int) -> torch.Tensor:
+                                        edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
         """Industry-grade sparse edge-indexed attention using torch_scatter.
 
         Optimized for performance and memory efficiency with torch.compile.
@@ -112,7 +107,6 @@ class EdgeAwareAttention(nn.Module):
         Input shapes (after reshaping to multi-head):
         - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
         - edge_index: [2, num_edges]
-        - edge_weights: [num_edges]
 
         Returns: [batch_size, num_heads, num_nodes, head_dim]
         """
@@ -132,11 +126,6 @@ class EdgeAwareAttention(nn.Module):
 
         # Compute attention scores: Q·K with scaling using einsum for optimization
         scores_e = torch.einsum('bhnd,bhnd->bhn', Q_e, K_e) * self.scale # [batch_size, num_heads, num_edges]
-
-        # Add edge bias if provided
-        if edge_weights is not None and edge_weights.numel() > 0:
-            edge_bias = self.edge_encoder(edge_weights.unsqueeze(-1)) # [num_edges, num_heads]
-            scores_e = scores_e + edge_bias.t().unsqueeze(0) # [batch_size, num_heads, num_edges]
 
         # Flatten batch and head dimensions for scatter operations
         scores_flat = scores_e.reshape(batch_size * num_heads, num_edges)  # [B*H, E]
@@ -162,189 +151,9 @@ class EdgeAwareAttention(nn.Module):
         attn_output = aggregated_flat.reshape(batch_size, num_heads, num_nodes, head_dim)
 
         return attn_output
-
-    def _sparse_attention_triton(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-                                 edge_index: torch.Tensor, edge_weights: torch.Tensor,
-                                 num_nodes: int) -> torch.Tensor:
-        """Ultra-fast sparse attention using Triton kernels for maximum performance.
-
-        This implementation uses custom Triton kernels to achieve near-peak GPU performance
-        for sparse attention on large graphs with 1000+ connections.
-
-        Key optimizations:
-        - Custom Triton kernel for fused attention computation
-        - Memory-coalesced access patterns
-        - Minimal kernel launches
-        - Optimized for A100/H100 GPUs
-        """
-        if not HAS_TRITON:
-            raise RuntimeError("Triton not available. Install with: pip install triton")
-
-        batch_size, num_heads, _, head_dim = Q.shape
-        device = Q.device
-        num_edges = edge_index.shape[1]
-
-        if num_edges == 0:
-            return torch.zeros(batch_size, num_heads, num_nodes, head_dim, device=device)
-
-        # Use optimized Triton-based sparse attention
-        return self._triton_sparse_attention_forward(
-            Q, K, V, edge_index, edge_weights, num_nodes
-        )
-
-    @staticmethod
-    @triton.jit
-    def _triton_sparse_attention_kernel(
-        # Pointers to matrices
-        q_ptr, k_ptr, v_ptr, edge_index_ptr, edge_weights_ptr,
-        output_ptr, src_max_ptr,
-        # Matrix dimensions
-        batch_size, num_heads, num_nodes, head_dim, num_edges,
-        # strides
-        stride_qb, stride_qh, stride_qn, stride_qd,
-        stride_kb, stride_kh, stride_kn, stride_kd,
-        stride_vb, stride_vh, stride_vn, stride_vd,
-        stride_ob, stride_oh, stride_on, stride_od,
-        stride_ei0, stride_ei1,
-        stride_ew,
-        # Meta-parameters
-        BLOCK_SIZE: tl.constexpr,
-    ):
-        """Triton kernel for sparse attention computation."""
-        # Get program ID
-        pid = tl.program_id(0)
-
-        # Compute indices
-        batch_idx = pid // (num_heads * num_nodes)
-        head_node_idx = pid % (num_heads * num_nodes)
-        head_idx = head_node_idx // num_nodes
-        node_idx = head_node_idx % num_nodes
-
-        if (batch_idx >= batch_size or head_idx >= num_heads) or node_idx >= num_nodes:
-            return
-
-        # Load Q for this node
-        q_offset = (batch_idx * stride_qb + head_idx * stride_qh +
-                   node_idx * stride_qn)
-        q = tl.load(q_ptr + q_offset + tl.arange(0, head_dim), mask=tl.arange(0, head_dim) < head_dim)
-
-        # Find edges where this node is the source
-        scores = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-        valid_edges = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-
-        # Loop over edges in blocks
-        num_blocks = tl.cdiv(num_edges, BLOCK_SIZE)
-        max_score = -float('inf')
-
-        for block_start in range(0, num_edges, BLOCK_SIZE):
-            block_size = min(BLOCK_SIZE, num_edges - block_start)
-
-            # Load edge sources
-            ei_offset = block_start * stride_ei0
-            src_nodes = tl.load(edge_index_ptr + ei_offset + tl.arange(0, BLOCK_SIZE),
-                              mask=tl.arange(0, BLOCK_SIZE) < block_size)
-
-            # Find edges where current node is source
-            is_source = src_nodes == node_idx
-            tgt_nodes = tl.load(edge_index_ptr + stride_ei1 + ei_offset + tl.arange(0, BLOCK_SIZE),
-                              mask=tl.arange(0, BLOCK_SIZE) < block_size)
-
-            # Load K and V for target nodes
-            for i in range(block_size):
-                if is_source[i]:
-                    tgt_idx = tgt_nodes[i]
-
-                    # Load K
-                    k_offset = (batch_idx * stride_kb + head_idx * stride_kh +
-                               tgt_idx * stride_kn)
-                    k = tl.load(k_ptr + k_offset + tl.arange(0, head_dim),
-                              mask=tl.arange(0, head_dim) < head_dim)
-
-                    # Compute attention score
-                    score = tl.sum(q * k) * (1.0 / tl.sqrt(tl.full([], head_dim, dtype=tl.float32)))
-
-                    # Load edge weight if available
-                    if edge_weights_ptr != 0:
-                        ew_offset = block_start + i
-                        edge_weight = tl.load(edge_weights_ptr + ew_offset)
-                        score = score + edge_weight
-
-                    scores[i] = score
-                    valid_edges[i] = 1
-                    max_score = tl.maximum(max_score, score)
-
-        # Compute softmax
-        exp_scores = tl.exp(scores - max_score)
-        sum_exp = tl.sum(exp_scores * valid_edges)
-        attn_weights = exp_scores / (sum_exp + 1e-8)
-
-        # Aggregate V
-        output = tl.zeros([head_dim], dtype=tl.float32)
-
-        for block_start in range(0, num_edges, BLOCK_SIZE):
-            block_size = min(BLOCK_SIZE, num_edges - block_start)
-
-            ei_offset = block_start * stride_ei0
-            src_nodes = tl.load(edge_index_ptr + ei_offset + tl.arange(0, BLOCK_SIZE),
-                              mask=tl.arange(0, BLOCK_SIZE) < block_size)
-
-            is_source = src_nodes == node_idx
-            tgt_nodes = tl.load(edge_index_ptr + stride_ei1 + ei_offset + tl.arange(0, BLOCK_SIZE),
-                              mask=tl.arange(0, BLOCK_SIZE) < block_size)
-
-            for i in range(block_size):
-                if is_source[i]:
-                    tgt_idx = tgt_nodes[i]
-
-                    # Load V
-                    v_offset = (batch_idx * stride_vb + head_idx * stride_vh +
-                               tgt_idx * stride_vn)
-                    v = tl.load(v_ptr + v_offset + tl.arange(0, head_dim),
-                              mask=tl.arange(0, head_dim) < head_dim)
-
-                    # Accumulate weighted V
-                    weight = attn_weights[block_start + i]
-                    output = output + weight * v
-
-        # Store result
-        out_offset = (batch_idx * stride_ob + head_idx * stride_oh +
-                     node_idx * stride_on)
-        tl.store(output_ptr + out_offset + tl.arange(0, head_dim),
-                output, mask=tl.arange(0, head_dim) < head_dim)
-
-    def _triton_sparse_attention_forward(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-                                        edge_index: torch.Tensor, edge_weights: torch.Tensor,
-                                        num_nodes: int) -> torch.Tensor:
-        """Forward pass for Triton-based sparse attention."""
-        batch_size, num_heads, _, head_dim = Q.shape
-        num_edges = edge_index.shape[1]
-
-        # Allocate output tensor
-        output = torch.zeros_like(Q)
-
-        # Grid and block sizes
-        BLOCK_SIZE = 1024  # Adjust based on head_dim and available shared memory
-        grid = (batch_size * num_heads * num_nodes,)
-
-        # Launch kernel
-        self._triton_sparse_attention_kernel[grid](
-            Q, K, V, edge_index, edge_weights if edge_weights is not None else torch.empty(0, device=Q.device),
-            output, torch.empty(0, device=Q.device),  # src_max not used in this version
-            batch_size, num_heads, num_nodes, head_dim, num_edges,
-            Q.stride(0), Q.stride(1), Q.stride(2), Q.stride(3),
-            K.stride(0), K.stride(1), K.stride(2), K.stride(3),
-            V.stride(0), V.stride(1), V.stride(2), V.stride(3),
-            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
-            edge_index.stride(0), edge_index.stride(1),
-            edge_weights.stride(0) if edge_weights is not None else 0,
-            BLOCK_SIZE=BLOCK_SIZE,
-        )
-
-        return output
-
+ 
     def _sparse_attention_pure_pytorch(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-                                       edge_index: torch.Tensor, edge_weights: torch.Tensor,
-                                       num_nodes: int) -> torch.Tensor:
+                                       edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
         """Sparse edge-indexed attention using pure PyTorch (no torch_scatter dependency).
         
         Slower than torch_scatter but avoids external dependency.
@@ -366,11 +175,6 @@ class EdgeAwareAttention(nn.Module):
         
         # Compute per-edge scores
         scores_e = (Q_e * K_e).sum(-1) * self.scale  # [batch_size, num_heads, num_edges]
-        
-        # Add edge bias
-        if edge_weights is not None and edge_weights.shape[0] > 0:
-            edge_bias = self.edge_encoder(edge_weights.unsqueeze(-1))  # [num_edges, num_heads]
-            scores_e = scores_e + edge_bias.t().unsqueeze(0)
         
         # Initialize output
         attn_output = torch.zeros(batch_size, num_heads, num_nodes, head_dim, device=device)
@@ -400,12 +204,10 @@ class EdgeAwareAttention(nn.Module):
         
         return attn_output
     
-    def forward(self, node_embeddings: torch.Tensor, edge_index: torch.Tensor, 
-                edge_weights: torch.Tensor) -> torch.Tensor:
+    def forward(self, node_embeddings: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
         node_embeddings: [batch_size, num_nodes, hidden_dim]
         edge_index: [2, num_edges]
-        edge_weights: [num_edges]
         
         Automatically selects between sparse (torch_scatter) and dense masked attention.
         Sparse attention computes only over edges (O(E) complexity).
@@ -424,21 +226,20 @@ class EdgeAwareAttention(nn.Module):
         # Reshape for multi-head attention - [batch_size, num_heads, num_nodes, head_dim]
         Q = Q.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
         K = K.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
-        V = V.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)
+        V = V.view(batch_size, num_nodes, self.num_heads, self.head_dim).transpose(1, 2)       
         
-        # Choose attention implementation based on graph density and availability
-        if self.use_sparse_attention and edge_index.shape[1] > 0:
+        # Choose attention implementation based on graph density and available libraries.
+        # Priority: torch_scatter (fast O(E) via scatter_softmax) -> Triton (custom kernel)
+        # -> pure PyTorch sparse fallback -> dense masked attention.
+        if self.use_sparse_attention and self.has_torch_scatter and edge_index.shape[1] > 0:
             # Use sparse edge-indexed attention via torch_scatter
-            attn_output = self._sparse_attention_torch_scatter(Q, K, V, edge_index, edge_weights, num_nodes)
-            # [batch_size, num_heads, num_nodes, head_dim]
-        elif self.use_sparse_attention and not HAS_TORCH_SCATTER and edge_index.shape[1] > 0:
+            attn_output = self._sparse_attention_torch_scatter(Q, K, V, edge_index, num_nodes)
+        elif self.use_sparse_attention and not self.has_torch_scatter and edge_index.shape[1] > 0:
             # Fallback to pure PyTorch sparse attention (slower but no dependency)
-            attn_output = self._sparse_attention_pure_pytorch(Q, K, V, edge_index, edge_weights, num_nodes)
-            # [batch_size, num_heads, num_nodes, head_dim]
+            attn_output = self._sparse_attention_pure_pytorch(Q, K, V, edge_index, num_nodes)
         else:
             # Use dense masked attention (original implementation)
             attn_output = self._dense_attention_masked(Q, K, V, edge_index, num_nodes)
-            # [batch_size, num_heads, num_nodes, head_dim]
         
         # Concatenate heads - [batch_size, num_nodes, hidden_dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(
@@ -461,7 +262,6 @@ class EdgeAwareAttention(nn.Module):
         Input shapes (after reshaping to multi-head):
         - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
         - edge_index: [2, num_edges]
-        - edge_weights: [num_edges]
         
         Returns: [batch_size, num_heads, num_nodes, head_dim]
         """
@@ -632,7 +432,6 @@ class GraphTransformer(nn.Module):
         """
         node_features = graph_data['node_features']
         edge_index = graph_data['edge_index']
-        edge_weights = graph_data['edge_weights']
         layer_positions = graph_data['layer_positions']
 
         # Input projection
@@ -646,7 +445,7 @@ class GraphTransformer(nn.Module):
         for i in range(self.num_layers):
             # Self-attention
             residual = x
-            x = self.layers[i](x, edge_index, edge_weights)
+            x = self.layers[i](x, edge_index)
             x = self.layer_norms[i](x + residual)
             
             # Feed-forward
