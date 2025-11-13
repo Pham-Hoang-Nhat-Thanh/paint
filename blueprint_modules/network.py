@@ -239,89 +239,82 @@ class NeuralArchitecture:
         - neuron_part: sorted list of (type, activation, layer_pos) tuples
         - connection_part: sorted list of (src_idx, tgt_idx) pairs where idx is position in sorted neuron list
         """
-        # Sort neurons by (neuron_type, layer_position, activation) for canonical ordering
-        # This creates a deterministic mapping independent of neuron IDs
+        # Sort neurons by (neuron_type, layer_position, activation, id) for canonical ordering
         sorted_neurons = sorted(
             self.neurons.items(),
             key=lambda x: (x[1].neuron_type.value, x[1].layer_position, x[1].activation.value, x[0])
         )
-        
-        # Build neuron signature and ID mapping in single pass
+
+        # Build neuron signature and explicit ID -> canonical index mapping
         id_to_canonical_idx = {}
-        neuron_sig_parts = [
-            f"{neuron.neuron_type.name}:{neuron.activation.name}:{neuron.layer_position:.4f}"
-            for canonical_idx, (neuron_id, neuron) in enumerate(sorted_neurons)
-            if not (id_to_canonical_idx.__setitem__(neuron_id, canonical_idx))  # Side effect: populate mapping
-        ]
-        
+        neuron_sig_parts = []
+        for canonical_idx, (neuron_id, neuron) in enumerate(sorted_neurons):
+            id_to_canonical_idx[neuron_id] = canonical_idx
+            # include neuron type, activation, and layer position with higher precision
+            # include neuron bias if present (fallback to 0.0)
+            bias = getattr(neuron, 'bias', 0.0)
+            neuron_sig_parts.append(
+                f"{neuron.neuron_type.name}:{neuron.activation.name}:{neuron.layer_position:.6f}:b{bias:.6f}"
+            )
+
         neuron_sig = "|".join(neuron_sig_parts)
-        
-        # Build connection signature using canonical indices - filter and map in one pass
-        conn_sig_parts = [
-            f"{id_to_canonical_idx[conn.source_id]}->{id_to_canonical_idx[conn.target_id]}"
-            for conn in sorted(self.connections, key=lambda c: (c.source_id, c.target_id))
-            if conn.enabled and conn.source_id in id_to_canonical_idx and conn.target_id in id_to_canonical_idx
-        ]
-        
+
+        # Build connection signature using canonical indices - include enabled flag for clarity
+        conn_sig_parts = []
+        for conn in sorted(self.connections, key=lambda c: (c.source_id, c.target_id)):
+            if conn.source_id in id_to_canonical_idx and conn.target_id in id_to_canonical_idx:
+                # Only include structural information (no weights)
+                src = id_to_canonical_idx[conn.source_id]
+                tgt = id_to_canonical_idx[conn.target_id]
+                enabled_flag = 1 if getattr(conn, 'enabled', True) else 0
+                conn_sig_parts.append(f"{src}->{tgt}:e{enabled_flag}")
+
         conn_sig = ",".join(conn_sig_parts)
-        
+
         return f"{neuron_sig}||{conn_sig}"
     
     def to_graph_representation(self) -> Dict:
-        """Convert architecture to graph format for transformer"""
+        """Convert architecture to graph format for transformer (optimized)"""
         node_ids = self._get_sorted_neuron_ids()
         id_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
-        # Local references for speed
         neurons = self.neurons
         connections = self.connections
 
-        # Build node features as a single tensor using as_tensor (avoids an extra copy when possible)
+        # Build node features efficiently
         if node_ids:
-            # to_feature_vector returns a small python list per neuron; as_tensor will create one FloatTensor
             node_features = torch.as_tensor(
                 [neurons[nid].to_feature_vector() for nid in node_ids],
                 dtype=torch.float
             )
         else:
-            # Feature length: 3 (type) + 4 (activation) + 2 (layer_pos,bias) = 9
             node_features = torch.empty((0, 9), dtype=torch.float)
 
-        # Efficiently build edge index arrays without creating an intermediate big list of tuples
-        src_list = []
-        tgt_list = []
-        weight_list = []
-        id_to_idx_get = id_to_index.get
-        for conn in connections:
-            if not conn.enabled:
-                continue
-            s = id_to_idx_get(conn.source_id)
-            t = id_to_idx_get(conn.target_id)
-            if s is None or t is None:
-                continue
-            src_list.append(s)
-            tgt_list.append(t)
-            weight_list.append(conn.weight)
-
-        if src_list:
+        # Build edge index and weights using list comprehensions
+        enabled_conns = [conn for conn in connections if conn.enabled]
+        src_tgt_weight = [
+            (id_to_index.get(conn.source_id), id_to_index.get(conn.target_id), conn.weight)
+            for conn in enabled_conns
+            if id_to_index.get(conn.source_id) is not None and id_to_index.get(conn.target_id) is not None
+        ]
+        if src_tgt_weight:
+            src_list, tgt_list, weight_list = zip(*src_tgt_weight)
             edge_index = torch.tensor([src_list, tgt_list], dtype=torch.long)
-            edge_weights = torch.as_tensor(weight_list, dtype=torch.float)
+            # If you want edge weights as a tensor, uncomment below:
+            # edge_weights = torch.tensor(weight_list, dtype=torch.float)
         else:
-            # Use empty tensors with correct shapes to avoid resizing later
             edge_index = torch.empty((2, 0), dtype=torch.long)
-            edge_weights = torch.empty((0,), dtype=torch.float)
+            # edge_weights = torch.empty((0,), dtype=torch.float)
 
         # Compute layer positions from sorted neuron IDs
-        # This ensures layer_positions is always available for network forward pass
         layer_positions = torch.FloatTensor([neurons[neuron_id].layer_position for neuron_id in node_ids])
 
         return {
             'node_features': node_features,
             'edge_index': edge_index,
-            'edge_weights': edge_weights,
             'layer_positions': layer_positions,
             'node_mapping': id_to_index,
             'performance': self.performance_metrics,
-            'sorted_neuron_ids': node_ids  # Return sorted IDs for reuse
+            'sorted_neuron_ids': node_ids
         }
     
     def _get_sorted_neuron_ids(self) -> List[int]:

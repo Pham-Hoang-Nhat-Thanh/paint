@@ -56,7 +56,8 @@ class ArchitectureTrainer:
             max_neurons=config.search.max_neurons,
             max_connections=config.search.max_connections,
             max_steps_per_episode=config.search.max_steps_per_episode,
-            connection_candidate_multiplier=config.search.connection_candidate_multiplier
+            connection_candidate_multiplier=config.search.connection_candidate_multiplier,
+            model_max_neurons=config.model.max_neurons
         )
         self.action_manager = ActionManager(
             max_neurons=config.model.max_neurons,
@@ -152,6 +153,7 @@ class ArchitectureTrainer:
         episode_experiences = []
         episode_rewards = []
         episode_steps = 0
+        self.policy_value_net.eval()  # Set to eval mode for MCTS
         
         # Initialize MCTS tree reuse (for persistent tree across steps WITHIN this episode)
         mcts_root = None  # Will store the selected child node for next iteration
@@ -174,6 +176,11 @@ class ArchitectureTrainer:
             if next_action is None:
                 print("No valid action found, terminating episode")
                 break
+            else:
+                print(f"Selected action: {next_action.action_type.name} | "
+                      f"Source: {next_action.source_neuron} | "
+                      f"Target: {next_action.target_neuron} | "
+                      f"Activation: {next_action.activation}")
 
             new_arch = best_node.architecture
             if new_arch is None:
@@ -196,19 +203,14 @@ class ArchitectureTrainer:
             # Draw architecture diagram after action (save every step for debugging)
             if self.episode % self.config.diagram_save_interval == 0:
                 self._draw_architecture_diagram(new_arch, step)
-            reward = self._evaluate_architecture(new_arch)
-
-            # Calculate timing information
-            step_end_time = time.time()
-            step_duration = step_end_time - step_start_time
-
-            print(f"Step completed: Reward = {reward:.4f} | Step time: {step_duration:.2f}s")
+            reward = best_node.value / best_node.visits # Use average value as reward
 
             # Store experience with MCTS visit distribution
             experience = self._create_experience(
                 current_arch, next_action, reward, new_arch,
                 search_root=search_root  # Contains visit distribution from MCTS
             )
+
             episode_experiences.append(experience)
             episode_rewards.append(reward)
             
@@ -220,40 +222,50 @@ class ArchitectureTrainer:
             if best_node is not None:
                 mcts_root = best_node
 
-            # Check termination conditions
-            if self._should_terminate_episode(current_arch, step, reward):
+            # Calculate timing information
+            step_end_time = time.time()
+            step_duration = step_end_time - step_start_time
+
+             # Check termination conditions
+            terminate_check = self._should_terminate_episode(current_arch, step)
+            if terminate_check == "max_steps" or terminate_check == "penalty":
                 print(f"Episode termination condition met at step {step}")
                 break
-        
+
+            print(f"Step completed: Reward = {reward:.4f} | Step time: {step_duration:.2f}s")
+
         # Process episode results
         episode_metrics = self._process_episode_results(
             current_arch, episode_rewards, episode_experiences, episode_steps
         )
         
-        # Evaluate final architecture with QuickTrainer to show true progress
-        final_eval = self._evaluate_final_architecture(current_arch)
-        print(f"Final Architecture Evaluation: Accuracy={final_eval['final_accuracy']:.4f}, Loss={final_eval['final_loss']:.4f} ({final_eval['method']})")
-        episode_metrics.update(final_eval)
-        
-        # =====CALCULATING FINAL REWARD=====
-        # CRITICAL: Update all experiences with final episode reward (use true final evaluation)
-        accuracy = float(final_eval.get('final_accuracy', episode_rewards[-1] if episode_rewards else 0.0))
-        loss = float(final_eval.get('final_loss', 0.0))
-        # normalize loss to (0,1)
-        loss_norm = loss / (1.0 + loss)
+        if terminate_check == "penalty":
+            final_reward = -1.0  # Assign a penalty reward
+        else:
+            # Evaluate final architecture with QuickTrainer to show true progress
+            final_eval = self._evaluate_final_architecture(current_arch)
+            print(f"Final Architecture Evaluation: Accuracy={final_eval['final_accuracy']:.4f}, Loss={final_eval['final_loss']:.4f} ({final_eval['method']})")
+            episode_metrics.update(final_eval)
+            
+            # =====CALCULATING FINAL REWARD=====
+            # CRITICAL: Update all experiences with final episode reward (use true final evaluation)
+            accuracy = float(final_eval.get('final_accuracy', episode_rewards[-1] if episode_rewards else 0.0))
+            loss = float(final_eval.get('final_loss', 0.0))
+            # normalize loss to (0,1)
+            loss_norm = loss / (1.0 + loss)
 
-        num_neurons = len(current_arch.neurons)
-        num_connections = len(current_arch.connections)
-        max_neurons = getattr(self.config.search, 'max_neurons', 0)
-        max_connections = getattr(self.config.search, 'max_connections', 0)
-        complexity_norm = ((num_neurons / max_neurons) + (num_connections / max_connections)) / 2.0 if (max_neurons > 0 and max_connections > 0) else 0.0
+            num_neurons = len(current_arch.neurons)
+            num_connections = len(current_arch.connections)
+            max_neurons = getattr(self.config.search, 'max_neurons', 0)
+            max_connections = getattr(self.config.search, 'max_connections', 0)
+            complexity_norm = ((num_neurons / max_neurons) + (num_connections / max_connections)) / 2.0 if (max_neurons > 0 and max_connections > 0) else 0.0
 
-        accuracy_deviation = self.config.search.target_accuracy - accuracy
-        raw_reward = self.config.search.reward_accuracy_weight * np.exp(-accuracy_deviation) * accuracy\
-                    - self.config.search.reward_loss_weight * loss_norm \
-                    - self.config.search.reward_complexity_weight * complexity_norm
-        final_reward = max(0.0, raw_reward)  # Ensure non-negative reward
-        print(f"Final Reward Calculation: Raw={raw_reward:.4f}, Final={final_reward:.4f} (Accuracy Dev={accuracy_deviation:.4f}, Loss Norm={loss_norm:.4f}, Complexity Norm={complexity_norm:.4f})")
+            accuracy_deviation = self.config.search.target_accuracy - accuracy
+            raw_reward = self.config.search.reward_accuracy_weight * np.exp(-accuracy_deviation) * accuracy\
+                        - self.config.search.reward_loss_weight * loss_norm \
+                        - self.config.search.reward_complexity_weight * complexity_norm
+            final_reward = max(0.0, raw_reward)  # Ensure non-negative reward
+            print(f"Final Reward Calculation: Raw={raw_reward:.4f}, Final={final_reward:.4f} (Accuracy Dev={accuracy_deviation:.4f}, Loss Norm={loss_norm:.4f}, Complexity Norm={complexity_norm:.4f})")
         for exp in episode_experiences:
             exp['value_target'] = final_reward
         
@@ -267,6 +279,29 @@ class ArchitectureTrainer:
 
         # ===== Save final architecture =====
         self.final_architecture = current_arch
+        # ===== EPISODE-LEVEL CACHE CLEANUP =====
+        # Centralized helper: clear MCTS episode-level caches (evaluation cache)
+        # and offload node-level policy tensors for the final root so memory
+        # doesn't accumulate across episodes. This preserves intra-episode
+        # reuse while ensuring episode boundaries free unnecessary memory.
+        try:
+            if hasattr(self, 'neural_mcts'):
+                try:
+                    # Pass the last root (if any) so node-level policies are offloaded
+                    roots = mcts_root if 'mcts_root' in locals() else None
+                    self.neural_mcts.clear_episode_caches(roots=roots)
+                except Exception:
+                    pass
+
+            # Free device caches
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         return episode_metrics
     
     
@@ -388,8 +423,7 @@ class ArchitectureTrainer:
         # Move to GPU immediately for single-graph evaluation
         graph_data['node_features'] = graph_data['node_features'].unsqueeze(0).to(self.device)
         graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
-        graph_data['edge_weights'] = graph_data['edge_weights'].to(self.device)
-        
+
         # Use cached sorted neuron IDs from graph representation instead of sorting again
         sorted_neuron_ids = graph_data['sorted_neuron_ids']
         layer_positions = [architecture.neurons[neuron_id].layer_position for neuron_id in sorted_neuron_ids]
@@ -426,7 +460,6 @@ class ArchitectureTrainer:
                 node_feats = node_feats.squeeze(0) if node_feats.dim() == 3 else node_feats
             
             edge_idx = gd['edge_index'].to(self.device) if gd['edge_index'].device.type == 'cpu' else gd['edge_index']
-            edge_w = gd['edge_weights'].to(self.device) if gd['edge_weights'].device.type == 'cpu' else gd['edge_weights']
             layer_pos = gd['layer_positions']
             if layer_pos.device.type == 'cpu':
                 layer_pos = layer_pos.to(self.device)
@@ -437,7 +470,6 @@ class ArchitectureTrainer:
             return {
                 'node_features': node_feats.unsqueeze(0) if node_feats.dim() == 2 else node_feats,
                 'edge_index': edge_idx,
-                'edge_weights': edge_w,
                 'layer_positions': layer_pos.unsqueeze(0) if layer_pos.dim() == 2 else layer_pos,
                 'batch': torch.zeros(num_nodes, dtype=torch.long, device=self.device),
                 'num_graphs': 1
@@ -450,7 +482,6 @@ class ArchitectureTrainer:
         all_node_features = []
         all_layer_positions = []
         all_edge_indices = []
-        all_edge_weights = []
         batch_tensor = []
         
         node_offset = 0
@@ -474,7 +505,6 @@ class ArchitectureTrainer:
             if edge_index.shape[1] > 0:
                 offset_edges = edge_index + node_offset
                 all_edge_indices.append(offset_edges)
-                all_edge_weights.append(gd['edge_weights'])
             
             # Track graph assignment
             batch_tensor.append(torch.full((num_nodes,), graph_idx, dtype=torch.long))
@@ -490,10 +520,8 @@ class ArchitectureTrainer:
         with torch.cuda.stream(streams[2]):
             if all_edge_indices:
                 batched_edges = torch.cat(all_edge_indices, dim=1).to(self.device)
-                batched_weights = torch.cat(all_edge_weights, dim=0).to(self.device)
             else:
                 batched_edges = torch.empty((2, 0), dtype=torch.long, device=self.device)
-                batched_weights = torch.empty(0, device=self.device)
         
         with torch.cuda.stream(streams[3]):
             batch_tensor = torch.cat(batch_tensor, dim=0).to(self.device)
@@ -504,7 +532,6 @@ class ArchitectureTrainer:
         return {
             'node_features': batched_features,
             'edge_index': batched_edges, 
-            'edge_weights': batched_weights,
             'layer_positions': batched_positions,
             'batch': batch_tensor,
             'num_graphs': batch_size
@@ -684,21 +711,18 @@ class ArchitectureTrainer:
         return experience
     
     def _should_terminate_episode(self, architecture: NeuralArchitecture, 
-                                 step: int, reward: float) -> bool:
+                                 step: int) -> str:
         """Check if episode should terminate"""
         # Check max steps
         if step >= self.config.search.max_steps_per_episode - 1:
-            return True
+            return "max_steps"
         
-        # Check neuron limit
-        if len(architecture.neurons) >= self.config.search.max_neurons:
-            return True
+        # Check if number of connections and hidden neurons is too low
+        if (len(architecture.neurons) <= self.config.search.min_neurons and
+            len(architecture.connections) <= self.config.search.min_connections):
+            return "penalty"
         
-        # Check if target accuracy reached
-        if reward >= self.config.search.target_accuracy:
-            return True
-        
-        return False
+        return ""
     
     def _process_episode_results(self, final_arch: NeuralArchitecture, 
                                 rewards: List[float], experiences: List[Dict], 
@@ -794,73 +818,80 @@ class ArchitectureTrainer:
         Returns:
             Dict with masks on CPU device
         """
-        legal_actions = self.action_space.get_valid_actions(state)
-        
+
         # Initialize all-zero masks (everything starts as illegal)
         action_type_mask = torch.zeros(len(ActionType), dtype=torch.float32)
         source_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
         target_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
         activation_mask = torch.zeros(len(ActivationType), dtype=torch.float32)
         
-        # Mark legal actions as 1.0
-        for action in legal_actions:
-            action_type_mask[action.action_type.value] = 1.0
-            if action.source_neuron is not None:
-                source_mask[action.source_neuron] = 1.0
-            if action.target_neuron is not None:
-                target_mask[action.target_neuron] = 1.0
-            if action.activation is not None:
-                try:
-                    activation_idx = list(ActivationType).index(action.activation)
-                    activation_mask[activation_idx] = 1.0
-                except (ValueError, IndexError):
-                    pass
+        # Vectorized mask construction using precomputed action primitives when available.
+        # This avoids a Python loop over all actions and is significantly faster for
+        # large action spaces. We keep a safe fallback to the original loop.
+        try:
+            primitives = self.action_space.get_full_action_primitives(state)
+            types = primitives.get('types', None)
+            sources = primitives.get('sources', None)
+            targets = primitives.get('targets', None)
+            activations = primitives.get('activations', None)
+
+            # Action types
+            if types is not None and types.size:
+                uniq_types = np.unique(types[types >= 0])
+                for t in uniq_types:
+                    if 0 <= int(t) < len(ActionType):
+                        action_type_mask[int(t)] = 1.0
+
+            # Sources (neuron indices)
+            if sources is not None and sources.size:
+                valid_srcs = sources[sources >= 0]
+                if valid_srcs.size:
+                    # Clip to mask length and dedupe
+                    valid_srcs = valid_srcs[valid_srcs < len(source_mask)]
+                    if valid_srcs.size:
+                        src_idxs = np.unique(valid_srcs).astype(int)
+                        source_mask[list(src_idxs)] = 1.0
+
+            # Targets (neuron indices)
+            if targets is not None and targets.size:
+                valid_tgts = targets[targets >= 0]
+                if valid_tgts.size:
+                    valid_tgts = valid_tgts[valid_tgts < len(target_mask)]
+                    if valid_tgts.size:
+                        tgt_idxs = np.unique(valid_tgts).astype(int)
+                        target_mask[list(tgt_idxs)] = 1.0
+
+            # Activations (encoded as small integers; -1 means none)
+            if activations is not None and activations.size:
+                valid_acts = activations[activations >= 0]
+                if valid_acts.size:
+                    valid_acts = valid_acts[valid_acts < len(activation_mask)]
+                    if valid_acts.size:
+                        act_idxs = np.unique(valid_acts).astype(int)
+                        activation_mask[list(act_idxs)] = 1.0
+        except Exception:
+            # Fallback: original per-action loop (robust but slower)
+            legal_actions = self.action_space.get_valid_actions(state)
+        
+            for action in legal_actions:
+                action_type_mask[action.action_type.value] = 1.0
+                if action.source_neuron is not None and action.source_neuron < len(source_mask):
+                    source_mask[action.source_neuron] = 1.0
+                if action.target_neuron is not None and action.target_neuron < len(target_mask):
+                    target_mask[action.target_neuron] = 1.0
+                if action.activation is not None:
+                    try:
+                        activation_idx = list(ActivationType).index(action.activation)
+                        if activation_idx < len(activation_mask):
+                            activation_mask[activation_idx] = 1.0
+                    except (ValueError, IndexError):
+                        pass
         
         return {
             'action_type': action_type_mask,
             'source_neuron': source_mask,
             'target_neuron': target_mask,
             'activation': activation_mask,
-        }
-
-    def _get_legal_action_mask_old(self, state: NeuralArchitecture) -> Dict[str, torch.Tensor]:
-        """Create mask for legal actions in this state (FIX #3: Action Legality Masking)
-        
-        Prevents training on impossible action combinations. AlphaZero reference:
-        "We actually have to correct for this manually by masking out illegal moves, 
-        and then re-normalizing the remaining scores"
-        
-        Returns:
-            Dict with masks for action_type, source_neuron, target_neuron, activation
-            (1.0 = legal, 0.0 = illegal)
-        """
-        legal_actions = self.action_space.get_valid_actions(state)
-        
-        # Initialize all-zero masks (everything starts as illegal)
-        action_type_mask = torch.zeros(len(ActionType), dtype=torch.float32)
-        source_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
-        target_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
-        activation_mask = torch.zeros(len(ActivationType), dtype=torch.float32)
-        
-        # Mark legal actions as 1.0
-        for action in legal_actions:
-            action_type_mask[action.action_type.value] = 1.0
-            if action.source_neuron is not None:
-                source_mask[action.source_neuron] = 1.0
-            if action.target_neuron is not None:
-                target_mask[action.target_neuron] = 1.0
-            if action.activation is not None:
-                try:
-                    activation_idx = list(ActivationType).index(action.activation)
-                    activation_mask[activation_idx] = 1.0
-                except (ValueError, IndexError):
-                    pass
-        
-        return {
-            'action_type': action_type_mask.to(self.device),
-            'source_neuron': source_mask.to(self.device),
-            'target_neuron': target_mask.to(self.device),
-            'activation': activation_mask.to(self.device),
         }
 
     def train_on_batch(self, batch_size: int = 32, sub_batch_size: int = 4):
@@ -993,6 +1024,10 @@ class ArchitectureTrainer:
         # Update priorities for all valid experiences
         if valid_indices_list:
             self.experience_buffer.update_priorities(valid_indices_list, valid_rewards_list)
+
+        print(f"  [Training] Processed {num_processed} graphs in batch of {batch_size} with sub-batch size {sub_batch_size}.", end='')
+        print(f"Total Loss: {total_loss_accum / num_processed:.4f}, Policy Loss: {policy_loss_accum / num_processed:.4f}, Value Loss: {value_loss_accum / num_processed:.4f}")
+        print(f"MCTS Policy Loss: {mcts_policy_loss_accum / num_processed:.4f}, Weighted Policy Loss: {weighted_policy_loss_accum / num_processed:.4f}, Weighted MCTS Policy Loss: {weighted_mcts_policy_loss_accum / num_processed:.4f}")
         
         # Return averaged metrics
         metrics = {
@@ -1075,12 +1110,15 @@ class ArchitectureTrainer:
             if not is_action_type_legal:
                 continue
             
-            is_source_legal = (action.source_neuron is None or 
-                             (action.source_neuron < len(action_mask_cpu['source_neuron']) and 
+            is_source_legal = (action.source_neuron is None or
+                             (action.source_neuron < len(action_mask_cpu['source_neuron']) and
                               action_mask_cpu['source_neuron'][action.source_neuron] > 0))
-            is_target_legal = (action.target_neuron is None or 
-                             (action.target_neuron < len(action_mask_cpu['target_neuron']) and 
-                              action_mask_cpu['target_neuron'][action.target_neuron] > 0))
+            if action.action_type in [ActionType.ADD_CONNECTION, ActionType.REMOVE_CONNECTION]:
+                is_target_legal = (action.target_neuron is not None and
+                                   action.target_neuron < len(action_mask_cpu['target_neuron']) and
+                                   action_mask_cpu['target_neuron'][action.target_neuron] > 0)
+            else:
+                is_target_legal = action.target_neuron is None
             is_activation_legal = (action.activation is None or action_mask_cpu['activation'].max() > 0)
             
             if not (is_source_legal and is_target_legal and is_activation_legal):
@@ -1571,37 +1609,35 @@ class ArchitectureTrainer:
                         probs = priorities ** getattr(self.experience_buffer, 'alpha', 1.0)
                         probs = probs / probs.sum()
 
-                    # Track per-item probability of NOT having been sampled yet (start = 1)
-                    not_sampled_prob = np.ones(buffer_size, dtype=np.float64)
+                    # Compute per-item probability of being sampled in one batch draw of size b:
+                    # s_i = 1 - (1 - p_i)^b (approximate draws with replacement)
+                    batch_size = min(self.config.batch_size, buffer_size)
+                    b = float(batch_size)
+                    s = 1.0 - np.power(1.0 - probs, b)
 
                     # Bound iterations to avoid pathological long loops; default: 3x full coverage
-                    max_iters = max(1, int(np.ceil(buffer_size / max(1, self.config.batch_size) * 3)))
-                    iters = 0
+                    max_iters = max(1, int(np.ceil(buffer_size / max(1, batch_size) * 3)))
 
-                    # Stop when expected remaining items is tiny or max iters reached
-                    while iters < max_iters and not_sampled_prob.sum() > 1e-3:  
-                        # We'll issue a prioritized sampled batch (with configured batch size)
-                        batch_size = min(self.config.batch_size, buffer_size)
+                    # Determine analytically how many iterations (t) are needed so that
+                    # the expected number of unseen items sum((1 - s_i)^t) <= tol.
+                    tol = 1e-3
+                    t_required = max_iters
+                    # Iterate t in Python but compute vectorized powers for speed; typically t is small
+                    for t in range(1, max_iters + 1):
+                        remaining = np.sum(np.power(1.0 - s, t))
+                        if remaining <= tol:
+                            t_required = t
+                            break
 
-                        # Approximate per-item selection probability for this batch.
-                        # Treat the batch as b independent draws with replacement using probs
-                        # as an approximation; this gives s_i = 1 - (1 - p_i)^b
-                        b = float(batch_size)
-                        s = 1.0 - np.power(1.0 - probs, b)
-                        
-                        # Run one sampled training batch (prioritized sampling with replacement across batches)
+                    # Execute the required number of training batches (no per-item bookkeeping loop)
+                    for _ in range(t_required):
                         train_metrics = self.train_on_batch(batch_size, sub_batch_size=self.config.search.sub_batch_size)
                         if train_metrics:
                             episode_metrics.update(train_metrics)
 
-                        # Update not-sampled probabilities (probabilistic bookkeeping)
-                        not_sampled_prob = not_sampled_prob * (1.0 - s)
-
-                        iters += 1
-
                     # After loop, clear buffer to keep behavior consistent with previous code
                     self.experience_buffer.clear()
-                    
+
 
             # Checkpoint periodically
             if (self.episode + 1) % self.config.checkpoint_interval == 0:

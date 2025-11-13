@@ -98,7 +98,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
             - Outputs: [num_graphs, output_dim] predictions
         
         Args:
-            graph_data: Dict with node_features, edge_index, edge_weights, layer_positions
+            graph_data: Dict with node_features, edge_index, layer_positions
                        Plus optional: 'batch' tensor and 'num_graphs' count
             sub_batch_size: Number of graphs to process through transformer at once (default 4)
         
@@ -111,9 +111,17 @@ class UnifiedPolicyValueNetwork(nn.Module):
         }
         """
         num_graphs = graph_data.get('num_graphs', 1)
-        for k, v in graph_data.items():
+        # Ensure graph_data tensors are on the same device as model parameters.
+        model_device = next(self.parameters()).device
+        for k, v in list(graph_data.items()):
             if torch.is_tensor(v):
-                assert v.device.type == 'cuda', f"{k} is not on CUDA!"
+                if v.device != model_device:
+                    # Move tensor to model device to support CPU and GPU runs transparently
+                    try:
+                        graph_data[k] = v.to(model_device)
+                    except Exception:
+                        # If move fails, raise with context
+                        raise RuntimeError(f"Failed to move graph_data['{k}'] from {v.device} to {model_device}")
         
         # Single graph case: process directly
         if num_graphs == 1:
@@ -121,18 +129,30 @@ class UnifiedPolicyValueNetwork(nn.Module):
             # global_embedding: [1, hidden_dim * 2]
         elif sub_batch_size >= num_graphs:
             # Small batch case: vectorized pooling for speed and GPU utilization
+            # Optimized: avoid constructing a large one-hot assignment matrix.
+            # Use in-place index_add_ to sum node embeddings per graph and then divide
+            # by counts to get mean pooling. All ops are on-device and memory-efficient.
             global_embedding, node_embeddings = self.graph_transformer(graph_data)
             batch_indices = graph_data['batch']  # [total_nodes]
             node_embeddings_squeezed = node_embeddings.squeeze(0)  # [total_nodes, hidden_dim]
 
-            # Vectorized pooling: create one-hot assignment matrix [total_nodes, num_graphs]
-            assign_matrix = (batch_indices.unsqueeze(-1) == torch.arange(num_graphs, device=batch_indices.device).unsqueeze(0)).float()  # [total_nodes, num_graphs]
-            # Sum node embeddings per graph
-            summed_embeddings = torch.matmul(assign_matrix.t(), node_embeddings_squeezed)  # [num_graphs, hidden_dim]
+            # Ensure indices are long and on same device
+            device = batch_indices.device
+            batch_idx = batch_indices.long()
+
+            total_nodes, hidden_dim = node_embeddings_squeezed.shape
+
+            # Sum node embeddings per graph using index_add_
+            pooled = torch.zeros((num_graphs, hidden_dim), device=device)
+            pooled.index_add_(0, batch_idx, node_embeddings_squeezed)
+
             # Count nodes per graph
-            node_counts = assign_matrix.sum(dim=0).clamp(min=1).unsqueeze(-1)  # [num_graphs, 1]
+            counts = torch.zeros((num_graphs,), device=device)
+            counts.index_add_(0, batch_idx, torch.ones((total_nodes,), device=device))
+            counts = counts.clamp(min=1).unsqueeze(-1)
+
             # Mean pool
-            pooled_embeddings = summed_embeddings / node_counts  # [num_graphs, hidden_dim]
+            pooled_embeddings = pooled / counts  # [num_graphs, hidden_dim]
 
             global_embedding = torch.cat([pooled_embeddings, pooled_embeddings], dim=-1)  # [num_graphs, hidden_dim * 2]
         else:
@@ -195,8 +215,15 @@ class ActionManager:
         if num_neurons < self.max_neurons:
             action_mask[ActionType.ADD_NEURON.value] = 0
 
-        if num_hidden > 0:
+        # Compute isolated hidden neurons (use architecture's cached connectivity)
+        connectivity = architecture._get_connectivity_sets()
+        has_incoming = connectivity['has_incoming']
+        has_outgoing = connectivity['has_outgoing']
+        isolated_hidden = [nid for nid, neuron in neurons.items() if neuron.neuron_type == NeuronType.HIDDEN and (nid not in has_incoming or nid not in has_outgoing)]
+
+        if len(isolated_hidden) > 0:
             action_mask[ActionType.REMOVE_NEURON.value] = 0
+        if num_hidden > 0:
             action_mask[ActionType.MODIFY_ACTIVATION.value] = 0
 
         if num_neurons >= 2:
@@ -205,22 +232,37 @@ class ActionManager:
         if num_connections > 0:
             action_mask[ActionType.REMOVE_CONNECTION.value] = 0
 
-        # Source neuron mask (for remove/modify actions) - vectorized with indexing
+        # Build masks (size = tensor_size). We return multiple masks for different action uses
+        # Generic source mask: allowed for ADD_CONNECTION sampling (exclude OUTPUT neurons)
         source_mask = torch.full((tensor_size,), -1e9)
-        if hidden_neurons:
-            valid_hidden = [nid for nid in hidden_neurons if nid < tensor_size]
-            if valid_hidden:
-                source_mask[valid_hidden] = 0
+        valid_source_ids = [nid for nid, neuron in neurons.items() if nid < tensor_size and neuron.neuron_type != NeuronType.OUTPUT]
+        if valid_source_ids:
+            source_mask[valid_source_ids] = 0
 
-        # Target neuron mask (for connection actions) - vectorized with indexing
+        # Remove-specific source mask: only isolated hidden neurons can be removed
+        remove_source_mask = torch.full((tensor_size,), -1e9)
+        if isolated_hidden:
+            valid_remove_ids = [nid for nid in isolated_hidden if nid < tensor_size]
+            if valid_remove_ids:
+                remove_source_mask[valid_remove_ids] = 0
+
+        # Modify-specific source mask: any hidden neuron may be modified
+        modify_source_mask = torch.full((tensor_size,), -1e9)
+        valid_modify_ids = [nid for nid in hidden_neurons if nid < tensor_size]
+        if valid_modify_ids:
+            modify_source_mask[valid_modify_ids] = 0
+
+        # Target neuron mask for ADD_CONNECTION: exclude INPUT neurons
         target_mask = torch.full((tensor_size,), -1e9)
-        valid_neuron_ids = [nid for nid in neurons.keys() if nid < tensor_size]
-        if valid_neuron_ids:
-            target_mask[valid_neuron_ids] = 0
+        valid_target_ids = [nid for nid, neuron in neurons.items() if nid < tensor_size and neuron.neuron_type != NeuronType.INPUT]
+        if valid_target_ids:
+            target_mask[valid_target_ids] = 0
 
         return {
             'action_type': action_mask,
             'source_neurons': source_mask,
+            'remove_source_neurons': remove_source_mask,
+            'modify_source_neurons': modify_source_mask,
             'target_neurons': target_mask,
             'tensor_size': tensor_size
         }
@@ -255,16 +297,6 @@ class ActionManager:
     def select_action(self, policy_output: Dict, architecture: NeuralArchitecture,
                      exploration: bool = True, use_policy: bool = True) -> Action:
         """Select action using policy output with masking, or random if use_policy=False"""
-        if not use_policy:
-            # Use random action selection from action space
-            if self.action_space is None:
-                raise ValueError("ActionSpace must be provided to ActionManager for random action selection")
-            valid_actions = self.action_space.get_valid_actions(architecture)
-            if valid_actions:
-                return np.random.choice(valid_actions)
-            else:
-                raise ValueError("No valid actions available in the current architecture")
-
         masks_dict = self.get_action_masks(architecture)
         masks = masks_dict.copy()
         tensor_size = masks.pop('tensor_size')
@@ -299,7 +331,7 @@ class ActionManager:
         
         if action_type == ActionType.REMOVE_NEURON:
             source_logits = self._prepare_logits(
-                policy_output['source_logits'], tensor_size, masks['source_neurons']
+                policy_output['source_logits'], tensor_size, masks.get('remove_source_neurons', masks['source_neurons'])
             )
             
             if exploration:
@@ -314,7 +346,7 @@ class ActionManager:
         
         if action_type == ActionType.MODIFY_ACTIVATION:
             source_logits = self._prepare_logits(
-                policy_output['source_logits'], tensor_size, masks['source_neurons']
+                policy_output['source_logits'], tensor_size, masks.get('modify_source_neurons', masks['source_neurons'])
             )
             activation_logits = policy_output['activation_logits']
             

@@ -6,7 +6,7 @@ class ModelConfig:
     """Configuration for the Graph Transformer and Policy-Value Network"""
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
-    hidden_dim: int = 128
+    hidden_dim: int = 512  # Increased for more capacity
     num_heads: int = 8
     num_layers: int = 3
     dropout: float = 0.1
@@ -16,25 +16,18 @@ class ModelConfig:
     max_neurons: int = 1000  # Accommodate MNIST inputs
     num_actions: int = 5
     num_activations: int = 4
-    
-    # Shared Backbone
-    backbone_hidden_dims: List[int] = None
-
-    def __post_init__(self):
-        if self.backbone_hidden_dims is None:
-            self.backbone_hidden_dims = [128, 64]
 
 @dataclass
 class MCTSConfig:
-    """Configuration for AlphaZero-style Neural MCTS (no rollouts)"""
+    """Configuration for AlphaZero-style Neural MCTS"""
     # Search parameters
-    num_simulations: int = 1000
+    num_simulations: int = 32  # Reduced for faster iterations
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 50
+    max_children: int = 100  # Increased to allow more diverse actions
     temperature: float = 1.0
     temperature_decay: float = 0.99
     
@@ -49,7 +42,9 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 500  # Increased to allow more complex architectures
+    max_steps_per_episode: int = 1000  # Increased to allow more complex architectures
+    min_neurons: int = 25  # Minimum number of hidden neurons to prevent oversimplification
+    min_connections: int = 250  # Minimum number of connections to prevent oversimplification
 
     # Evaluation
     quick_train_epochs: int = 1  # Reduced for faster evaluations
@@ -97,7 +92,7 @@ class OverallConfig:
     search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
     
     # Training parameters 
-    batch_size: int = 32
+    batch_size: int = 64
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
@@ -125,5 +120,5 @@ class OverallConfig:
     enable_tf32: bool = True
 
     # Early stopping
-    early_stopping_patience: int = 100
+    early_stopping_patience: int = 5
     early_stopping_min_delta: float = 0.001
