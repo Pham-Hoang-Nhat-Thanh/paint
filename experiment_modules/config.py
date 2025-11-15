@@ -6,10 +6,10 @@ class ModelConfig:
     """Configuration for the Graph Transformer and Policy-Value Network"""
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
-    hidden_dim: int = 512  # Increased for more capacity
-    num_heads: int = 8
-    num_layers: int = 3
-    dropout: float = 0.1
+    hidden_dim: int = 2048  # Increased for more capacity
+    num_heads: int = 16
+    num_layers: int = 6
+    dropout: float = 0.2  # Increased dropout for better regularization
     use_edge_features: bool = True
     
     # Policy-Value Network
@@ -21,20 +21,15 @@ class ModelConfig:
 class MCTSConfig:
     """Configuration for AlphaZero-style Neural MCTS"""
     # Search parameters
-    num_simulations: int = 32  # Reduced for faster iterations
+    num_simulations: int = 500  # Increased for better search quality
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 100  # Increased to allow more diverse actions
+    max_children: int = 30
     temperature: float = 1.0
     temperature_decay: float = 0.99
-    
-    # Loss weighting for MCTS KL vs supervised CE
-    mcts_policy_weight: float = 1.0  # Weight for KL divergence to MCTS visit distribution
-    component_ce_weight: float = 0.25  # Initial weight for supervised cross-entropy on policy components (source/target/activation)
-    ce_anneal_episodes: int = 500  # Number of episodes over which to anneal CE weight from component_ce_weight to 0.05
 
 @dataclass
 class ArchitectureSearchConfig:
@@ -99,7 +94,7 @@ class OverallConfig:
     max_episodes: int = 300
     
     # System
-    device: str = "cuda:3"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:2"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000
@@ -110,7 +105,7 @@ class OverallConfig:
     # Monitoring
     eval_interval: int = 1
     checkpoint_interval: int = 1
-    diagram_save_interval: int = 50
+    diagram_save_interval: int = 1
     log_interval: int = 1
     train_interval: int = 5  # Train every N episodes
 
@@ -120,5 +115,5 @@ class OverallConfig:
     enable_tf32: bool = True
 
     # Early stopping
-    early_stopping_patience: int = 5
+    early_stopping_patience: int = 50
     early_stopping_min_delta: float = 0.001

@@ -4,6 +4,7 @@ import numpy as np
 from dataclasses import dataclass
 import traceback
 from .network import NeuralArchitecture, NeuronType, ActivationType, Neuron
+import gc
 
 if TYPE_CHECKING:
     from .evolutionary_cycle import EvolutionaryCycle
@@ -138,9 +139,21 @@ class ActionSpace:
             tgt_not_input = ~is_input[tgt_idx]
 
             # Layer rule: allow if either isolated (-1) or src_layer <= tgt_layer
+            # Additionally explicitly allow pairs involving isolated hidden neurons
             src_layers = layers[src_idx]
             tgt_layers = layers[tgt_idx]
             layer_ok = (src_layers == -1) | (tgt_layers == -1) | (src_layers <= tgt_layers)
+
+            # Explicitly include isolated hidden neurons (topo layer == -1)
+            try:
+                if isolated_hidden:
+                    # Build boolean masks for sampled flattened indices
+                    src_isolated = np.isin(all_ids[src_idx], list(isolated_hidden))
+                    tgt_isolated = np.isin(all_ids[tgt_idx], list(isolated_hidden))
+                    layer_ok = layer_ok | src_isolated | tgt_isolated
+            except Exception:
+                # If isolation detection fails for any reason, fall back to previous rule
+                pass
 
             valid_pair_mask = neq_mask & not_existing_mask & src_not_output & tgt_not_input & layer_ok
 
@@ -275,51 +288,6 @@ class ActionSpace:
                     target_neuron=conn.target_id
                 ))
 
-    def _add_simple_prioritized_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture):
-        """Add actions with simple prioritization for policy network compatibility"""
-        neurons = architecture.neurons
-        num_neurons = len(neurons)
-        
-        # Filter hidden neurons once
-        hidden_neurons = [nid for nid, neuron in neurons.items()
-                         if neuron.neuron_type == NeuronType.HIDDEN]
-
-        # Always allow structural changes
-        if num_neurons < self.max_neurons:
-            # Propose adding neurons with all activation types supported by the network
-            for activation in ActivationType:
-                valid_actions.append(Action(
-                    action_type=ActionType.ADD_NEURON,
-                    activation=activation
-                ))
-
-        if hidden_neurons:
-            valid_actions.append(Action(
-                action_type=ActionType.REMOVE_NEURON,
-                source_neuron=np.random.choice(hidden_neurons)
-            ))
-
-        # Check for isolated neurons and prioritize de-isolation
-        isolated_hidden = self._get_isolated_hidden_neurons(architecture)
-
-        if isolated_hidden:
-            # Prioritize de-isolation
-            self._add_deisolation_actions(valid_actions, architecture, isolated_hidden)
-        else:
-            # Allow refinement actions
-            self._add_refinement_actions(valid_actions, architecture, hidden_neurons)
-
-        # Connection removal
-        if architecture.connections:
-            sample_conns = np.random.choice(architecture.connections,
-                                          size=min(5, len(architecture.connections)), replace=False)
-            for conn in sample_conns:
-                valid_actions.append(Action(
-                    action_type=ActionType.REMOVE_CONNECTION,
-                    source_neuron=conn.source_id,
-                    target_neuron=conn.target_id
-                ))
-
     def _get_isolated_hidden_neurons(self, architecture: NeuralArchitecture) -> set:
         """Get set of isolated hidden neurons - O(n) where n is number of neurons.
         
@@ -340,157 +308,6 @@ class ActionSpace:
                     isolated.add(neuron_id)
         
         return isolated
-
-    def _add_deisolation_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture,
-                                isolated_hidden: set):
-        """Aggressively add actions that help de-isolate neurons - prioritize connections that fix isolation"""
-        neurons = architecture.neurons
-        existing_connections = {(conn.source_id, conn.target_id) for conn in architecture.connections}
-
-        # Build connectivity sets efficiently in single pass
-        targets = set()
-        sources = set()
-        for conn in architecture.connections:
-            targets.add(conn.target_id)
-            sources.add(conn.source_id)
-        
-        # Identify isolation types for each isolated neuron using sets (O(1) lookup)
-        isolation_details = {
-            neuron_id: {
-                'has_in': neuron_id in targets,
-                'has_out': neuron_id in sources
-            }
-            for neuron_id in isolated_hidden
-        }
-
-        # Separate neurons by type for smarter connection generation (single pass)
-        input_neurons = []
-        output_neurons = []
-        hidden_neurons = []
-        neuron_type_cache = {}  # Cache for faster type lookups
-        
-        for nid, n in neurons.items():
-            neuron_type_cache[nid] = n.neuron_type
-            if n.neuron_type == NeuronType.INPUT:
-                input_neurons.append(nid)
-            elif n.neuron_type == NeuronType.OUTPUT:
-                output_neurons.append(nid)
-            elif n.neuron_type == NeuronType.HIDDEN:
-                hidden_neurons.append(nid)
-
-        candidates = []
-        added = set()
-
-        # Priority 1: Fix neurons with NO connections at all (most isolated)
-        completely_isolated = [nid for nid, details in isolation_details.items()
-                              if not details['has_in'] and not details['has_out']]
-
-        # Pre-slice neuron lists for better performance
-        input_sample = input_neurons[:len(input_neurons)//2 + 1]
-        output_sample = output_neurons[:len(output_neurons)//2 + 1]
-        hidden_sample = hidden_neurons[:len(hidden_neurons)//2 + 1]
-        
-        for isolated_id in completely_isolated:
-            # Try to connect to inputs and outputs first
-            # Optimized: inputs->hidden and hidden->outputs are always valid, skip validation
-            for input_id in input_sample:
-                conn_key = (input_id, isolated_id)
-                if conn_key not in existing_connections and conn_key not in added:
-                    candidates.append(conn_key)  # input->hidden always valid
-                    added.add(conn_key)
-
-            # Connect from hidden to hidden
-            for hidden_id in hidden_sample:
-                if hidden_id != isolated_id:
-                    conn_key = (hidden_id, isolated_id)
-                    if conn_key not in existing_connections and conn_key not in added:
-                        if self._is_valid_connection(neurons, hidden_id, isolated_id):
-                            candidates.append(conn_key)
-                            added.add(conn_key)
-
-            for output_id in output_sample:
-                conn_key = (isolated_id, output_id)
-                if conn_key not in existing_connections and conn_key not in added:
-                    candidates.append(conn_key)  # hidden->output always valid
-                    added.add(conn_key)
-
-        # Priority 2: Fix neurons missing inward connections
-        missing_inward = [nid for nid, details in isolation_details.items() if not details['has_in']]
-        for isolated_id in missing_inward:
-            # Connect from inputs and other hidden neurons (pre-filter and slice)
-            potential_sources = input_neurons + [h for h in hidden_neurons if h != isolated_id]
-            for source_id in potential_sources[:10]:
-                conn_key = (source_id, isolated_id)
-                if conn_key not in existing_connections and conn_key not in added:
-                    if self._is_valid_connection(neurons, source_id, isolated_id):
-                        candidates.append(conn_key)
-                        added.add(conn_key)
-
-        # Priority 3: Fix neurons missing outward connections
-        missing_outward = [nid for nid, details in isolation_details.items() if not details['has_out']]
-        for isolated_id in missing_outward:
-            # Connect to outputs and other hidden neurons (pre-filter and slice)
-            potential_targets = output_neurons + [h for h in hidden_neurons if h != isolated_id]
-            for target_id in potential_targets[:10]:
-                conn_key = (isolated_id, target_id)
-                if conn_key not in existing_connections and conn_key not in added:
-                    if self._is_valid_connection(neurons, isolated_id, target_id):
-                        candidates.append(conn_key)
-                        added.add(conn_key)
-
-        # Add all unique candidates (no arbitrary limit - let MCTS decide)
-        for source_id, target_id in candidates:
-            valid_actions.append(Action(
-                action_type=ActionType.ADD_CONNECTION,
-                source_neuron=source_id,
-                target_neuron=target_id
-            ))
-
-    def _add_refinement_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture,
-                               hidden_neurons: List[int]):
-        """Add refinement actions: activation changes and general connections"""
-        neurons = architecture.neurons
-
-        # Activation modifications
-        if hidden_neurons:
-            sample_neurons = np.random.choice(hidden_neurons, size=min(3, len(hidden_neurons)), replace=False)
-            for neuron_id in sample_neurons:
-                current_activation = neurons[neuron_id].activation
-                # Allow modifying activation to any supported ActivationType (except current)
-                for new_activation in ActivationType:
-                    if new_activation != current_activation:
-                        valid_actions.append(Action(
-                            action_type=ActionType.MODIFY_ACTIVATION,
-                            source_neuron=neuron_id,
-                            activation=new_activation
-                        ))
-
-        # General connections (not just de-isolation)
-        if len(architecture.connections) < self.max_connections:
-            all_neuron_ids = list(neurons.keys())
-            existing_connections = {(conn.source_id, conn.target_id) for conn in architecture.connections}
-
-            # Pre-compute number of attempts
-            num_attempts = len(all_neuron_ids) ** 2 // 1000 * self.connection_candidate_multiplier # Adjusted for efficiency
-            candidates = []
-            added_in_loop = set()
-            
-            for _ in range(num_attempts):
-                source_id = np.random.choice(all_neuron_ids)
-                target_id = np.random.choice(all_neuron_ids)
-                conn_key = (source_id, target_id)
-                
-                if source_id != target_id and conn_key not in existing_connections and conn_key not in added_in_loop:
-                    if self._is_valid_connection(neurons, source_id, target_id):
-                        candidates.append(conn_key)
-                        added_in_loop.add(conn_key)
-
-            for source_id, target_id in candidates: 
-                valid_actions.append(Action(
-                    action_type=ActionType.ADD_CONNECTION,
-                    source_neuron=source_id,
-                    target_neuron=target_id
-                ))
 
     def _is_valid_connection(self, architecture: NeuralArchitecture, source_id: int, target_id: int) -> bool:
         """Check if a connection between two neurons is valid.
@@ -538,3 +355,27 @@ class ActionSpace:
             return False
 
         return True
+
+    def get_action_primitives(self, architecture: NeuralArchitecture):
+        """Get cached action primitives for fast scoring and membership tests"""
+        try:
+            sig = architecture.compute_signature()
+        except Exception:
+            sig = None
+
+        if sig in self._full_action_primitives:
+            return self._full_action_primitives[sig]
+        else:
+            # Compute full action space to populate cache
+            self._get_full_action_space(architecture)
+            return self._full_action_primitives.get(sig, None)
+
+    def clear_cache(self):
+        """Clear cached action primitives and release memory held by numpy arrays/lists."""
+        try:
+            self._full_action_primitives.clear()
+        except Exception:
+            self._full_action_primitives = {}
+        # Force GC to release references to numpy arrays
+        gc.collect()
+        

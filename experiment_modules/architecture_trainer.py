@@ -9,6 +9,7 @@ import json
 import logging
 import traceback
 import warnings
+import gc
 from PIL import Image, ImageDraw
 from blueprint_modules.network import Neuron, Connection
 from blueprint_modules.action import ActionType
@@ -73,7 +74,8 @@ class ArchitectureTrainer:
             comp_weight=config.search.comp_weight if hasattr(config.search, 'comp_weight') else 0.0,
             early_stopping_patience=config.early_stopping_patience,
             early_stopping_min_delta=config.early_stopping_min_delta,
-            max_children=config.mcts.max_children if hasattr(config.mcts, 'max_children') else 50
+            max_children=config.mcts.max_children if hasattr(config.mcts, 'max_children') else 50,
+            max_neurons=config.model.max_neurons if hasattr(config.model, 'max_neurons') else 1000
         )
         
         # QuickTrainer for final episode evaluation
@@ -97,7 +99,7 @@ class ArchitectureTrainer:
         
         # Training state
         self.episode = 0
-        self.best_accuracy = 0.0
+        self.best_reward = 0.0
         self.training_history = []
         self.final_architecture = None
         
@@ -201,15 +203,18 @@ class ArchitectureTrainer:
                 raise RuntimeError("Action application failed")
 
             # Draw architecture diagram after action (save every step for debugging)
-            if self.episode % self.config.diagram_save_interval == 0:
+            if (self.episode + 1) % self.config.diagram_save_interval == 0 or self.episode == 0:
                 self._draw_architecture_diagram(new_arch, step)
             reward = best_node.value / best_node.visits # Use average value as reward
 
+            ce_start = time.time()
             # Store experience with MCTS visit distribution
             experience = self._create_experience(
                 current_arch, next_action, reward, new_arch,
                 search_root=search_root  # Contains visit distribution from MCTS
             )
+            ce_end = time.time()
+            print(f"Experience creation took {ce_end - ce_start:.4f} seconds")
 
             episode_experiences.append(experience)
             episode_rewards.append(reward)
@@ -221,6 +226,7 @@ class ArchitectureTrainer:
             # Update tree reuse: best_node IS the child node we want to reuse as next root
             if best_node is not None:
                 mcts_root = best_node
+                mcts_root.parent = None # MEMORY LEAK FIX: Prune parent to allow GC
 
             # Calculate timing information
             step_end_time = time.time()
@@ -278,7 +284,7 @@ class ArchitectureTrainer:
         self._log_episode(episode_metrics)
 
         # ===== Save final architecture =====
-        self.final_architecture = current_arch
+        self.final_architecture = current_arch.to_serializable_dict()
         # ===== EPISODE-LEVEL CACHE CLEANUP =====
         # Centralized helper: clear MCTS episode-level caches (evaluation cache)
         # and offload node-level policy tensors for the final root so memory
@@ -287,11 +293,20 @@ class ArchitectureTrainer:
         try:
             if hasattr(self, 'neural_mcts'):
                 try:
-                    # Pass the last root (if any) so node-level policies are offloaded
+                    # Pass the last root (if any). At episode boundary we fully clear
+                    # node-level policy tensors to free GPU memory. Experiences have
+                    # already been materialized to CPU above, so full clear is safe.
                     roots = mcts_root if 'mcts_root' in locals() else None
-                    self.neural_mcts.clear_episode_caches(roots=roots)
+                    self.neural_mcts.clear_episode_caches(roots=roots, preserve_roots=False)
                 except Exception:
                     pass
+
+            # Clear ActionManager caches too
+            try:
+                if hasattr(self, 'action_manager') and hasattr(self.action_manager, 'clear_cache'):
+                    self.action_manager.clear_cache()
+            except Exception:
+                pass
 
             # Free device caches
             try:
@@ -301,10 +316,11 @@ class ArchitectureTrainer:
                 pass
         except Exception:
             pass
+        
+        gc.collect()
 
         return episode_metrics
-    
-    
+      
     def _actions_match(self, action1: Action, action2: Action) -> bool:
         """Check if two actions are equivalent"""
         if action1 is None or action2 is None:
@@ -538,177 +554,155 @@ class ArchitectureTrainer:
         }
     
     def _precompute_mcts_marginals(self, visit_distribution: torch.Tensor, 
-                                   mcts_actions: List[Action]) -> Dict[str, List]:
-        """Precompute per-component MCTS marginal distributions at experience creation time.
-        
-        This avoids repeated marginalization during training and ensures deterministic,
-        cache-friendly computation. Stores as CPU lists for serialization and device safety.
-        
-        Returns Dict with keys:
-        - 'mcts_policy_action_type': [num_action_types] prob distribution (CPU list)
-        - 'mcts_policy_source': [max_neurons] prob distribution if source actions exist (CPU list)
-        - 'mcts_policy_target': [max_neurons] prob distribution if target actions exist (CPU list)
-        - 'mcts_policy_activation': [num_activations] prob distribution if activation actions exist (CPU list)
-        """
-        marginals = {}
-        
-        if visit_distribution is None or mcts_actions is None:
-            return marginals
-        
-        try:
-            # Cache expensive constants (avoid recomputation if called multiple times in episode)
-            if not hasattr(self, '_mcts_marginal_constants'):
-                self._mcts_marginal_constants = {
-                    'num_action_types': len(ActionType),
-                    'num_activations': len(ActivationType),
-                    'activation_type_map': {act: idx for idx, act in enumerate(ActivationType)},
-                    'max_neurons': self.config.model.max_neurons
-                }
+                                    mcts_actions: List[Action]) -> Dict[str, List]:
+            """Precompute per-component MCTS marginal distributions at experience creation time.
             
-            const = self._mcts_marginal_constants
+            This avoids repeated marginalization during training and ensures deterministic,
+            cache-friendly computation. Stores as CPU lists for serialization and device safety.
             
-            # Convert visit_distribution to CPU if needed
-            visit_dist_cpu = visit_distribution.cpu() if torch.is_tensor(visit_distribution) else visit_distribution
-            
-            # Initialize aggregators
-            action_type_dist = torch.zeros(const['num_action_types'], dtype=torch.float32)
-            source_dist = torch.zeros(const['max_neurons'], dtype=torch.float32)
-            target_dist = torch.zeros(const['max_neurons'], dtype=torch.float32)
-            activation_dist = torch.zeros(const['num_activations'], dtype=torch.float32)
-            
-            source_count = target_count = activation_count = 0
-            
-            # Single pass marginalization
-            for prob, act in zip(visit_dist_cpu, mcts_actions):
-                if act is None:
-                    continue
-                
-                prob_val = float(prob)
-                
-                # Action type (always)
-                action_type_dist[act.action_type.value] += prob_val
-                
-                # Source neuron
-                if act.source_neuron is not None and 0 <= act.source_neuron < const['max_neurons']:
-                    source_dist[act.source_neuron] += prob_val
-                    source_count += 1
-                
-                # Target neuron
-                if act.target_neuron is not None and 0 <= act.target_neuron < const['max_neurons']:
-                    target_dist[act.target_neuron] += prob_val
-                    target_count += 1
-                
-                # Activation
-                if act.activation is not None:
-                    act_idx = const['activation_type_map'].get(act.activation)
-                    if act_idx is not None:
-                        activation_dist[act_idx] += prob_val
-                        activation_count += 1
-            
-            # Normalize and clamp with epsilon guard
-            def _normalize_clamp(dist, count):
-                if count == 0:
-                    return None
-                policy_sum = dist.sum()
-                if policy_sum > 1e-8:
-                    dist = dist / policy_sum
-                dist = torch.clamp(dist, min=1e-8, max=1.0 - 1e-8)
-                normalized = dist / dist.sum()
-                # Convert to CPU list for serialization and storage safety
-                return normalized.cpu().tolist()
-            
-            # Store normalized marginals as CPU lists
-            normalized_action_dist = _normalize_clamp(action_type_dist, 1)  # Always has data
-            if normalized_action_dist is not None:
-                marginals['mcts_policy_action_type'] = normalized_action_dist
-            
-            if source_count > 0:
-                normalized_source = _normalize_clamp(source_dist, source_count)
-                if normalized_source is not None:
-                    marginals['mcts_policy_source'] = normalized_source
-            
-            if target_count > 0:
-                normalized_target = _normalize_clamp(target_dist, target_count)
-                if normalized_target is not None:
-                    marginals['mcts_policy_target'] = normalized_target
-            
-            if activation_count > 0:
-                normalized_activation = _normalize_clamp(activation_dist, activation_count)
-                if normalized_activation is not None:
-                    marginals['mcts_policy_activation'] = normalized_activation
-        
-        except Exception as e:
-            print(f"    [Warning] Failed to precompute MCTS marginals: {e}")
-        
-        return marginals
-    
-    def _create_experience(self, state: NeuralArchitecture, action: Action, 
-                          reward: float, next_state: NeuralArchitecture,
-                          search_root=None) -> Dict:
-        """Create experience tuple with MCTS visit distribution for AlphaZero-style training
-        
-        AlphaZero Key Insight: Store MCTS-improved policy π(s) = visit_count(a) / total_visits
-        The network learns to predict this π, not raw network priors. This leverages MCTS's 
-        superior exploration and planning.
-        
-        Optimization: Precompute and store per-component marginal distributions as CPU lists
-        to avoid repeated marginalization during training.
-        """
-        experience = {
-            'state': state,
-            'action': action,
-            'reward': reward,  # Immediate reward (will be replaced with final episode reward)
-            'next_state': next_state,
-            'timestamp': time.time(),
-            'mcts_policy': None,  # Will be filled below
-            'mcts_actions': None,   # For debugging
-            # Per-component precomputed marginals (stored as CPU lists for safety/serialization)
-            'mcts_policy_action_type': None,
-            'mcts_policy_source': None,
-            'mcts_policy_target': None,
-            'mcts_policy_activation': None,
-            # OPTIMIZATION: Cache legal action masks to avoid recomputation during training (52% speedup!)
-            'legal_action_mask': self._get_legal_action_mask_cpu(state)  # Cache computed at episode time
-        }
-        
-        # Extract MCTS visit distribution (CRITICAL for AlphaZero learning!)
-        if search_root is not None and hasattr(search_root, 'children'):
+            Returns Dict with keys:
+            - 'mcts_policy_action_type': [num_action_types] prob distribution (CPU list)
+            - 'mcts_policy_source': [max_neurons] prob distribution if source actions exist (CPU list)
+            - 'mcts_policy_target': [max_neurons] prob distribution if target actions exist (CPU list)
+            - 'mcts_policy_activation': [num_activations] prob distribution if activation actions exist (CPU list)
+            """
+            marginals = {}
+
+            if visit_distribution is None or mcts_actions is None:
+                return marginals
+
             try:
-                # Get visit distribution from neural_mcts helper
-                visit_distribution = self.neural_mcts.get_visit_distribution(
-                    search_root, temperature=1.0
-                )
-                
-                if visit_distribution is not None and len(visit_distribution) > 0:
-                    # Store raw distribution as a CPU-native Python list for safety
-                    # (avoids keeping tensors on CUDA inside the replay buffer)
-                    try:
-                        # Ensure mcts_policy is always a Python list
-                        if torch.is_tensor(visit_distribution):
-                            experience['mcts_policy'] = visit_distribution.detach().cpu().tolist()
-                        elif isinstance(visit_distribution, np.ndarray):
-                            experience['mcts_policy'] = visit_distribution.tolist()
-                        elif isinstance(visit_distribution, list):
-                            experience['mcts_policy'] = visit_distribution
-                        else:
-                            raise ValueError("Unexpected type for visit_distribution")
+                # Cache expensive constants (avoid recomputation if called multiple times in episode)
+                if not hasattr(self, '_mcts_marginal_constants'):
+                    self._mcts_marginal_constants = {
+                        'num_action_types': len(ActionType),
+                        'num_activations': len(ActivationType),
+                        'activation_type_map': {act: idx for idx, act in enumerate(ActivationType)},
+                        'max_neurons': self.config.model.max_neurons
+                    }
 
-                    except Exception:
-                        # Fallback: keep as-is but ensure CPU device if possible
-                        experience['mcts_policy'] = visit_distribution.cpu() if torch.is_tensor(visit_distribution) else visit_distribution
+                const = self._mcts_marginal_constants
+                # Perform aggregation on the configured device to avoid repeated GPU->CPU syncs.
+                device = self.device
 
-                    # Store actions as plain python list for serialization/safety
-                    experience['mcts_actions'] = [child.action for child in search_root.children]
-                    
-                    # OPTIMIZATION: Precompute per-component marginals at experience creation
-                    # Returns Dict with keys 'mcts_policy_action_type', 'mcts_policy_source', etc. (CPU lists)
-                    marginals = self._precompute_mcts_marginals(visit_distribution, experience['mcts_actions'])
-                    experience.update(marginals)  # Merge marginals into experience
+                # Convert visit_distribution to a 1-D tensor on device
+                if torch.is_tensor(visit_distribution):
+                    visit_t = visit_distribution.detach().to(device).reshape(-1)
+                elif isinstance(visit_distribution, np.ndarray):
+                    visit_t = torch.from_numpy(visit_distribution.astype(np.float32)).to(device)
+                else:
+                    visit_t = torch.tensor(visit_distribution, dtype=torch.float32, device=device).reshape(-1)
+
+                if visit_t.numel() == 0:
+                    return marginals
+
+                # Vectorized creation of index tensors
+                act_map = const['activation_type_map']
+                types = torch.tensor([a.action_type.value if a else -1 for a in mcts_actions], dtype=torch.long, device=device)
+                sources = torch.tensor([a.source_neuron if a and a.source_neuron is not None else -1 for a in mcts_actions], dtype=torch.long, device=device)
+                targets = torch.tensor([a.target_neuron if a and a.target_neuron is not None else -1 for a in mcts_actions], dtype=torch.long, device=device)
+                activations = torch.tensor([act_map.get(a.activation, -1) if a else -1 for a in mcts_actions], dtype=torch.long, device=device)
+
+                # Aggregate on-device using scatter/index_add
+                # Action type marginal
+                valid_type_mask = types >= 0
+                if valid_type_mask.any():
+                    type_weights = torch.zeros(const['num_action_types'], dtype=torch.float32, device=device)
+                    type_weights.index_add_(0, types[valid_type_mask], visit_t[valid_type_mask])
+                    normalized = _normalize_clamp(type_weights, 1)
+                    if normalized is not None:
+                        marginals['mcts_policy_action_type'] = normalized
+
+                # Source marginal
+                src_mask = sources >= 0
+                if src_mask.any():
+                    src_weights = torch.zeros(const['max_neurons'], dtype=torch.float32, device=device)
+                    src_weights.index_add_(0, sources[src_mask], visit_t[src_mask])
+                    normalized = _normalize_clamp(src_weights, int(src_mask.sum().item()))
+                    if normalized is not None:
+                        marginals['mcts_policy_source'] = normalized
+
+                # Target marginal
+                tgt_mask = targets >= 0
+                if tgt_mask.any():
+                    tgt_weights = torch.zeros(const['max_neurons'], dtype=torch.float32, device=device)
+                    tgt_weights.index_add_(0, targets[tgt_mask], visit_t[tgt_mask])
+                    normalized = _normalize_clamp(tgt_weights, int(tgt_mask.sum().item()))
+                    if normalized is not None:
+                        marginals['mcts_policy_target'] = normalized
+
+                # Activation marginal
+                act_mask = activations >= 0
+                if act_mask.any():
+                    act_weights = torch.zeros(const['num_activations'], dtype=torch.float32, device=device)
+                    act_weights.index_add_(0, activations[act_mask], visit_t[act_mask])
+                    normalized = _normalize_clamp(act_weights, int(act_mask.sum().item()))
+                    if normalized is not None:
+                        marginals['mcts_policy_activation'] = normalized
+
             except Exception as e:
-                print(f"    [Warning] Failed to extract MCTS policy: {e}")
-                # Continue without policy - will train only on value
-        
-        return experience
+                print(f"    [Warning] Failed to precompute MCTS marginals (vectorized): {e}")
+
+            return marginals   
+     
+    def _create_experience(self, state: NeuralArchitecture, action: Action, 
+                            reward: float, next_state: NeuralArchitecture,
+                            search_root=None) -> Dict:
+            """Create experience tuple with MCTS visit distribution for AlphaZero-style training
+            
+            AlphaZero Key Insight: Store MCTS-improved policy π(s) = visit_count(a) / total_visits
+            The network learns to predict this π, not raw network priors. This leverages MCTS's 
+            superior exploration and planning.
+            
+            Optimization: Precompute and store per-component marginal distributions as CPU lists
+            to avoid repeated marginalization during training.
+            """
+            experience = {
+                'state': state,
+                'action': action,
+                'reward': reward,  # Immediate reward (will be replaced with final episode reward)
+                'next_state': next_state,
+                'timestamp': time.time(),
+                'mcts_policy': None,  # Will be filled below
+                'mcts_actions': None,   # For debugging
+                # Per-component precomputed marginals (stored as CPU lists for safety/serialization)
+                'mcts_policy_action_type': None,
+                'mcts_policy_source': None,
+                'mcts_policy_target': None,
+                'mcts_policy_activation': None,
+                # OPTIMIZATION: Cache legal action masks to avoid recomputation during training (52% speedup!)
+                'legal_action_mask': self._get_legal_action_mask_cpu(state)  # Cache computed at episode time
+            }
+            
+            # Extract MCTS visit distribution (CRITICAL for AlphaZero learning!)
+            if search_root is not None and hasattr(search_root, 'children'):
+                try:
+                    # Get visit distribution from neural_mcts helper
+                    visit_distribution = self.neural_mcts.get_visit_distribution(
+                        search_root, temperature=1.0
+                    )
+                    
+                    if visit_distribution is not None and len(visit_distribution) > 0:
+                        # Store raw distribution as a CPU-native Python list for safety
+                        # (avoids keeping tensors on CUDA inside the replay buffer)
+                        # Simplified and robust conversion to a NumPy array
+                        if torch.is_tensor(visit_distribution):
+                            experience['mcts_policy'] = visit_distribution.detach().cpu().numpy().astype(np.float32)
+                        else:
+                            experience['mcts_policy'] = np.array(visit_distribution, dtype=np.float32)
+
+                        # Store actions as plain python list for serialization/safety
+                        experience['mcts_actions'] = [child.action for child in search_root.children]
+                        
+                        # OPTIMIZATION: Precompute per-component marginals at experience creation
+                        # Returns Dict with keys 'mcts_policy_action_type', 'mcts_policy_source', etc. (CPU lists)
+                        marginals = self._precompute_mcts_marginals(visit_distribution, experience['mcts_actions'])
+                        experience.update(marginals)  # Merge marginals into experience
+                except Exception as e:
+                    print(f"    [Warning] Failed to extract MCTS policy: {e}")
+                    # Continue without policy - will train only on value
+            
+            return experience   
     
     def _should_terminate_episode(self, architecture: NeuralArchitecture, 
                                  step: int) -> str:
@@ -739,12 +733,12 @@ class ArchitectureTrainer:
             'total_neurons': len(final_arch.neurons),
             'total_connections': len(final_arch.connections),
             'experiences': len(experiences),
-            'best_accuracy': max(rewards) if rewards else 0.0
+            'best_reward': max(rewards) if rewards else 0.0
         }
         
-        # Update best accuracy
-        if final_reward > self.best_accuracy:
-            self.best_accuracy = final_reward
+        # Update best reward
+        if final_reward > self.best_reward:
+            self.best_reward = final_reward
             metrics['is_best'] = True
         else:
             metrics['is_best'] = False
@@ -810,89 +804,83 @@ class ArchitectureTrainer:
         }
     
     def _get_legal_action_mask_cpu(self, state: NeuralArchitecture) -> Dict[str, torch.Tensor]:
-        """Create mask for legal actions on CPU (no GPU transfers).
-        
-        This is called during batch preparation to avoid per-graph GPU transfers.
-        Masks are moved to GPU in batch later.
-        
-        Returns:
-            Dict with masks on CPU device
-        """
+            """Create mask for legal actions on CPU (no GPU transfers).
+            
+            This is called during batch preparation to avoid per-graph GPU transfers.
+            Masks are moved to GPU in batch later.
+            
+            Returns:
+                Dict with masks on CPU device
+            """
 
-        # Initialize all-zero masks (everything starts as illegal)
-        action_type_mask = torch.zeros(len(ActionType), dtype=torch.float32)
-        source_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
-        target_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
-        activation_mask = torch.zeros(len(ActivationType), dtype=torch.float32)
-        
-        # Vectorized mask construction using precomputed action primitives when available.
-        # This avoids a Python loop over all actions and is significantly faster for
-        # large action spaces. We keep a safe fallback to the original loop.
-        try:
-            primitives = self.action_space.get_full_action_primitives(state)
-            types = primitives.get('types', None)
-            sources = primitives.get('sources', None)
-            targets = primitives.get('targets', None)
-            activations = primitives.get('activations', None)
+            # Check cache on the architecture instance to avoid recomputation
+            try:
+                if hasattr(state, '_cached_legal_action_mask_cpu') and state._cached_legal_action_mask_cpu is not None:
+                    return state._cached_legal_action_mask_cpu
+            except Exception:
+                pass
 
-            # Action types
-            if types is not None and types.size:
-                uniq_types = np.unique(types[types >= 0])
-                for t in uniq_types:
-                    if 0 <= int(t) < len(ActionType):
-                        action_type_mask[int(t)] = 1.0
+            # Initialize all-zero masks (everything starts as illegal)
+            action_type_mask = torch.zeros(len(ActionType), dtype=torch.float32)
+            source_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
+            target_mask = torch.zeros(self.config.model.max_neurons, dtype=torch.float32)
+            activation_mask = torch.zeros(len(ActivationType), dtype=torch.float32)
+            
+            # Vectorized mask construction for improved performance
+            try:
+                legal_actions = self.action_space.get_valid_actions(state)
+                if not legal_actions:
+                    # Return empty masks if no legal actions are available
+                    return {
+                        'action_type': action_type_mask, 'source_neuron': source_mask,
+                        'target_neuron': target_mask, 'activation': activation_mask
+                    }
 
-            # Sources (neuron indices)
-            if sources is not None and sources.size:
-                valid_srcs = sources[sources >= 0]
-                if valid_srcs.size:
-                    # Clip to mask length and dedupe
-                    valid_srcs = valid_srcs[valid_srcs < len(source_mask)]
-                    if valid_srcs.size:
-                        src_idxs = np.unique(valid_srcs).astype(int)
-                        source_mask[list(src_idxs)] = 1.0
+                # Vectorized creation of masks from the list of legal actions
+                types = torch.tensor([a.action_type.value for a in legal_actions], dtype=torch.long)
+                sources = torch.tensor([a.source_neuron for a in legal_actions if a.source_neuron is not None], dtype=torch.long)
+                targets = torch.tensor([a.target_neuron for a in legal_actions if a.target_neuron is not None], dtype=torch.long)
+                
+                activation_indices = []
+                for act in legal_actions:
+                    if act.activation is not None:
+                        try:
+                            activation_indices.append(list(ActivationType).index(act.activation))
+                        except ValueError:
+                            pass # Should not happen with valid actions
+                activations = torch.tensor(activation_indices, dtype=torch.long)
 
-            # Targets (neuron indices)
-            if targets is not None and targets.size:
-                valid_tgts = targets[targets >= 0]
-                if valid_tgts.size:
-                    valid_tgts = valid_tgts[valid_tgts < len(target_mask)]
-                    if valid_tgts.size:
-                        tgt_idxs = np.unique(valid_tgts).astype(int)
-                        target_mask[list(tgt_idxs)] = 1.0
+                action_type_mask.scatter_(0, types, 1.0)
+                source_mask.scatter_(0, sources, 1.0)
+                target_mask.scatter_(0, targets, 1.0)
+                activation_mask.scatter_(0, activations, 1.0)
+                
+            except Exception:
+                # Fallback for safety, though the vectorized approach should be robust
+                for action in self.action_space.get_valid_actions(state):
+                    action_type_mask[action.action_type.value] = 1.0
+                    if action.source_neuron is not None: source_mask[action.source_neuron] = 1.0
+                    if action.target_neuron is not None: target_mask[action.target_neuron] = 1.0
+                    if action.activation is not None:
+                        try:
+                            activation_mask[list(ActivationType).index(action.activation)] = 1.0
+                        except (ValueError, IndexError):
+                            pass
+            
+            res = {
+                'action_type': action_type_mask,
+                'source_neuron': source_mask,
+                'target_neuron': target_mask,
+                'activation': activation_mask,
+            }
 
-            # Activations (encoded as small integers; -1 means none)
-            if activations is not None and activations.size:
-                valid_acts = activations[activations >= 0]
-                if valid_acts.size:
-                    valid_acts = valid_acts[valid_acts < len(activation_mask)]
-                    if valid_acts.size:
-                        act_idxs = np.unique(valid_acts).astype(int)
-                        activation_mask[list(act_idxs)] = 1.0
-        except Exception:
-            # Fallback: original per-action loop (robust but slower)
-            legal_actions = self.action_space.get_valid_actions(state)
-        
-            for action in legal_actions:
-                action_type_mask[action.action_type.value] = 1.0
-                if action.source_neuron is not None and action.source_neuron < len(source_mask):
-                    source_mask[action.source_neuron] = 1.0
-                if action.target_neuron is not None and action.target_neuron < len(target_mask):
-                    target_mask[action.target_neuron] = 1.0
-                if action.activation is not None:
-                    try:
-                        activation_idx = list(ActivationType).index(action.activation)
-                        if activation_idx < len(activation_mask):
-                            activation_mask[activation_idx] = 1.0
-                    except (ValueError, IndexError):
-                        pass
-        
-        return {
-            'action_type': action_type_mask,
-            'source_neuron': source_mask,
-            'target_neuron': target_mask,
-            'activation': activation_mask,
-        }
+            # Cache on the architecture instance for future calls during the same episode
+            try:
+                setattr(state, '_cached_legal_action_mask_cpu', res)
+            except Exception:
+                pass
+
+            return res
 
     def train_on_batch(self, batch_size: int = 32, sub_batch_size: int = 4):
         """Train with proper gradient accumulation across sub-batches.
@@ -947,11 +935,8 @@ class ArchitectureTrainer:
         # Initialize gradient accumulation across all sub-batches
         self.optimizer.zero_grad()
         total_loss_accum = 0.0
-        policy_loss_accum = 0.0
         value_loss_accum = 0.0
         mcts_policy_loss_accum = 0.0
-        weighted_policy_loss_accum = 0.0
-        weighted_mcts_policy_loss_accum = 0.0
         num_processed = 0
         valid_indices_list = []
         valid_rewards_list = []
@@ -992,11 +977,8 @@ class ArchitectureTrainer:
                 
                 # Accumulate metrics (raw and weighted)
                 total_loss_accum += sub_result['total_loss']
-                policy_loss_accum += sub_result['policy_loss']
                 value_loss_accum += sub_result['value_loss']
                 mcts_policy_loss_accum += sub_result['mcts_policy_loss']
-                weighted_policy_loss_accum += sub_result['weighted_policy_loss']
-                weighted_mcts_policy_loss_accum += sub_result['weighted_mcts_policy_loss']
                 num_processed += sub_result['num_graphs']
                 
                 # Track for priority updates
@@ -1026,17 +1008,13 @@ class ArchitectureTrainer:
             self.experience_buffer.update_priorities(valid_indices_list, valid_rewards_list)
 
         print(f"  [Training] Processed {num_processed} graphs in batch of {batch_size} with sub-batch size {sub_batch_size}.", end='')
-        print(f"Total Loss: {total_loss_accum / num_processed:.4f}, Policy Loss: {policy_loss_accum / num_processed:.4f}, Value Loss: {value_loss_accum / num_processed:.4f}")
-        print(f"MCTS Policy Loss: {mcts_policy_loss_accum / num_processed:.4f}, Weighted Policy Loss: {weighted_policy_loss_accum / num_processed:.4f}, Weighted MCTS Policy Loss: {weighted_mcts_policy_loss_accum / num_processed:.4f}")
+        print(f"Total Loss: {total_loss_accum / num_processed:.4f}, Value Loss: {value_loss_accum / num_processed:.4f}, MCTS Policy Loss: {mcts_policy_loss_accum / num_processed:.4f}")
         
         # Return averaged metrics
         metrics = {
             'total_loss': total_loss_accum / num_processed if num_processed > 0 else 0.0,
-            'policy_loss': policy_loss_accum / num_processed if num_processed > 0 else 0.0,
             'value_loss': value_loss_accum / num_processed if num_processed > 0 else 0.0,
             'mcts_policy_loss': mcts_policy_loss_accum / num_processed if num_processed > 0 else 0.0,
-            'weighted_policy_loss': weighted_policy_loss_accum / num_processed if num_processed > 0 else 0.0,
-            'weighted_mcts_policy_loss': weighted_mcts_policy_loss_accum / num_processed if num_processed > 0 else 0.0,
             'num_graphs': num_processed
         }
 
@@ -1060,19 +1038,12 @@ class ArchitectureTrainer:
             Dict with:
                 - loss: scalar tensor (requires grad for backward)
                 - total_loss: float value
-                - policy_loss: float value
                 - value_loss: float value
                 - mcts_policy_loss: float value
-                - weighted_policy_loss: float value
-                - weighted_mcts_policy_loss: float value
                 - num_graphs: int (number of valid graphs)
                 - valid_indices: list of buffer indices for priority update
                 - valid_rewards: list of rewards for priority update
         """
-        # Cache normalization constants (used in multiple CE loss calculations)
-        log_max_neurons = np.log(max(1.0, self.config.model.max_neurons))
-        log_num_activations = np.log(max(1.0, len(ActivationType)))
-
         # === PHASE 1: BATCH CPU WORK (non-blocking, no GPU transfers yet) ===
         # Extract all graph representations, action masks, and targets on CPU first.
         # CRITICAL OPTIMIZATION: Use cached legal_action_mask from experience (52% speedup!)
@@ -1175,12 +1146,8 @@ class ArchitectureTrainer:
         # scalars as tensors on device to avoid repeated GPU->CPU syncs (.item()).
         
         total_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
-        policy_loss_sum = torch.tensor(0.0, device=self.device)
         value_loss_sum = torch.tensor(0.0, device=self.device)
         mcts_policy_loss_sum = torch.tensor(0.0, device=self.device)
-        weighted_policy_loss_sum = torch.tensor(0.0, device=self.device)
-        weighted_mcts_policy_loss_sum = torch.tensor(0.0, device=self.device)
-
         try:
             action_type_logits = predictions['action_type']  # [num_graphs, 5]
             source_logits = predictions['source_logits']      # [num_graphs, max_neurons]
@@ -1222,8 +1189,6 @@ class ArchitectureTrainer:
             masked_activation_logits = masked_activation_logits.masked_fill((activation_masks == 0), -1e9)
             
             # === PREPARE BATCH TARGETS ===
-            action_type_targets = torch.tensor([t['action_type'] for t in targets_list], dtype=torch.long, device=self.device)
-            
             # Prepare optional targets (use -1 for "not applicable" so cross_entropy ignores them)
             source_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
             for i, t in enumerate(targets_list):
@@ -1239,45 +1204,6 @@ class ArchitectureTrainer:
             for i, t in enumerate(targets_list):
                 if 'activation' in t:
                     activation_targets[i] = t['activation']
-            
-            # === VECTORIZED LOSS COMPUTATION ===
-            # Compute all policy losses at once
-            action_type_loss = F.cross_entropy(masked_action_logits, action_type_targets, reduction='none')  # [num_graphs]
-            
-            source_loss = torch.zeros(num_graphs, device=self.device)
-            source_mask = source_targets >= 0
-            if source_mask.any():
-                source_loss[source_mask] = F.cross_entropy(
-                    masked_source_logits[source_mask],
-                    source_targets[source_mask],
-                    reduction='none'
-                ) / log_max_neurons
-            
-            target_loss = torch.zeros(num_graphs, device=self.device)
-            target_mask = target_targets >= 0
-            if target_mask.any():
-                target_loss[target_mask] = F.cross_entropy(
-                    masked_target_logits[target_mask],
-                    target_targets[target_mask],
-                    reduction='none'
-                ) / log_max_neurons
-            
-            activation_loss = torch.zeros(num_graphs, device=self.device)
-            activation_mask = activation_targets >= 0
-            if activation_mask.any():
-                activation_loss[activation_mask] = F.cross_entropy(
-                    masked_activation_logits[activation_mask],
-                    activation_targets[activation_mask],
-                    reduction='none'
-                ) / log_num_activations
-            
-            # Count how many targets each graph has
-            loss_counts = torch.ones(num_graphs, device=self.device)  # at least action_type
-            loss_counts += (source_targets >= 0).float()
-            loss_counts += (target_targets >= 0).float()
-            loss_counts += (activation_targets >= 0).float()
-            
-            policy_loss = (action_type_loss + source_loss + target_loss + activation_loss) / loss_counts  # [num_graphs]
             
             # === VALUE LOSS (vectorized) ===
             value_targets = torch.stack([t['value'].squeeze() if t['value'].dim() > 0 else t['value'] 
@@ -1333,24 +1259,17 @@ class ArchitectureTrainer:
                 pass
             
             # === COMBINE LOSSES ===
-            # Pre-computed weights for annealing
-            weighted_mcts_loss_batch = mcts_policy_weight * mcts_losses
-            weighted_ce_loss_batch = annealed_ce_weight * policy_loss
-            
             # Apply sample weights
             weights_tensor = torch.tensor(weights_list, dtype=torch.float32, device=self.device)
-            graph_losses = (weighted_mcts_loss_batch + weighted_ce_loss_batch + value_loss) * weights_tensor
+            # IMPORTANT: exclude the single-action CE from the optimization loss.
+            graph_losses = (mcts_losses + value_loss) * weights_tensor
             
             # Sum all losses
             total_loss = graph_losses.sum()
             
             # Accumulate metrics (no .item() to avoid GPU sync)
-            policy_loss_sum = policy_loss.sum().detach()
             value_loss_sum = value_loss.sum().detach()
-            mcts_policy_loss_sum = mcts_losses.sum().detach()
-            weighted_policy_loss_sum = weighted_ce_loss_batch.sum().detach()
-            weighted_mcts_policy_loss_sum = weighted_mcts_loss_batch.sum().detach()
-            
+            mcts_policy_loss_sum = mcts_losses.sum().detach() 
         except Exception as e:
             print(f"    [ERROR] Vectorized loss computation failed: {e}")
             import traceback
@@ -1365,8 +1284,12 @@ class ArchitectureTrainer:
         valid_rewards = []
         surprise_weight = getattr(self.config.search, 'priority_surprise_weight', 0.5)
         for exp in valid_experiences:
-            # Get final target (ground truth for this experience)
-            value_target = exp.get('value_target', exp['reward'])
+            # Get final target (ground truth for this experience). Use only
+            # the explicitly stored final episode reward; do NOT fall back to
+            # the immediate per-step reward.
+            value_target = exp.get('value_target', None)
+            if value_target is None:
+                value_target = 0.0
             immediate_reward = exp['reward']
             
             # Surprise: how wrong was the network's prediction?
@@ -1377,12 +1300,6 @@ class ArchitectureTrainer:
             priority = value_target + surprise_weight * surprise
             valid_rewards.append(max(0.0, priority))
         
-        # Convert accumulated monitoring tensors to Python floats once to avoid repeated syncs
-        try:
-            policy_loss_val = float(policy_loss_sum.detach().cpu().item())
-        except Exception:
-            policy_loss_val = 0.0
-
         try:
             value_loss_val = float(value_loss_sum.detach().cpu().item())
         except Exception:
@@ -1392,25 +1309,12 @@ class ArchitectureTrainer:
             mcts_policy_loss_val = float(mcts_policy_loss_sum.detach().cpu().item())
         except Exception:
             mcts_policy_loss_val = 0.0
-
-        try:
-            weighted_policy_loss_val = float(weighted_policy_loss_sum.detach().cpu().item())
-        except Exception:
-            weighted_policy_loss_val = 0.0
-
-        try:
-            weighted_mcts_policy_loss_val = float(weighted_mcts_policy_loss_sum.detach().cpu().item())
-        except Exception:
-            weighted_mcts_policy_loss_val = 0.0
       
         return {
             'loss': total_loss,
-            'total_loss': total_loss.item(),
-            'policy_loss': policy_loss_val,                      # Raw (unweighted) supervised CE
+            'total_loss': total_loss.item(),                   # Raw (unweighted) supervised CE
             'value_loss': value_loss_val,
             'mcts_policy_loss': mcts_policy_loss_val,           # Raw (unweighted) MCTS KL
-            'weighted_policy_loss': weighted_policy_loss_val,   # After annealing weight
-            'weighted_mcts_policy_loss': weighted_mcts_policy_loss_val,  # After mcts_policy_weight
             'num_graphs': num_graphs,
             'valid_indices': valid_indices_list,
             'valid_rewards': valid_rewards,
@@ -1444,7 +1348,13 @@ class ArchitectureTrainer:
             self._num_activations = len(ActivationType)
         
         action = experience['action']
-        value_target = experience.get('value_target', experience['reward'])
+        # Use only final episode reward as the value target. Do NOT fall back
+        # to the immediate per-step reward; that would leak bootstrap signal.
+        value_target = experience.get('value_target', None)
+        if value_target is None:
+            # Missing value_target can happen for very old experiences; set to 0.0
+            # but do not use the immediate 'reward' as a proxy.
+            value_target = 0.0
         
         # ===== VALUE TARGET =====
         targets = {
@@ -1547,17 +1457,7 @@ class ArchitectureTrainer:
                             if act_idx is not None:
                                 activation_dist[act_idx] += prob_val
                                 activation_count += 1
-                    
-                    # Normalize and clamp all distributions (vectorized)
-                    def _normalize_clamp(dist, count):
-                        if count == 0:
-                            return None
-                        policy_sum = dist.sum()
-                        if policy_sum > 1e-8:
-                            dist = dist / policy_sum
-                        dist = torch.clamp(dist, min=1e-8, max=1.0 - 1e-8)
-                        return dist / dist.sum()
-                    
+                                
                     # Add distributions to targets if count > 0
                     normalized_action_dist = _normalize_clamp(action_type_dist, 1)  # Always has data
                     if normalized_action_dist is not None:
@@ -1587,7 +1487,7 @@ class ArchitectureTrainer:
             
             # Train on batch(s) if we have enough experiences
             train_interval = getattr(self.config, 'train_interval', 10)
-            if (self.episode + 1) % train_interval == 0:
+            if (self.episode + 1) % train_interval == 0 or self.episode == 0:
                 
                 # We will sample batches from the replay buffer. The buffer.sample()
                 # method is prioritized and probabilistic, so multiple sample() calls
@@ -1640,7 +1540,7 @@ class ArchitectureTrainer:
 
 
             # Checkpoint periodically
-            if (self.episode + 1) % self.config.checkpoint_interval == 0:
+            if (self.episode + 1) % self.config.checkpoint_interval == 0 or self.episode == 0:
                 self._save_checkpoint()
 
             # Update episode counter
@@ -1718,7 +1618,7 @@ class ArchitectureTrainer:
         print(
             f"Episode {self.episode}: acc={accuracy:.4f}, avg_reward={avg_reward:.4f}, "
             f"steps={steps}, experiences={experiences}, neurons={neurons}, "
-            f"conns={connections}, best={self.best_accuracy:.4f}, is_best={is_best}"
+            f"conns={connections}, best={self.best_reward:.4f}, is_best={is_best}"
         )
 
         # Prepare structured log dict with selected fields (sanitize all values)
@@ -1731,13 +1631,12 @@ class ArchitectureTrainer:
             'experiences': experiences,
             'total_neurons': neurons,
             'total_connections': connections,
-            'best_accuracy': float(_sanitize(self.best_accuracy)),
+            'best_reward': float(_sanitize(self.best_reward)),
             'is_best': is_best
         }
 
         # Include training metrics if present (losses, num_graphs, etc.)
-        for k in ('total_loss', 'policy_loss', 'value_loss', 'mcts_policy_loss',
-                  'weighted_policy_loss', 'weighted_mcts_policy_loss', 'num_graphs'):
+        for k in ('total_loss', 'value_loss', 'mcts_policy_loss', 'num_graphs'):
             if k in metrics:
                 log_dict[k] = _sanitize(metrics[k])
 
@@ -1771,7 +1670,7 @@ class ArchitectureTrainer:
             try:
                 with open(self.log_path, 'a', encoding='utf-8') as f:
                     f.write(f"{time.time()} INFO Episode {self.episode} final_acc={accuracy:.4f} "
-                           f"steps={steps} experiences={experiences} neurons={neurons} conns={connections} best={self.best_accuracy:.4f}\n")
+                           f"steps={steps} experiences={experiences} neurons={neurons} conns={connections} best={self.best_reward:.4f}\n")
                     f.flush()
 
                 # Also attempt metrics JSONL write as last resort
@@ -1794,11 +1693,11 @@ class ArchitectureTrainer:
             'episode': self.episode,
             'policy_value_net_state': self.policy_value_net.state_dict(),
             'optimizer_state': self.optimizer.state_dict(),
-            'best_accuracy': self.best_accuracy,
+            'best_reward': self.best_reward,
             'training_history': self.training_history,
             'config': self.config,
             'experience_buffer': self.experience_buffer.state_dict(),
-            'final_architecture': self.final_architecture.to_serializable_dict() if final_architecture is not None else None
+            'final_architecture': self.final_architecture
         }
 
         filename = f"checkpoint_ep{self.episode}.pth"
@@ -1813,7 +1712,7 @@ class ArchitectureTrainer:
 
         self.policy_value_net.load_state_dict(checkpoint['policy_value_net_state'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state'])
-        self.best_accuracy = checkpoint['best_accuracy']
+        self.best_reward = checkpoint['best_reward']
         self.training_history = checkpoint['training_history']
         self.episode = checkpoint['episode'] + 1  # Start next episode
         self.experience_buffer.load_state_dict(checkpoint['experience_buffer'])
@@ -1835,6 +1734,9 @@ class ArchitectureTrainer:
         - Minimal overhead: no antialiasing, lightweight drawing
         """
         try:
+            # Only draw 10 diagrams per episode to limit I/O
+            if (step + 1) % (self.config.search.max_steps_per_episode // 10) != 0 and step != 0:
+                return
             # Create directory
             os.makedirs(f'architecture_diagrams/ep{self.episode:03d}', exist_ok=True)
 
@@ -1938,3 +1840,24 @@ class ArchitectureTrainer:
         except Exception as e:
             print(f"Failed to draw architecture diagram: {e}")
             traceback.print_exc()
+
+
+# Normalize and clamp with epsilon guard
+def _normalize_clamp(dist, count):
+    if count == 0:
+        return None
+    policy_sum = dist.sum()
+    # Safe normalization: normalize when sum>0 and avoid forcing tiny
+    # non-zero probabilities up to a hard minimum which would distort
+    # small probability mass in large action spaces. We only guard
+    # against division by zero here.
+    if policy_sum > 0.0:
+        dist = dist / policy_sum
+    else:
+        return None
+    # Do not enforce a global minimum clamp on tiny non-zero probs;
+    # leave small masses as-is so long-tail probability is preserved.
+    # Only ensure numerical stability by renormalizing to sum==1.
+    normalized = dist / dist.sum()
+    # Convert to CPU list for serialization and storage safety
+    return normalized.cpu().tolist()

@@ -127,7 +127,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
         if num_graphs == 1:
             global_embedding, _ = self.graph_transformer(graph_data)
             # global_embedding: [1, hidden_dim * 2]
-        elif sub_batch_size >= num_graphs:
+        else:
             # Small batch case: vectorized pooling for speed and GPU utilization
             # Optimized: avoid constructing a large one-hot assignment matrix.
             # Use in-place index_add_ to sum node embeddings per graph and then divide
@@ -155,10 +155,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
             pooled_embeddings = pooled / counts  # [num_graphs, hidden_dim]
 
             global_embedding = torch.cat([pooled_embeddings, pooled_embeddings], dim=-1)  # [num_graphs, hidden_dim * 2]
-        else:
-            # Large batch case: Raise error for not sub-batching
-            raise NotImplementedError("Please use sub-batching for large batches.")
-        
+ 
         # Shared processing - applied to full batch (cheap linear ops, fits in memory)
         shared_features = self.shared_backbone(global_embedding)
         # shared_features: [num_graphs, hidden_dim // 2]

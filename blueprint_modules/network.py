@@ -5,6 +5,7 @@ from enum import Enum
 import torch.nn as nn
 from torch.amp import autocast
 import random
+import copy
 
 class NeuronType(Enum):
     INPUT = "input"
@@ -60,6 +61,8 @@ class NeuralArchitecture:
         self._sorted_neuron_ids = None
         self._connectivity_cache = None  # {'has_incoming': set, 'has_outgoing': set}
         self._topological_layers_cache = None  # {neuron_id: layer}
+        # Cached legal-action mask used by trainer; cleared when structure mutates
+        self._cached_legal_action_mask_cpu = None
         
         # Initialize with MNIST base structure
         self._initialize_mnist_base()
@@ -124,6 +127,8 @@ class NeuralArchitecture:
         self._connectivity_cache = None
         # Invalidate topological layers cache so next computation is fresh
         self._topological_layers_cache = None
+        # Invalidate external cached legal-action mask
+        self._cached_legal_action_mask_cpu = None
 
         # If caller didn't provide a float position, compute it from topology
         # so integer topological layers are mapped to normalized floats.
@@ -161,6 +166,8 @@ class NeuralArchitecture:
         self._connectivity_cache = None
         # Synchronize layer_position floats with updated topology
         self.sync_layer_positions_from_topology()
+        # Invalidate any cached legal-action mask since valid actions changed
+        self._cached_legal_action_mask_cpu = None
         return True
     
     def remove_neuron(self, neuron_id: int) -> bool:
@@ -202,6 +209,8 @@ class NeuralArchitecture:
         self._topological_layers_cache = None
         # Synchronize layer_position floats with updated topology
         self.sync_layer_positions_from_topology()
+        # Invalidate cached legal-action mask
+        self._cached_legal_action_mask_cpu = None
         return True
     
     def remove_connection(self, source_id: int, target_id: int) -> bool:
@@ -226,6 +235,8 @@ class NeuralArchitecture:
                 self._topological_layers_cache = None
             # Synchronize layer_position floats with updated topology
             self.sync_layer_positions_from_topology()
+        # Invalidate cached legal-action mask when connections change
+        self._cached_legal_action_mask_cpu = None
         return len(self.connections) < initial_count
     
     def compute_signature(self) -> str:
@@ -316,6 +327,49 @@ class NeuralArchitecture:
             'performance': self.performance_metrics,
             'sorted_neuron_ids': node_ids
         }
+
+    def clear_caches(self):
+        """Clear transient caches to free CPU memory held by this architecture.
+
+        This is safe to call when the architecture is no longer needed for
+        immediate computation (e.g., when offloading or dropping MCTS nodes).
+        """
+        try:
+            self._cached_legal_action_mask_cpu = None
+        except Exception:
+            pass
+
+        try:
+            self._sorted_neuron_ids = None
+        except Exception:
+            pass
+
+        try:
+            self._connectivity_cache = None
+        except Exception:
+            pass
+
+        try:
+            self._topological_layers_cache = None
+        except Exception:
+            pass
+
+        # Connection set may be rebuilt lazily by add_connection()/remove_connection()
+        try:
+            if hasattr(self, '_connection_set'):
+                delattr(self, '_connection_set')
+        except Exception:
+            try:
+                del self._connection_set
+            except Exception:
+                pass
+
+        # Force GC to help release any numpy arrays / intermediate objects
+        try:
+            import gc
+            gc.collect()
+        except Exception:
+            pass
     
     def _get_sorted_neuron_ids(self) -> List[int]:
         """Get sorted neuron IDs (cached) - O(1) after first call, O(n log n) on first call"""
@@ -704,6 +758,8 @@ class NeuralArchitecture:
         arch._connectivity_cache = None
         arch._topological_layers_cache = None
         arch._connection_set = set()
+        # Ensure legal-action mask cache exists (None means not computed yet)
+        arch._cached_legal_action_mask_cpu = None
 
         # Reconstruct neurons
         for neuron_data in data['neurons']:
@@ -733,6 +789,27 @@ class NeuralArchitecture:
         counts = self.get_neuron_count()
         return f"NeuralArchitecture(neurons={sum(counts.values())}, connections={len(self.connections)})"
 
+    def copy(self) -> 'NeuralArchitecture':
+        """Create a fast deep copy of the architecture without the initialization overhead."""
+        new_arch = NeuralArchitecture.__new__(NeuralArchitecture)
+        new_arch.neurons = copy.deepcopy(self.neurons)
+        new_arch.connections = copy.deepcopy(self.connections)
+        new_arch.next_neuron_id = self.next_neuron_id
+        new_arch.performance_metrics = copy.deepcopy(self.performance_metrics)
+
+        # Copy caches (shallow copy is sufficient)
+        new_arch._sorted_neuron_ids = copy.deepcopy(self._sorted_neuron_ids)
+        new_arch._connectivity_cache = copy.deepcopy(self._connectivity_cache)
+        new_arch._topological_layers_cache = copy.deepcopy(self._topological_layers_cache)
+        if hasattr(self, '_connection_set'):
+            new_arch._connection_set = copy.deepcopy(self._connection_set)
+        else:
+            new_arch._connection_set = set()
+
+        # Copy legal-action mask cache
+        new_arch._cached_legal_action_mask_cpu = copy.deepcopy(self._cached_legal_action_mask_cpu)
+
+        return new_arch
 
 class GraphNeuralNetwork(nn.Module):
     """

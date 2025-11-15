@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 from typing import Tuple
 import traceback
+from torch.amp import autocast
+from torch.amp import GradScaler
 
 class QuickTrainer:
     """Proper training and evaluation using the graph-based networks"""
@@ -17,13 +19,71 @@ class QuickTrainer:
 
         # Setup scaler for mixed precision
         if use_mixed_precision:
-            from torch.amp import GradScaler
-            self.scaler = GradScaler('cuda')
+            # Construct GradScaler for mixed precision. Newer PyTorch versions accept
+            # a `device` argument (e.g., 'cuda:0'); pass our configured device when
+            # CUDA is available. Fall back to the no-arg constructor if the
+            # installed GradScaler doesn't accept `device`.
+            if torch.cuda.is_available():
+                try:
+                    self.scaler = GradScaler(device=str(self.device))
+                except TypeError:
+                    # Older PyTorch versions don't accept device argument
+                    self.scaler = GradScaler()
+            else:
+                self.scaler = None
         else:
             self.scaler = None
 
         # Initialize model as None - will be set when architecture is provided
         self.model = None
+
+    def _move_loader_dataset_to_device(self, loader) -> bool:
+        """Attempt to move an entire DataLoader.dataset to `self.device`.
+
+        Returns True if the dataset was moved (best-effort), False otherwise.
+
+        Handles common dataset types:
+        - torch.utils.data.TensorDataset (has `.tensors`)
+        - torchvision-like datasets with `.data` and `.targets` attributes
+        Falls back silently when it cannot move the underlying data.
+        """
+        dataset = getattr(loader, 'dataset', None)
+        if dataset is None:
+            return False
+
+        try:
+            # TensorDataset: .tensors is a tuple of tensors
+            if hasattr(dataset, 'tensors'):
+                try:
+                    dataset.tensors = tuple(
+                        t.to(self.device) if isinstance(t, torch.Tensor) else t
+                        for t in dataset.tensors
+                    )
+                    return True
+                except Exception:
+                    return False
+
+            # Common torchvision datasets (MNIST, etc.) often have .data and .targets
+            if hasattr(dataset, 'data') and hasattr(dataset, 'targets'):
+                moved_any = False
+                try:
+                    if isinstance(dataset.data, torch.Tensor):
+                        dataset.data = dataset.data.to(self.device)
+                        moved_any = True
+                except Exception:
+                    pass
+                try:
+                    if isinstance(dataset.targets, torch.Tensor):
+                        dataset.targets = dataset.targets.to(self.device)
+                        moved_any = True
+                except Exception:
+                    pass
+                return moved_any
+
+        except Exception:
+            return False
+
+        return False
     
     def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
         """Train the graph-based network and return (final_accuracy, last_epoch_avg_loss)
@@ -38,10 +98,20 @@ class QuickTrainer:
             self.update_architecture(architecture)
             model = self.model
 
+            # Ensure model resides on the configured device
+            try:
+                model.to(self.device)
+            except Exception:
+                pass
+
             # Setup training
+            # Do NOT call `.to()` on the optimizer object — optimizers don't support `.to()`.
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
             criterion = nn.CrossEntropyLoss()
             
+            # Attempt to move the entire training dataset to device once.
+            train_dataset_moved = self._move_loader_dataset_to_device(self.train_loader)
+
             # Training loop with fractional epoch support
             model.train()
             num_full_epochs = int(self.max_epochs)
@@ -54,11 +124,18 @@ class QuickTrainer:
                 total = 0
 
                 for batch_idx, (data, target) in enumerate(self.train_loader):
-                    data, target = data.to(self.device), target.to(self.device)
+                    # If we didn't move the whole dataset up-front, move this batch.
+                    if not train_dataset_moved:
+                        data, target = data.to(self.device), target.to(self.device)
                     optimizer.zero_grad()
 
                     # Forward pass with optimizations
-                    output = model(data, use_mixed_precision=self.use_mixed_precision)
+                    # Use autocast when mixed precision is enabled and GPU is available
+                    if self.use_mixed_precision and torch.cuda.is_available():
+                        with autocast():
+                            output = model(data, use_mixed_precision=self.use_mixed_precision)
+                    else:
+                        output = model(data, use_mixed_precision=self.use_mixed_precision)
                     loss = criterion(output, target)
 
                     # Backward pass with mixed precision support
@@ -88,11 +165,16 @@ class QuickTrainer:
                     if batch_idx >= num_batches_fractional:
                         break
 
-                    data, target = data.to(self.device), target.to(self.device)
+                    if not train_dataset_moved:
+                        data, target = data.to(self.device), target.to(self.device)
                     optimizer.zero_grad()
 
                     # Forward pass with optimizations
-                    output = model(data, use_mixed_precision=self.use_mixed_precision)
+                    if self.use_mixed_precision and torch.cuda.is_available():
+                        with autocast():
+                            output = model(data, use_mixed_precision=self.use_mixed_precision)
+                    else:
+                        output = model(data, use_mixed_precision=self.use_mixed_precision)
                     loss = criterion(output, target)
 
                     # Backward pass with mixed precision support
@@ -140,11 +222,16 @@ class QuickTrainer:
         loss = 0.0
         criterion = nn.CrossEntropyLoss()
 
+        # Try to move the whole test dataset to device once. If that succeeds,
+        # we can skip per-batch `.to()` calls which reduces host->device transfers.
+        test_dataset_moved = self._move_loader_dataset_to_device(self.test_loader)
+
         with torch.no_grad():
             batch_count = 0
             for batch_idx, (data, target) in enumerate(self.test_loader):
-                # Move inputs to the trainer device before any model call
-                data, target = data.to(self.device), target.to(self.device)
+                # Move inputs to the trainer device before any model call if needed
+                if not test_dataset_moved:
+                    data, target = data.to(self.device), target.to(self.device)
 
                 output = model(data, use_mixed_precision=self.use_mixed_precision)
                 batch_loss = criterion(output, target)
