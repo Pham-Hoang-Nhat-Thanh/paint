@@ -27,7 +27,7 @@ class MCTSConfig:
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 30
+    max_children: int = 500
     temperature: float = 1.0
     temperature_decay: float = 0.99
 
@@ -48,6 +48,9 @@ class ArchitectureSearchConfig:
 
     # Sub-batch size for training
     sub_batch_size: int = 8
+
+    # Stability threshold for evolutionary cycle
+    stability_threshold: float = 0.001
 
     # Termination conditions
     target_accuracy: float = 0.97

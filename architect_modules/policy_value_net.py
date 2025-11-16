@@ -19,12 +19,15 @@ class UnifiedPolicyValueNetwork(nn.Module):
     def __init__(self, node_feature_dim: int, hidden_dim: int = 128,
                  max_neurons: int = 1000, num_actions: int = 5,
                  num_activations: int = 4, self_attention_heads: int = 8,
-                 transformer_layers: int = 3):
+                 transformer_layers: int = 3, num_phases: int = 3):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_neurons = max_neurons
         self.num_actions = num_actions
         self.num_activations = num_activations
+
+        # Phase embedding
+        self.phase_embedding = nn.Embedding(num_phases, hidden_dim // 8)
         
         # Graph transformer backbone
         self.graph_transformer = GraphTransformer(
@@ -36,7 +39,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
         
         # Shared backbone MLP - optimized for speed (removed biases for faster computation)
         self.shared_backbone = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim, bias=False),  # global_embedding is hidden_dim * 2
+            nn.Linear(hidden_dim * 2 + hidden_dim // 8, hidden_dim, bias=False),  # global_embedding is hidden_dim * 2
             nn.ReLU(inplace=True),
             nn.Dropout(0.1),
             nn.Linear(hidden_dim, hidden_dim // 2, bias=False),
@@ -82,7 +85,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0)
     
-    def forward(self, graph_data: Dict, sub_batch_size: int = 4) -> Dict[str, torch.Tensor]:
+    def forward(self, graph_data: Dict, phase: int) -> Dict[str, torch.Tensor]:
         """
         Supports both single and batched graphs with memory-efficient sub-batching.
         
@@ -114,14 +117,8 @@ class UnifiedPolicyValueNetwork(nn.Module):
         # Ensure graph_data tensors are on the same device as model parameters.
         model_device = next(self.parameters()).device
         for k, v in list(graph_data.items()):
-            if torch.is_tensor(v):
-                if v.device != model_device:
-                    # Move tensor to model device to support CPU and GPU runs transparently
-                    try:
-                        graph_data[k] = v.to(model_device)
-                    except Exception:
-                        # If move fails, raise with context
-                        raise RuntimeError(f"Failed to move graph_data['{k}'] from {v.device} to {model_device}")
+            if torch.is_tensor(v) and v.device != model_device:
+                graph_data[k] = v.to(model_device)
         
         # Single graph case: process directly
         if num_graphs == 1:
@@ -153,9 +150,14 @@ class UnifiedPolicyValueNetwork(nn.Module):
 
             # Mean pool
             pooled_embeddings = pooled / counts  # [num_graphs, hidden_dim]
-
             global_embedding = torch.cat([pooled_embeddings, pooled_embeddings], dim=-1)  # [num_graphs, hidden_dim * 2]
  
+        # Add phase embedding
+        phase_tensor = torch.tensor([phase] * num_graphs, dtype=torch.long, device=model_device)
+        phase_embedding = self.phase_embedding(phase_tensor)
+
+        global_embedding = torch.cat([global_embedding, phase_embedding], dim=-1) # [num_graphs, hidden_dim * 2 + hidden_dim // 8]
+
         # Shared processing - applied to full batch (cheap linear ops, fits in memory)
         shared_features = self.shared_backbone(global_embedding)
         # shared_features: [num_graphs, hidden_dim // 2]
@@ -188,13 +190,14 @@ class ActionManager:
         self._mask_cache = {}
         self._cache_key_size = 0
     
-    def get_action_masks(self, architecture: NeuralArchitecture) -> Dict[str, torch.Tensor]:
+    def get_action_masks(self, architecture: NeuralArchitecture, phase: int) -> Dict[str, torch.Tensor]:
         """Get masks for invalid actions"""
         neurons = architecture.neurons
         
         # Optimized: filter hidden neurons once and cache neuron type info
         hidden_neurons = [nid for nid, neuron in neurons.items()
                          if neuron.neuron_type == NeuronType.HIDDEN]
+        isolated_hidden = self.action_space._get_isolated_hidden_neurons(architecture)
         
         num_neurons = len(neurons)
         num_hidden = len(hidden_neurons)
@@ -212,22 +215,19 @@ class ActionManager:
         if num_neurons < self.max_neurons:
             action_mask[ActionType.ADD_NEURON.value] = 0
 
-        # Compute isolated hidden neurons (use architecture's cached connectivity)
-        connectivity = architecture._get_connectivity_sets()
-        has_incoming = connectivity['has_incoming']
-        has_outgoing = connectivity['has_outgoing']
-        isolated_hidden = [nid for nid, neuron in neurons.items() if neuron.neuron_type == NeuronType.HIDDEN and (nid not in has_incoming or nid not in has_outgoing)]
-
-        if len(isolated_hidden) > 0:
-            action_mask[ActionType.REMOVE_NEURON.value] = 0
-        if num_hidden > 0:
-            action_mask[ActionType.MODIFY_ACTIVATION.value] = 0
-
-        if num_neurons >= 2:
-            action_mask[ActionType.ADD_CONNECTION.value] = 0
-
-        if num_connections > 0:
-            action_mask[ActionType.REMOVE_CONNECTION.value] = 0
+        if phase == 0:  # EXPANDING
+            if num_neurons < self.max_neurons:
+                action_mask[ActionType.ADD_NEURON.value] = 0
+        elif phase == 1:  # REFINEMENT
+            if num_hidden > 0:
+                action_mask[ActionType.MODIFY_ACTIVATION.value] = 0
+            if num_neurons >= 2:
+                action_mask[ActionType.ADD_CONNECTION.value] = 0
+        elif phase == 2:  # PRUNING
+            if len(isolated_hidden) > 0:
+                action_mask[ActionType.REMOVE_NEURON.value] = 0
+            if num_connections > 0:
+                action_mask[ActionType.REMOVE_CONNECTION.value] = 0
 
         # Build masks (size = tensor_size). We return multiple masks for different action uses
         # Generic source mask: allowed for ADD_CONNECTION sampling (exclude OUTPUT neurons)

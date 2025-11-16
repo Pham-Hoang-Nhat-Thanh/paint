@@ -1,6 +1,6 @@
 from blueprint_modules.mcts import MCTS, MCTSNode
-from blueprint_modules.network import NeuralArchitecture, ActivationType, NeuronType, Neuron, Connection
-from blueprint_modules.action import Action, ActionSpace, ActionType
+from blueprint_modules.network import NeuralArchitecture, ActivationType
+from blueprint_modules.action import Action, ActionSpace
 from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
 from torch.distributions import Categorical
@@ -87,7 +87,7 @@ class NeuralMCTS(MCTS):
         # Cache for evaluations to avoid redundant computations
         self.evaluation_cache = {}
         # Evolutionary cycle tracking
-        self.current_cycle = EvolutionaryCycle()
+        self.current_cycle = EvolutionaryCycle(stability_threshold=0.001)
         # Reusable ActionManager instance
         self.action_manager = ActionManager(action_space=self.action_space, max_neurons=max_neurons)
         self.max_children = max_children
@@ -96,9 +96,6 @@ class NeuralMCTS(MCTS):
         """Clean up resources used by NeuralMCTS"""
         # Clear evaluation cache to free memory
         self.evaluation_cache.clear()
-        
-        # Reset evolutionary cycle
-        self.current_cycle.reset() if hasattr(self.current_cycle, 'reset') else None
         
         # Force garbage collection
         import gc
@@ -206,7 +203,7 @@ class NeuralMCTS(MCTS):
         if node.policy_value is None:
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(node.architecture)
-                node.policy_value = self.policy_value_net(graph_data)
+                node.policy_value = self.policy_value_net(graph_data, phase = self.current_cycle.current_phase.value)
         
         return node.policy_value['value'].item()
     
@@ -238,83 +235,109 @@ class NeuralMCTS(MCTS):
         else:
             root = NeuralMCTSNode(initial_architecture)
 
-        # Get neural network predictions for root
-        with torch.no_grad():
-            graph_data = self._prepare_graph_data(initial_architecture)
-            policy_value = self.policy_value_net(graph_data)
-            root.policy_value = policy_value
+        # Create a local copy of the episode-level cycle for this search so
+        # the search can advance phases locally while starting from the
+        # current episode phase. Changes are merged back after the search.
+        orig_cycle = self.current_cycle
+        search_cycle = orig_cycle.copy()
+        # Point `self.current_cycle` to the local search copy so helper
+        # methods naturally use the search-local phase during this call.
+        self.current_cycle = search_cycle
 
-        # Early stopping tracking
-        best_values = deque(maxlen=self.early_stopping_patience)
-        no_improvement_count = 0
-        initial_visits = root.visits  # Track starting visits for reused trees
-        
-        # Add Dirichlet noise to root for exploration (AlphaZero-style)
-        # This ensures we explore even when policy network has strong (but potentially wrong) priors
-        self._add_dirichlet_noise_to_root(root)
+        try:
+            # Get neural network predictions for root
+            with torch.no_grad():
+                graph_data = self._prepare_graph_data(initial_architecture)
+                policy_value = self.policy_value_net(graph_data, phase = self.current_cycle.current_phase.value)
+                root.policy_value = policy_value
 
-        print("Starting MCTS search...")
-        for i in range(iterations):
-            # ===== STEP 1: SELECT =====
-            # Traverse tree using PUCT until reaching a leaf node
-            node = self._select(root)
-
-            # ===== STEP 2: EXPAND & EVALUATE =====
-            # Expand one new child and get its value in one step (no redundant re-evaluation)
-            expanded_node, value = self._expand(node)
-
-            # ===== STEP 4: BACKUP =====
-            # Propagate value up the tree
-            self._backpropagate(expanded_node, value)
-
-            # Early stopping check - only after sufficient new visits on reused trees
-            new_visits = root.visits - initial_visits
-            min_new_visits = min(20, iterations // 2)  # At least 20 new visits or half of iterations
+            # Early stopping tracking
+            best_values = deque(maxlen=self.early_stopping_patience)
+            no_improvement_count = 0
+            initial_visits = root.visits  # Track starting visits for reused trees
             
-            # Skip early stopping until we have enough new exploration on reused trees
-            if new_visits < min_new_visits:
-                continue
+            # Add Dirichlet noise to root for exploration (AlphaZero-style)
+            # This ensures we explore even when policy network has strong (but potentially wrong) priors
+            self._add_dirichlet_noise_to_root(root)
+
+            print("Starting MCTS search...")
+            for i in range(iterations):
+                # ===== STEP 1: SELECT =====
+                # Traverse tree using PUCT until reaching a leaf node
+                node = self._select(root)
+
+                # ===== STEP 2: EXPAND & EVALUATE =====
+                # Expand one new child and get its value in one step (no redundant re-evaluation)
+                expanded_node, value = self._expand(node)
+
+                # If expansion produced a child, record its evaluation in the local cycle
+                if expanded_node is not None:
+                    self.current_cycle.add_evaluation(value)
+                    if self.current_cycle.is_stable():
+                        self.current_cycle.advance_phase()
+
+                # ===== STEP 4: BACKUP =====
+                # Propagate value up the tree
+                self._backpropagate(expanded_node, value)
+
+                # Early stopping check - only after sufficient new visits on reused trees
+                new_visits = root.visits - initial_visits
+                min_new_visits = min(20, iterations // 2)  # At least 20 new visits or half of iterations
                 
-            current_best = root.value / root.visits if root.visits > 0 else 0.0
-            best_values.append(current_best)
+                # Skip early stopping until we have enough new exploration on reused trees
+                if new_visits < min_new_visits:
+                    continue
+                    
+                current_best = root.value / root.visits if root.visits > 0 else 0.0
+                best_values.append(current_best)
 
-            if len(best_values) == self.early_stopping_patience and i > iterations // 2:
-                recent_best = max(best_values)
-                oldest_recent = min(best_values)
-                improvement = recent_best - oldest_recent
+                if len(best_values) == self.early_stopping_patience and i > iterations // 2:
+                    recent_best = max(best_values)
+                    oldest_recent = min(best_values)
+                    improvement = recent_best - oldest_recent
 
-                if improvement < self.early_stopping_min_delta:
-                    no_improvement_count += 1
-                else:
-                    no_improvement_count = 0
+                    if improvement < self.early_stopping_min_delta:
+                        no_improvement_count += 1
+                    else:
+                        no_improvement_count = 0
 
-                if no_improvement_count >= self.early_stopping_patience:
-                    print(f"Early stopping at iteration {i + 1}: no significant improvement in last {self.early_stopping_patience} iterations")
-                    break
+                    if no_improvement_count >= self.early_stopping_patience:
+                        print(f"Early stopping at iteration {i + 1}: no significant improvement in last {self.early_stopping_patience} iterations")
+                        break
 
-            if (i + 1) % max(1, iterations // 10) == 0:
-                print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {current_best:.4f}")
-        # ===== STEP 5: SELECT FINAL ACTION =====
-        # Use visit counts to select final action (most visited = most promising)
-        final_node = self._select_final_action(root, temperature)
-        if final_node and final_node.action:
-            # Update evolutionary cycle with final node's value
-            final_value = final_node.value / final_node.visits
-            self.current_cycle.add_evaluation(final_value)
+                if (i + 1) % max(1, iterations // 10) == 0:
+                    print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {current_best:.4f}")
 
-            # Reset cycle if structural change
-            if final_node.action.action_type in [ActionType.ADD_NEURON, ActionType.REMOVE_NEURON]:
-                self.current_cycle.reset()
+            # ===== STEP 5: SELECT FINAL ACTION =====
+            # Use visit counts to select final action (most visited = most promising)
+            final_node = self._select_final_action(root, temperature)
+            if final_node and final_node.action:
+                # Update local (search) cycle with final node's value
+                final_value = final_node.value / final_node.visits
+                self.current_cycle.add_evaluation(final_value)
+                if self.current_cycle.is_stable():
+                    self.current_cycle.advance_phase()
 
-            print("MCTS search completed successfully")
-            
-            # Return tuple: (selected_child, search_root)
-            # selected_child becomes new root for next search (tree reuse)
-            # search_root provides visit distribution for training
-            return (final_node, root)
-        else:
-            print("MCTS search completed: no valid action found")
-            return (root, root)  # Return tuple even on failure
+                print("MCTS search completed successfully")
+                return (final_node, root)
+            else:
+                print("MCTS search completed: no valid action found")
+                return (root, root)  # Return tuple even on failure
+        finally:
+            # Merge search-local cycle back to episode-level cycle when appropriate.
+            # Policy: if the search advanced the cycle or reached stability, update
+            # the episode cycle state. Otherwise keep the episode cycle intact.
+            try:
+                # If the search made progress (advanced cycle id) or found stability,
+                # copy the relevant fields back into the episode cycle.
+                if search_cycle.cycle_id != orig_cycle.cycle_id or search_cycle.is_stable():
+                    orig_cycle.cycle_id = search_cycle.cycle_id
+                    orig_cycle.node_values = list(search_cycle.node_values)
+                    orig_cycle.current_phase = search_cycle.current_phase
+                    orig_cycle.stability_threshold = search_cycle.stability_threshold
+            finally:
+                # Always restore the original object reference on the instance
+                self.current_cycle = orig_cycle
         
     
     def _add_dirichlet_noise_to_root(self, root: NeuralMCTSNode, epsilon: float = 0.25, alpha: float = 0.3):
@@ -375,7 +398,7 @@ class NeuralMCTS(MCTS):
         if node.policy_value is None:
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(node.architecture)
-                node.policy_value = self.policy_value_net(graph_data)
+                node.policy_value = self.policy_value_net(graph_data, phase = self.current_cycle.current_phase.value)
 
         # Cache valid actions for this node if not already cached
         if node._valid_actions_cache is None:
@@ -434,7 +457,7 @@ class NeuralMCTS(MCTS):
         # Evaluate the sampled child architecture
         with torch.no_grad():
             child_graph = self._prepare_graph_data(new_architecture)
-            child_policy = self.policy_value_net(child_graph)
+            child_policy = self.policy_value_net(child_graph, phase = self.current_cycle.current_phase.value)
             child_value = child_policy['value'].item()
 
         # Create child node with the sampled action and evaluated policy
@@ -506,7 +529,7 @@ class NeuralMCTS(MCTS):
             masks = node._cached_masks.copy()
             tensor_size = masks.pop('tensor_size')
         else:
-            masks = self.action_manager.get_action_masks(architecture)
+            masks = self.action_manager.get_action_masks(architecture, phase=self.current_cycle.current_phase.value)
             tensor_size = masks.pop('tensor_size')
             # Cache masks on node if provided
             if node is not None:
@@ -592,7 +615,7 @@ class NeuralMCTS(MCTS):
         # This is ~20x faster than computing full prior (action_type + source + target + activation)
         
         # Get masks for action types
-        masks = self.action_manager.get_action_masks(architecture)
+        masks = self.action_manager.get_action_masks(architecture, phase=self.current_cycle.current_phase.value)
         device = policy_output['action_type'].device
         masks['action_type'] = masks['action_type'].to(device)
         

@@ -13,6 +13,7 @@ import gc
 from PIL import Image, ImageDraw
 from blueprint_modules.network import Neuron, Connection
 from blueprint_modules.action import ActionType
+from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 
 # Suppress TF32 deprecation warnings
 warnings.filterwarnings("ignore", message="Please use the new API settings to control TF32 behavior")
@@ -96,6 +97,11 @@ class ArchitectureTrainer:
             lr=config.model.learning_rate if hasattr(config.model, 'learning_rate') else 1e-3,
             weight_decay=1e-4
         )
+
+        # Evolutionary cycle tracker
+        self.evolutionary_cycle = EvolutionaryCycle(
+            stability_threshold=config.search.stability_threshold if hasattr(config.search, 'stability_threshold') else 0.001
+        )
         
         # Training state
         self.episode = 0
@@ -165,6 +171,10 @@ class ArchitectureTrainer:
             print(f"Step {step + 1}/{self.config.search.max_steps_per_episode}:")
             step_start_time = time.time()
             
+            # Ensure MCTS uses the episode-level evolutionary cycle so searches
+            # start from the current episode phase and merge progress back
+            # (NeuralMCTS.search makes a local copy and may advance phases).
+            self.neural_mcts.current_cycle = self.evolutionary_cycle
             # MCTS search (always, no policy_mix_ratio since we're pure AlphaZero now)
             best_node, search_root = self.neural_mcts.search(
                 current_arch,
@@ -227,6 +237,11 @@ class ArchitectureTrainer:
             if best_node is not None:
                 mcts_root = best_node
                 mcts_root.parent = None # MEMORY LEAK FIX: Prune parent to allow GC
+
+            # Check for phase transition
+            self.evolutionary_cycle.add_evaluation(reward)
+            if self.evolutionary_cycle.is_stable():
+                self.evolutionary_cycle.advance_phase()
 
             # Calculate timing information
             step_end_time = time.time()
@@ -395,7 +410,7 @@ class ArchitectureTrainer:
             # Use policy-value network for fast evaluation during episode
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(architecture)
-                policy_output = self.policy_value_net(graph_data)
+                policy_output = self.policy_value_net(graph_data, phase = self.evolutionary_cycle.current_phase.value)
                 # Value output is the estimated accuracy
                 value = policy_output['value'].item()
                 return value
@@ -671,7 +686,8 @@ class ArchitectureTrainer:
                 'mcts_policy_target': None,
                 'mcts_policy_activation': None,
                 # OPTIMIZATION: Cache legal action masks to avoid recomputation during training (52% speedup!)
-                'legal_action_mask': self._get_legal_action_mask_cpu(state)  # Cache computed at episode time
+                'legal_action_mask': self._get_legal_action_mask_cpu(state),  # Cache computed at episode time
+                'evolutionary_phase': int(self.evolutionary_cycle.current_phase.value)
             }
             
             # Extract MCTS visit distribution (CRITICAL for AlphaZero learning!)
@@ -828,7 +844,9 @@ class ArchitectureTrainer:
             
             # Vectorized mask construction for improved performance
             try:
-                legal_actions = self.action_space.get_valid_actions(state)
+                # Use the episode-level evolutionary cycle when computing legal actions
+                # so the mask matches the search behavior (phase-dependent action sets).
+                legal_actions = self.action_space.get_valid_actions(state, evolutionary_cycle=self.evolutionary_cycle)
                 if not legal_actions:
                     # Return empty masks if no legal actions are available
                     return {
@@ -952,8 +970,7 @@ class ArchitectureTrainer:
             sub_indices = indices[sub_batch_idx:sub_batch_end]
             
             # Process this sub-batch with pre-computed weights (avoid per-graph recalculation)
-            sub_result = self._process_sub_batch(sub_experiences, sub_weights, sub_indices, 
-                                                 annealed_ce_weight, mcts_policy_weight)
+            sub_result = self._process_sub_batch(sub_experiences, sub_weights, sub_indices)
             
             if sub_result is not None:
                 # Backward on this sub-batch (accumulates gradients)
@@ -1020,7 +1037,7 @@ class ArchitectureTrainer:
 
         return metrics
     
-    def _process_sub_batch(self, experiences, weights, indices, annealed_ce_weight, mcts_policy_weight):
+    def _process_sub_batch(self, experiences, weights, indices):
         """Process a single sub-batch and compute loss for gradient accumulation.
         
         Optimizations:
@@ -1128,7 +1145,15 @@ class ArchitectureTrainer:
         self.policy_value_net.to(self.device)
         self.policy_value_net.train()  # CRITICAL: Ensure network is in training mode
 
-        predictions = self.policy_value_net(batched_graph_data, sub_batch_size=num_graphs)
+        # Use the most common evolutionary phase among experiences in this sub-batch
+        phases = [exp.get('evolutionary_phase', int(self.evolutionary_cycle.current_phase.value)) for exp in experiences]
+        try:
+            # pick modal phase to approximate per-graph conditioning
+            batch_phase = int(max(set(phases), key=phases.count))
+        except Exception:
+            batch_phase = int(self.evolutionary_cycle.current_phase.value)
+
+        predictions = self.policy_value_net(batched_graph_data, phase = batch_phase)
         
         # DIAGNOSTIC: Check if predictions are on GPU
         pred_device = predictions['action_type'].device

@@ -1,43 +1,46 @@
 from dataclasses import dataclass, field
 from typing import List
-from .action import Action
+from enum import Enum
+
+class Phase(Enum):
+    """Defines the phases of the evolutionary cycle"""
+    EXPANDING = 0
+    REFINEMENT = 1
+    PRUNING = 2
 
 @dataclass
 class EvolutionaryCycle:
     """Tracks the state of an evolutionary cycle for architecture search"""
     cycle_id: int = 0
     node_values: List[float] = field(default_factory=list)
-    actions_taken: List[Action] = field(default_factory=list)
-    stability_threshold: float = 0.6
-    
+    stability_threshold: float = 0.001
+    current_phase: Phase = Phase.EXPANDING
     def is_stable(self) -> bool:
-        """Check if the cycle has reached stable performance based on recent node values"""
-        if len(self.node_values) < 5:
+        if len(self.node_values) < 15:
             return False
-        # Check if recent values are above threshold and stabilizing
-        recent_values = self.node_values[-5:]
-        return all(v >= self.stability_threshold for v in recent_values)
+        recent_values = self.node_values[-15:]
+        delta = max(recent_values) - min(recent_values)
+        return delta <= self.stability_threshold  # or another small value
     
     def add_evaluation(self, value: float):
         """Add a node value evaluation to the cycle"""
         self.node_values.append(value)
+
+    def copy(self) -> 'EvolutionaryCycle':
+        """Return a shallow copy of the cycle suitable for local/search use.
+
+        The copy is independent (lists are shallow-copied) so searches can
+        advance phases locally without mutating the episode-level cycle.
+        """
+        return EvolutionaryCycle(
+            cycle_id=self.cycle_id,
+            node_values=list(self.node_values),
+            stability_threshold=self.stability_threshold,
+            current_phase=self.current_phase
+        )
     
-    def add_action(self, action: Action):
-        """Add an action taken in this cycle"""
-        self.actions_taken.append(action)
-    
-    def reset(self):
-        """Reset the cycle for a new evolutionary phase"""
+    def advance_phase(self):
+        """Advances to the next phase and resets the cycle's tracking data."""
         self.cycle_id += 1
+        self.current_phase = Phase((self.current_phase.value + 1) % len(Phase))
         self.node_values.clear()
-        self.actions_taken.clear()
-    
-    def should_prioritize_deisolation(self) -> bool:
-        """Determine if we should prioritize de-isolation actions"""
-        # Always prioritize de-isolation if cycle is not stable
-        return not self.is_stable()
-    
-    def should_prioritize_exploration(self) -> bool:
-        """Determine if we should prioritize exploration actions"""
-        # Prioritize exploration if stable and enough actions taken
-        return self.is_stable() and len(self.actions_taken) > 5
