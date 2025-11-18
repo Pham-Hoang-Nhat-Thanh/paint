@@ -33,9 +33,37 @@ from .experience_replay import ExperienceReplay
 from .config import OverallConfig
 
 class ArchitectureTrainer:
-    """Main class that orchestrates the complete training process"""
+    """Orchestrates the complete training process for neural architecture search.
+
+    This class manages the MCTS-based search, the policy-value network,
+    experience replay, and the overall training loop.
+
+    Attributes:
+        config (OverallConfig): The overall configuration.
+        device (torch.device): The device to run on.
+        train_loader: DataLoader for the training dataset.
+        test_loader: DataLoader for the test dataset.
+        policy_value_net (UnifiedPolicyValueNetwork): The policy-value network.
+        action_space (ActionSpace): The action space.
+        action_manager (ActionManager): The action manager.
+        neural_mcts (NeuralMCTS): The neural MCTS algorithm.
+        quick_trainer (QuickTrainer): The trainer for final evaluation.
+        experience_buffer (ExperienceReplay): The experience replay buffer.
+        optimizer (optim.Optimizer): The optimizer for the policy-value network.
+        evolutionary_cycle (EvolutionaryCycle): The evolutionary cycle tracker.
+        episode (int): The current episode number.
+        best_reward (float): The best reward achieved so far.
+        training_history (List): A history of training metrics.
+    """
     
     def __init__(self, config: OverallConfig, train_loader, test_loader):
+        """Initializes the ArchitectureTrainer.
+
+        Args:
+            config (OverallConfig): The overall configuration.
+            train_loader: DataLoader for the training dataset.
+            test_loader: DataLoader for the test dataset.
+        """
         self.config = config
         self.device = torch.device(config.device)
         
@@ -134,7 +162,7 @@ class ArchitectureTrainer:
         print(f"Starting AlphaZero-style MCTS training (no curriculum, pure self-play)")
     
     def cleanup(self):
-        """Clean up trainer resources"""
+        """Cleans up the trainer's resources."""
         # Clean up neural MCTS
         if hasattr(self.neural_mcts, 'cleanup'):
             self.neural_mcts.cleanup()
@@ -153,7 +181,11 @@ class ArchitectureTrainer:
         print("Trainer cleanup completed")
     
     def run_training_episode(self) -> Dict[str, Any]:
-        """Run one complete training episode using AlphaZero-style MCTS."""
+        """Runs one complete training episode using AlphaZero-style MCTS.
+
+        Returns:
+            Dict[str, Any]: A dictionary of episode metrics.
+        """
         print(f"Starting episode {self.episode}")
         # Initialize architecture
         current_arch = NeuralArchitecture()
@@ -340,7 +372,15 @@ class ArchitectureTrainer:
         return episode_metrics, current_arch.to_serializable_dict()
       
     def _actions_match(self, action1: Action, action2: Action) -> bool:
-        """Check if two actions are equivalent"""
+        """Checks if two actions are equivalent.
+
+        Args:
+            action1 (Action): The first action.
+            action2 (Action): The second action.
+
+        Returns:
+            bool: True if the actions are equivalent, False otherwise.
+        """
         if action1 is None or action2 is None:
             return False
         
@@ -370,7 +410,16 @@ class ArchitectureTrainer:
         return False
     
     def _apply_action(self, architecture: NeuralArchitecture, action: Action) -> NeuralArchitecture:
-        """Apply action to create new architecture"""
+        """Applies an action to create a new architecture.
+
+        Args:
+            architecture (NeuralArchitecture): The original architecture.
+            action (Action): The action to apply.
+
+        Returns:
+            NeuralArchitecture: The new architecture, or None if the action
+                failed.
+        """
         # Create a copy of the architecture
         new_arch = NeuralArchitecture()
         # The default NeuralArchitecture() constructor initializes a MNIST base (inputs/outputs
@@ -408,7 +457,14 @@ class ArchitectureTrainer:
         return new_arch if success else None
     
     def _evaluate_architecture(self, architecture: NeuralArchitecture) -> float:
-        """Evaluate architecture using policy-value network (lightweight, per-step)"""
+        """Evaluates an architecture using the policy-value network.
+
+        Args:
+            architecture (NeuralArchitecture): The architecture to evaluate.
+
+        Returns:
+            float: The estimated value of the architecture.
+        """
         try:
             # Use policy-value network for fast evaluation during episode
             with torch.no_grad():
@@ -423,10 +479,13 @@ class ArchitectureTrainer:
             return 0.0
     
     def _evaluate_final_architecture(self, architecture: NeuralArchitecture) -> Dict[str, float]:
-        """Full evaluation of final episode architecture using actual training
-        
-        This is called at the end of each episode to show true progress.
-        Uses QuickTrainer for actual training + evaluation on test set.
+        """Performs a full evaluation of the final episode architecture.
+
+        Args:
+            architecture (NeuralArchitecture): The final architecture.
+
+        Returns:
+            Dict[str, float]: A dictionary of evaluation metrics.
         """
         try:
             accuracy, loss = self.quick_trainer.train_and_evaluate(architecture)
@@ -447,10 +506,13 @@ class ArchitectureTrainer:
             }
 
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
-        """Optimized: Prepare graph data for neural network using cached sorted IDs
-        
-        Returns GPU tensors for single-graph evaluation (used during MCTS).
-        For batched training, use _batch_graph_data instead.
+        """Prepares graph data for the neural network.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            Dict: The graph data.
         """
         graph_data = architecture.to_graph_representation()
         
@@ -466,18 +528,13 @@ class ArchitectureTrainer:
         return graph_data
     
     def _batch_graph_data(self, graph_data_list: List[Dict]) -> Dict:
-        """Process graph dicts into batched format efficiently on GPU.
-        
-        Accepts EITHER:
-        - CPU graph representations (from to_graph_representation()) for training batches
-        - GPU graph dicts (from _prepare_graph_data()) for single graphs
-        
-        NOTE: PolicyValueNetwork requires CUDA inputs. We batch and transfer once.
-        
-        Optimizations:
-        - Keep tensors on GPU (no CPU detour)
-        - Use CUDA streams for parallel operations
-        - Accepts CPU input to avoid serialized transfers
+        """Processes graph dicts into a batched format on the GPU.
+
+        Args:
+            graph_data_list (List[Dict]): A list of graph data dictionaries.
+
+        Returns:
+            Dict: The batched graph data.
         """
         if not graph_data_list:
             return {}
@@ -574,7 +631,18 @@ class ArchitectureTrainer:
     def _create_experience(self, state: NeuralArchitecture, action: Action, 
                       reward: float, next_state: NeuralArchitecture,
                       search_root=None) -> Dict:
-        """Create experience with true AlphaZero MCTS policy targets"""
+        """Creates an experience dictionary with AlphaZero MCTS policy targets.
+
+        Args:
+            state (NeuralArchitecture): The current state.
+            action (Action): The action taken.
+            reward (float): The immediate reward.
+            next_state (NeuralArchitecture): The next state.
+            search_root: The root of the MCTS search tree. Defaults to None.
+
+        Returns:
+            Dict: The experience dictionary.
+        """
         exp_phase = int(self.evolutionary_cycle.current_phase.value)
         
         experience = {
@@ -612,7 +680,14 @@ class ArchitectureTrainer:
         return experience
 
     def _create_targets(self, experience: Dict) -> Dict:
-        """Create true AlphaZero training targets - direct MCTS policy"""
+        """Creates AlphaZero training targets from an experience.
+
+        Args:
+            experience (Dict): The experience dictionary.
+
+        Returns:
+            Dict: The training targets.
+        """
         action = experience['action']
         value_target = experience.get('value_target', 0.0)
         
@@ -648,7 +723,15 @@ class ArchitectureTrainer:
 
     def _should_terminate_episode(self, architecture: NeuralArchitecture, 
                                  step: int) -> str:
-        """Check if episode should terminate"""
+        """Checks if the episode should terminate.
+
+        Args:
+            architecture (NeuralArchitecture): The current architecture.
+            step (int): The current step number.
+
+        Returns:
+            str: The termination reason, or an empty string if not terminating.
+        """
         # Check max steps
         if step >= self.config.search.max_steps_per_episode - 1:
             return "max_steps"
@@ -663,7 +746,17 @@ class ArchitectureTrainer:
     def _process_episode_results(self, final_arch: NeuralArchitecture, 
                                 rewards: List[float], experiences: List[Dict], 
                                 steps: int) -> Dict[str, Any]:
-        """Process and return episode metrics"""
+        """Processes and returns episode metrics.
+
+        Args:
+            final_arch (NeuralArchitecture): The final architecture.
+            rewards (List[float]): A list of rewards for the episode.
+            experiences (List[Dict]): A list of experiences for the episode.
+            steps (int): The number of steps in the episode.
+
+        Returns:
+            Dict[str, Any]: A dictionary of episode metrics.
+        """
         final_reward = rewards[-1] if rewards else 0.0
         avg_reward = np.mean(rewards) if rewards else 0.0
         
@@ -688,14 +781,14 @@ class ArchitectureTrainer:
         return metrics
     
     def _compute_experience_priority(self, experience: Dict, episode_metrics: Dict) -> float:
-        """Compute priority for experience replay using outcome + surprise (TD-error proxy).
-        
-        Priority reflects two signals:
-        1. OUTCOME: experiences from high-value episodes are more important
-        2. SURPRISE: |value_target - immediate_reward| = prediction error, indicates informativeness
-        3. NOVELTY: bonus for larger/more complex architectures
-        
-        This ensures replay buffer learns from both good outcomes and surprising transitions.
+        """Computes the priority for an experience.
+
+        Args:
+            experience (Dict): The experience dictionary.
+            episode_metrics (Dict): The metrics for the episode.
+
+        Returns:
+            float: The priority of the experience.
         """
         # Get immediate reward (what PV net predicted during episode)
         immediate_reward = experience['reward']
@@ -724,13 +817,15 @@ class ArchitectureTrainer:
         return priority + novelty_bonus
       
     def _get_legal_action_mask(self, state: NeuralArchitecture, phase: int = None) -> Dict[str, torch.Tensor]:
-            """Create mask for legal actions on CPU (no GPU transfers).
-            
-            This is called during batch preparation to avoid per-graph GPU transfers.
-            Masks are moved to GPU in batch later.
-            
+            """Creates a mask for legal actions on the CPU.
+
+            Args:
+                state (NeuralArchitecture): The current state.
+                phase (int, optional): The current evolutionary phase.
+                    Defaults to None.
+
             Returns:
-                Dict with masks on CPU device
+                Dict[str, torch.Tensor]: A dictionary of action masks.
             """
 
             # Determine phase key to use for per-phase caching
@@ -828,34 +923,14 @@ class ArchitectureTrainer:
             return res
 
     def train_on_batch(self, batch_size: int = 32, sub_batch_size: int = 4):
-        """Train with proper gradient accumulation across sub-batches.
-        
-        Optimizations:
-        - Pre-compute annealed CE weight once (avoid per-graph calculations)
-        - Pass pre-computed weights to _process_sub_batch to avoid redundant lookups
-        - Cache config values (avoid repeated attribute lookups)
-        - Reduce print overhead (batch-level only)
-        
-        MEMORY EFFICIENT FLOW:
-        1. Sample batch_size experiences from replay buffer
-        2. Split into sub-batches of size sub_batch_size
-        3. For each sub-batch:
-           - Process graphs through network
-           - Compute loss for this sub-batch
-           - Backward (accumulate gradients in network parameters)
-           - Clear intermediate tensors from GPU
-        4. After all sub-batches: gradient clipping and optimizer.step()
-        5. Update priorities for all experiences
-        
-        Key benefit: Never keeps all batch_size graphs in memory simultaneously.
-        Memory peak is O(sub_batch_size * avg_nodes) instead of O(batch_size * avg_nodes).
-        
+        """Trains on a batch of experiences with gradient accumulation.
+
         Args:
-            batch_size: Total number of experiences to sample
-            sub_batch_size: Number of graphs per training step (default 4)
-        
+            batch_size (int): The total number of experiences to sample.
+            sub_batch_size (int): The number of graphs per training step.
+
         Returns:
-            Dictionary with accumulated losses
+            Dict: A dictionary of accumulated losses.
         """
         # Sample full batch from replay buffer
         experiences, indices, weights = self.experience_buffer.sample(batch_size)
@@ -952,28 +1027,15 @@ class ArchitectureTrainer:
         return metrics
     
     def _process_sub_batch(self, experiences, weights, indices):
-        """Process a single sub-batch and compute loss for gradient accumulation.
-        
-        Optimizations:
-        - Accept pre-computed annealed_ce_weight and mcts_policy_weight to avoid per-graph recalculation
-        - Cache math.log values for loss normalization
-        
+        """Processes a single sub-batch and computes the loss.
+
         Args:
-            experiences: List of experience dicts
-            weights: List of sample weights for prioritized replay
-            indices: List of buffer indices for priority updates
-            annealed_ce_weight: Pre-computed CE weight for this batch (from train_on_batch)
-            mcts_policy_weight: Pre-computed MCTS policy weight from config
-        
+            experiences (List[Dict]): A list of experience dictionaries.
+            weights (List[float]): A list of sample weights.
+            indices (List[int]): A list of buffer indices.
+
         Returns:
-            Dict with:
-                - loss: scalar tensor (requires grad for backward)
-                - total_loss: float value
-                - value_loss: float value
-                - mcts_policy_loss: float value
-                - num_graphs: int (number of valid graphs)
-                - valid_indices: list of buffer indices for priority update
-                - valid_rewards: list of rewards for priority update
+            Dict: A dictionary of loss metrics.
         """
         # === PHASE 1: BATCH CPU WORK (non-blocking, no GPU transfers yet) ===
         # Extract all graph representations, action masks, and targets on CPU first.
@@ -1335,7 +1397,7 @@ class ArchitectureTrainer:
             return None
 
     def run_training(self):
-        """Run complete training process using AlphaZero-style MCTS + policy network"""
+        """Runs the complete training process."""
         print("Starting architecture search training...")
         
         while self.episode < self.config.max_episodes:
@@ -1415,7 +1477,11 @@ class ArchitectureTrainer:
         return self.training_history
     
     def _log_episode(self, metrics: Dict):
-        """Log episode metrics"""
+        """Logs episode metrics.
+
+        Args:
+            metrics (Dict): A dictionary of episode metrics.
+        """
         # Always log (removed interval check so every episode is logged)
         # Sanitize and extract commonly used metrics for readable logs
         def _sanitize(v):
@@ -1539,12 +1605,11 @@ class ArchitectureTrainer:
                 traceback.print_exc()
     
     def _save_checkpoint(self, final_architecture=None):
-        """Save training checkpoint (AlphaZero-style, no curriculum)
-        
-        Note: MCTS tree state (mcts_root) is NOT saved because:
-        - Tree is episode-scoped (resets between episodes)
-        - Each episode should start with fresh tree for exploration diversity
-        - Tree reuse is only beneficial within a single episode
+        """Saves a training checkpoint.
+
+        Args:
+            final_architecture (dict, optional): The final architecture to
+                save. Defaults to None.
         """
         checkpoint = {
             'episode': self.episode,
@@ -1564,7 +1629,11 @@ class ArchitectureTrainer:
         print(f"Checkpoint saved: {filepath}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load training checkpoint"""
+        """Loads a training checkpoint.
+
+        Args:
+            checkpoint_path (str): The path to the checkpoint file.
+        """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         self.policy_value_net.load_state_dict(checkpoint['policy_value_net_state'])
@@ -1582,13 +1651,11 @@ class ArchitectureTrainer:
         print(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
 
     def _draw_architecture_diagram(self, architecture: NeuralArchitecture, step: int):
-        """Draw a diagram using PIL (much faster than matplotlib, 10-100x speedup)
-        
-        Optimizations:
-        - Use PIL instead of matplotlib (PIL is 10-100x faster)
-        - Layer-based hierarchical layout (O(n) instead of O(n²) spring layout)
-        - Direct pixel manipulation instead of path rendering
-        - Minimal overhead: no antialiasing, lightweight drawing
+        """Draws a diagram of the architecture.
+
+        Args:
+            architecture (NeuralArchitecture): The architecture to draw.
+            step (int): The current step number.
         """
         try:
             # Only draw 10 diagrams per episode to limit I/O

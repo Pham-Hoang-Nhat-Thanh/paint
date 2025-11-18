@@ -18,6 +18,14 @@ from experiment_modules.architecture_trainer import ArchitectureTrainer
 _data_cache = {}
 
 def load_mnist_data(batch_size=64):
+    """Loads the MNIST dataset with caching and optimized loading.
+
+    Args:
+        batch_size (int): The batch size for the data loaders.
+
+    Returns:
+        tuple: A tuple containing the training and test data loaders.
+    """
     global _data_cache
     """Load MNIST dataset with caching and optimized loading"""
     cache_key = f"mnist_{batch_size}"
@@ -60,7 +68,15 @@ def load_mnist_data(batch_size=64):
     return train_loader, test_loader
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
-    """Find the latest checkpoint file in the checkpoint directory"""
+    """Finds the latest checkpoint file in the checkpoint directory.
+
+    Args:
+        checkpoint_dir (str): The directory where checkpoints are stored.
+
+    Returns:
+        str: The path to the latest checkpoint file, or None if no checkpoint
+            is found.
+    """
     if not os.path.exists(checkpoint_dir):
         return None
 
@@ -84,6 +100,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str:
     return os.path.join(checkpoint_dir, latest_file)
 
 def main():
+    """The main function for running the architecture search."""
     # Load configuration
     config = OverallConfig()
 
@@ -188,7 +205,7 @@ def main():
         trainer.cleanup()
 
 def cleanup_and_exit():
-    """Clean up resources and exit gracefully"""
+    """Cleans up resources and exits gracefully."""
     print("\nCleaning up resources...")
     
     # Clear the data cache to help with cleanup

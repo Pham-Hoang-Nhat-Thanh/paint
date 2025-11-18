@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from .evolutionary_cycle import EvolutionaryCycle
 
 class ActionType(Enum):
+    """Enumeration of possible actions on the neural architecture."""
     ADD_NEURON = 0
     REMOVE_NEURON = 1
     MODIFY_ACTIVATION = 2
@@ -19,6 +20,15 @@ class ActionType(Enum):
 
 @dataclass
 class Action:
+    """Represents an action to be applied to a neural architecture.
+
+    Attributes:
+        action_type (ActionType): The type of action to perform.
+        source_neuron (Optional[int]): The ID of the source neuron.
+        target_neuron (Optional[int]): The ID of the target neuron.
+        activation (Optional[ActivationType]): The activation function.
+        parameters (Dict): Additional parameters for the action.
+    """
     action_type: ActionType
     source_neuron: Optional[int] = None
     target_neuron: Optional[int] = None
@@ -26,11 +36,19 @@ class Action:
     parameters: Dict = None
     
     def __post_init__(self):
+        """Initializes the parameters dictionary if it is None."""
         if self.parameters is None:
             self.parameters = {}
     
     def __eq__(self, other):
-        """Two actions are equal if all their fields match"""
+        """Checks if two actions are equal.
+
+        Args:
+            other: The object to compare with.
+
+        Returns:
+            bool: True if the actions are equal, False otherwise.
+        """
         if not isinstance(other, Action):
             return False
         return (self.action_type == other.action_type and
@@ -39,15 +57,43 @@ class Action:
                 self.activation == other.activation)
     
     def __hash__(self):
-        """Make Action hashable so it can be used in sets and as dict keys"""
+        """Computes the hash of the action to allow it to be used in sets.
+
+        Returns:
+            int: The hash of the action.
+        """
         return hash((self.action_type, self.source_neuron, self.target_neuron, self.activation))
 
 class ActionSpace:
-    """Manages valid actions for a given neural architecture"""
+    """Manages the valid actions for a given neural architecture.
+
+    This class is responsible for generating the set of all possible valid
+    actions that can be applied to a neural architecture, taking into account
+    various constraints and the current evolutionary phase.
+
+    Attributes:
+        max_neurons (int): The maximum number of neurons allowed.
+        model_max_neurons (int): The hard limit of neurons imposed by the model.
+        max_connections (int): The maximum number of connections allowed.
+        max_steps_per_episode (int): The maximum number of steps per episode.
+        connection_candidate_multiplier (int): The multiplier for connection
+            candidates.
+    """
 
     def __init__(self, max_neurons: int = 1000, max_connections: int = 10000,
                  max_steps_per_episode: int = 50, connection_candidate_multiplier: int = 3,
                  model_max_neurons: int = None):
+        """Initializes the ActionSpace.
+
+        Args:
+            max_neurons (int): The maximum number of neurons allowed.
+            max_connections (int): The maximum number of connections allowed.
+            max_steps_per_episode (int): The maximum number of steps per episode.
+            connection_candidate_multiplier (int): The multiplier for
+                connection candidates.
+            model_max_neurons (int, optional): The hard limit of neurons imposed
+                by the model. Defaults to None.
+        """
         # max_neurons: search-time soft limit (number of neurons allowed in architecture)
         # model_max_neurons: hard limit imposed by model heads (logit vector sizes)
         self.max_neurons = max_neurons
@@ -62,7 +108,16 @@ class ActionSpace:
 
     def get_valid_actions(self, architecture: NeuralArchitecture,
                          evolutionary_cycle: Optional['EvolutionaryCycle'] = None) -> List[Action]:
-        """Get valid actions for the current architecture state based on the evolutionary phase."""
+        """Gets the valid actions for the current architecture state.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+            evolutionary_cycle (Optional['EvolutionaryCycle']): The current
+                evolutionary cycle. Defaults to None.
+
+        Returns:
+            List[Action]: A list of valid actions.
+        """
         if evolutionary_cycle is None:
             return self._get_full_action_space(architecture)
 
@@ -77,12 +132,18 @@ class ActionSpace:
             return []
 
     def _get_full_action_space(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Return the full set of valid actions for the architecture.
+        """Returns the full set of valid actions for the architecture.
 
         This enumerates all sensible actions while applying validation rules
         (type-based and topological). The returned list is deterministically
         ordered by neuron ids and activation enumeration to make behaviour stable
         across runs.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            List[Action]: A list of all valid actions.
         """
         valid_actions: List[Action] = []
         neurons = architecture.neurons
@@ -206,7 +267,14 @@ class ActionSpace:
         return valid_actions
     
     def _get_expanding_actions(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Actions for the expanding phase: only adding new neurons."""
+        """Gets the actions for the expanding phase (only adding new neurons).
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            List[Action]: A list of valid expanding actions.
+        """
         valid_actions: List[Action] = []
         num_neurons = len(architecture.neurons)
         can_add_neuron = num_neurons < self.max_neurons and architecture.next_neuron_id < self.model_max_neurons
@@ -216,7 +284,16 @@ class ActionSpace:
         return valid_actions
     
     def _get_refinement_actions(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Actions for the refinement phase: adding connections and modifying activations."""
+        """Gets actions for the refinement phase.
+
+        This includes adding connections and modifying activations.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            List[Action]: A list of valid refinement actions.
+        """
         valid_actions: List[Action] = []
         neurons = architecture.neurons
         hidden_ids = sorted([nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN])
@@ -304,7 +381,16 @@ class ActionSpace:
         return valid_actions
     
     def _get_pruning_actions(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Actions for the pruning phase: removing neurons and connections."""
+        """Gets actions for the pruning phase.
+
+        This includes removing neurons and connections.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            List[Action]: A list of valid pruning actions.
+        """
         valid_actions: List[Action] = []
         isolated_hidden = self._get_isolated_hidden_neurons(architecture)
         removable = sorted([nid for nid, n in architecture.neurons.items() if n.neuron_type == NeuronType.HIDDEN and nid in isolated_hidden])
@@ -317,7 +403,15 @@ class ActionSpace:
         return valid_actions
 
     def apply_action(self, architecture: NeuralArchitecture, action: Action) -> bool:
-        """Apply an action to the architecture, return success status"""
+        """Applies an action to the architecture.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+            action (Action): The action to apply.
+
+        Returns:
+            bool: True if the action was applied successfully, False otherwise.
+        """
         try:
             if action.action_type == ActionType.ADD_NEURON:
                 # New neurons are added as isolated (layer -1)
@@ -359,10 +453,16 @@ class ActionSpace:
         return False
 
     def _get_isolated_hidden_neurons(self, architecture: NeuralArchitecture) -> set:
-        """Get set of isolated hidden neurons - O(n) where n is number of neurons.
-        
-        Uses cached connectivity from architecture to avoid re-scanning connections.
-        Cache is automatically invalidated when architecture is modified.
+        """Gets the set of isolated hidden neurons.
+
+        This method uses cached connectivity from the architecture to avoid
+        re-scanning connections.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            set: A set of isolated hidden neuron IDs.
         """
         # Get cached connectivity (O(1) after first call, O(n+m) only on first call or after modification)
         connectivity = architecture._get_connectivity_sets()
@@ -380,18 +480,15 @@ class ActionSpace:
         return isolated
 
     def _is_valid_connection(self, architecture: NeuralArchitecture, source_id: int, target_id: int) -> bool:
-        """Check if a connection between two neurons is valid.
+        """Checks if a connection between two neurons is valid.
 
-        Rules enforced:
-        - Output neurons cannot be sources.
-        - Input neurons cannot be targets.
-        - Disallow connections where the source is in a strictly higher topological layer
-          than the target (this prevents backward edges / cycles).
-        - Allow connections involving isolated neurons (layer -1) because these actions
-          are used to de-/re-isolate neurons (we want to allow de-isolation).
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+            source_id (int): The ID of the source neuron.
+            target_id (int): The ID of the target neuron.
 
-        This reduces the need for an expensive cycle-check while still permitting
-        de-isolation actions to proceed.
+        Returns:
+            bool: True if the connection is valid, False otherwise.
         """
         neurons = architecture.neurons
         source_type = neurons[source_id].neuron_type
@@ -427,7 +524,14 @@ class ActionSpace:
         return True
 
     def get_action_primitives(self, architecture: NeuralArchitecture):
-        """Get cached action primitives for fast scoring and membership tests"""
+        """Gets cached action primitives for fast scoring and membership tests.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            Dict: The cached action primitives.
+        """
         try:
             sig = architecture.compute_signature()
         except Exception:
@@ -441,7 +545,7 @@ class ActionSpace:
             return self._full_action_primitives.get(sig, None)
 
     def clear_cache(self):
-        """Clear cached action primitives and release memory held by numpy arrays/lists."""
+        """Clears the cached action primitives."""
         try:
             self._full_action_primitives.clear()
         except Exception:

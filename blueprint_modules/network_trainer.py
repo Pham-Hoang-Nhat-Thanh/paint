@@ -7,9 +7,39 @@ from torch.amp import autocast
 from torch.amp import GradScaler
 
 class QuickTrainer:
-    """Proper training and evaluation using the graph-based networks"""
+    """Handles training and evaluation of graph-based neural networks.
+
+    This class provides a streamlined process for training a `GraphNeuralNetwork`
+    model based on a given `NeuralArchitecture`.
+
+    Attributes:
+        train_loader: DataLoader for the training dataset.
+        test_loader: DataLoader for the test dataset.
+        device (str): The device to run on ('cpu' or 'cuda').
+        max_epochs (int): The maximum number of epochs for training.
+        use_mixed_precision (bool): Whether to use mixed precision training.
+        eval_samples (int, optional): The number of samples to use for
+            evaluation. Defaults to None.
+        scaler (GradScaler, optional): The gradient scaler for mixed precision
+            training. Defaults to None.
+        model (GraphNeuralNetwork, optional): The neural network model.
+            Defaults to None.
+    """
 
     def __init__(self, train_loader, test_loader, device='cpu', max_epochs=5, use_mixed_precision=False, eval_samples=None):
+        """Initializes the QuickTrainer.
+
+        Args:
+            train_loader: DataLoader for the training dataset.
+            test_loader: DataLoader for the test dataset.
+            device (str): The device to run on. Defaults to 'cpu'.
+            max_epochs (int): The maximum number of epochs for training.
+                Defaults to 5.
+            use_mixed_precision (bool): Whether to use mixed precision training.
+                Defaults to False.
+            eval_samples (int, optional): The number of samples to use for
+                evaluation. Defaults to None.
+        """
         self.train_loader = train_loader
         self.test_loader = test_loader
         self.device = device
@@ -38,17 +68,13 @@ class QuickTrainer:
         self.model = None
 
     def _move_loader_dataset_to_device(self, loader) -> bool:
-        """Attempt to move an entire DataLoader.dataset to `self.device`.
+        """Attempts to move an entire DataLoader dataset to the specified device.
 
-        Returns True if the dataset was moved (best-effort), False otherwise.
+        Args:
+            loader: The DataLoader whose dataset to move.
 
-        Handles common dataset types:
-        - torch.utils.data.TensorDataset (has `.tensors`)
-        - torchvision-like datasets with `.data` and `.targets` attributes
-        Falls back silently when it cannot move the underlying data.
-        
-        Note: Does not move to CUDA if DataLoader uses multiple workers (num_workers > 0),
-        as CUDA tensors cannot be shared across processes.
+        Returns:
+            bool: True if the dataset was moved, False otherwise.
         """
         dataset = getattr(loader, 'dataset', None)
         if dataset is None:
@@ -96,12 +122,16 @@ class QuickTrainer:
         return False
     
     def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
-        """Train the graph-based network and return (final_accuracy, last_epoch_avg_loss)
+        """Trains and evaluates the graph-based network.
 
-        Supports fractional epochs (e.g., 2.5 epochs = 2 full epochs + half of the third)
+        This method supports fractional epochs.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture to train.
 
         Returns:
-            (accuracy, loss)
+            Tuple[float, float]: A tuple containing the final accuracy and the
+                average loss of the last epoch.
         """
         try:
             # Convert architecture to executable model
@@ -222,9 +252,15 @@ class QuickTrainer:
             return 0.0, 0.0
     
     def evaluate_model(self, model: GraphNeuralNetwork) -> float:
-        """Evaluate the trained model on test data
-        
-        If self.eval_samples is set, only evaluates on first N samples for speed.
+        """Evaluates the trained model on test data.
+
+        If `self.eval_samples` is set, only evaluates on the first N samples.
+
+        Args:
+            model (GraphNeuralNetwork): The trained model.
+
+        Returns:
+            float: The accuracy of the model.
         """
         model.eval()
         correct = 0
@@ -262,12 +298,23 @@ class QuickTrainer:
         return (correct / total if total > 0 else 0.0), avg_loss
 
     def update_architecture(self, architecture: NeuralArchitecture):
-        """Update the model with a new architecture"""
+        """Updates the model with a new architecture.
+
+        Args:
+            architecture (NeuralArchitecture): The new neural architecture.
+        """
         if self.model is None:
             self.model = GraphNeuralNetwork(architecture, device=self.device)
         else:
             self.model.update_architecture(architecture)
 
     def architecture_to_pytorch(self, architecture: NeuralArchitecture) -> GraphNeuralNetwork:
-        """Convert architecture to executable PyTorch model"""
+        """Converts an architecture to an executable PyTorch model.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+
+        Returns:
+            GraphNeuralNetwork: The executable PyTorch model.
+        """
         return GraphNeuralNetwork(architecture)

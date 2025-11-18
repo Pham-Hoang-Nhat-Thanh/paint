@@ -14,12 +14,47 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 class UnifiedPolicyValueNetwork(nn.Module):
-    """Unified network that outputs both policy and value predictions"""
+    """Unified network that outputs both policy and value predictions.
+
+    This network uses a graph transformer to encode the neural architecture
+    and then outputs a policy (logits for actions) and a value (predicted
+    performance).
+
+    Attributes:
+        hidden_dim (int): The dimensionality of the hidden features.
+        max_neurons (int): The maximum number of neurons.
+        num_actions (int): The number of action types.
+        num_activations (int): The number of activation types.
+        phase_embedding (nn.Embedding): Embedding layer for the evolutionary phase.
+        graph_transformer (GraphTransformer): The graph transformer backbone.
+        shared_backbone (nn.Sequential): Shared layers after the transformer.
+        action_type_head (nn.Linear): Head for predicting the action type.
+        conditional_source_heads (nn.ModuleDict): Heads for predicting the
+            source neuron, conditioned on the action type.
+        conditional_target_heads (nn.ModuleDict): Heads for predicting the
+            target neuron, conditioned on the source neuron.
+        conditional_activation_heads (nn.ModuleDict): Heads for predicting the
+            activation function, conditioned on the action type.
+        source_encoder (nn.Sequential): Encoder for source neuron features.
+        value_head (nn.Linear): Head for predicting the value.
+    """
     
     def __init__(self, node_feature_dim: int, hidden_dim: int = 128,
                  max_neurons: int = 1000, num_actions: int = 5,
                  num_activations: int = 4, self_attention_heads: int = 8,
                  transformer_layers: int = 3, num_phases: int = 3):
+        """Initializes the UnifiedPolicyValueNetwork.
+
+        Args:
+            node_feature_dim (int): Dimensionality of the node features.
+            hidden_dim (int): Dimensionality of the hidden features.
+            max_neurons (int): Maximum number of neurons.
+            num_actions (int): Number of action types.
+            num_activations (int): Number of activation types.
+            self_attention_heads (int): Number of attention heads.
+            transformer_layers (int): Number of transformer layers.
+            num_phases (int): Number of evolutionary phases.
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.max_neurons = max_neurons
@@ -94,6 +129,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
         self._initialize_weights()
     
     def _initialize_weights(self):
+        """Initializes the weights of the network."""
         for module in self.modules():
             if isinstance(module, nn.Linear):
                 nn.init.xavier_uniform_(module.weight)
@@ -101,6 +137,16 @@ class UnifiedPolicyValueNetwork(nn.Module):
                     nn.init.constant_(module.bias, 0)
     
     def forward(self, graph_data: Dict, phase: int) -> Dict[str, torch.Tensor]:
+        """Forward pass of the network.
+
+        Args:
+            graph_data (Dict): A dictionary containing the graph data.
+            phase (int): The current evolutionary phase.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the policy and
+                value predictions.
+        """
         num_graphs = graph_data.get('num_graphs', 1)
         model_device = next(self.parameters()).device
         
@@ -159,9 +205,24 @@ class UnifiedPolicyValueNetwork(nn.Module):
             'value': self.value_head(shared_features)
         }
 class ActionManager:
-    """Manages action selection with masking, validation, and conditional distributions"""
+    """Manages action selection with masking, validation, and conditional distributions.
+
+    Attributes:
+        max_neurons (int): The maximum number of neurons.
+        action_space (ActionSpace): The action space.
+        exploration_boost (float): The exploration boost factor.
+    """
 
     def __init__(self, max_neurons: int = 100, action_space: ActionSpace = None, exploration_boost: float = 0.5):
+        """Initializes the ActionManager.
+
+        Args:
+            max_neurons (int): The maximum number of neurons. Defaults to 100.
+            action_space (ActionSpace, optional): The action space.
+                Defaults to None.
+            exploration_boost (float): The exploration boost factor.
+                Defaults to 0.5.
+        """
         self.max_neurons = max_neurons
         self.action_space = action_space
         self.exploration_boost = exploration_boost
@@ -174,7 +235,14 @@ class ActionManager:
         self._expand_step_cache = {}
 
     def _get_action_type_name(self, action_type: int) -> str:
-        """Convert action type index to string name"""
+        """Converts an action type index to its string name.
+
+        Args:
+            action_type (int): The action type index.
+
+        Returns:
+            str: The name of the action type.
+        """
         action_names = {
             0: 'add_neuron',
             1: 'remove_neuron', 
@@ -185,7 +253,16 @@ class ActionManager:
         return action_names.get(action_type, 'add_neuron')
     
     def _compute_priors_vectorized(self, policy_output: Dict, actions: List[Action], masks: Dict) -> torch.Tensor:
-        """Compute priors using correct conditional probabilities in vectorized form"""
+        """Computes priors using correct conditional probabilities in vectorized form.
+
+        Args:
+            policy_output (Dict): The output of the policy-value network.
+            actions (List[Action]): A list of actions.
+            masks (Dict): A dictionary of action masks.
+
+        Returns:
+            torch.Tensor: The computed priors.
+        """
         if not actions:
             return torch.tensor([], device=next(iter(policy_output.values())).device)
 
@@ -364,7 +441,18 @@ class ActionManager:
 
     def _compute_conditional_logits(self, policy_output: Dict, action_type: ActionType, 
                                   source_neuron: int = None, precomputed_source_features: torch.Tensor = None) -> Dict[str, torch.Tensor]:
-        """Compute conditional logits given action type and optional source"""
+        """Computes conditional logits given an action type and optional source neuron.
+
+        Args:
+            policy_output (Dict): The output of the policy-value network.
+            action_type (ActionType): The type of action.
+            source_neuron (int, optional): The source neuron. Defaults to None.
+            precomputed_source_features (torch.Tensor, optional): Precomputed
+                source features. Defaults to None.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary of conditional logits.
+        """
         shared_features = policy_output['shared_features']
         action_type_name = self._get_action_type_name(action_type.value)
         
@@ -427,7 +515,15 @@ class ActionManager:
         return result
     
     def get_action_masks(self, architecture: NeuralArchitecture, phase: int) -> Dict[str, torch.Tensor]:
-        """Get masks for invalid actions"""
+        """Gets masks for invalid actions.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+            phase (int): The current evolutionary phase.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary of action masks.
+        """
         neurons = architecture.neurons
         
         # Optimized: filter hidden neurons once and cache neuron type info
@@ -501,7 +597,16 @@ class ActionManager:
         }
     
     def _prepare_logits(self, logits_full: torch.Tensor, tensor_size: int, mask: torch.Tensor) -> torch.Tensor:
-        """Helper to pad/truncate logits and apply mask - optimized"""
+        """Pads/truncates logits and applies a mask.
+
+        Args:
+            logits_full (torch.Tensor): The full logits tensor.
+            tensor_size (int): The target tensor size.
+            mask (torch.Tensor): The mask to apply.
+
+        Returns:
+            torch.Tensor: The prepared logits.
+        """
         device = logits_full.device
         is_batched = logits_full.dim() > 1
         
@@ -529,7 +634,17 @@ class ActionManager:
 
     def select_action(self, policy_output: Dict, architecture: NeuralArchitecture,
                      exploration: bool = True, use_policy: bool = True) -> Action:
-        """Select action using policy output with masking and conditional distributions"""
+        """Selects an action using the policy output with masking and conditional distributions.
+
+        Args:
+            policy_output (Dict): The output of the policy-value network.
+            architecture (NeuralArchitecture): The neural architecture.
+            exploration (bool): Whether to use exploration. Defaults to True.
+            use_policy (bool): Whether to use the policy. Defaults to True.
+
+        Returns:
+            Action: The selected action.
+        """
 
         masks_dict = self.get_action_masks(architecture, phase=0)  # phase can be adjusted as needed
         masks = masks_dict.copy()

@@ -53,18 +53,16 @@ PAINT replaces traditional evolutionary search with a neural-guided planning app
 
 	```bash
 	pip install -r requirements.txt
-	# Or, for minimal setup:
-	pip install torch torchvision numpy
 	```
 
 3. **Run the entry script:**
 
 	```bash
-	python experiment_modules/main.py
+	python -m experiment_modules.main
 	```
 
 	- The code will auto-detect CUDA and use GPU if available.
-	- Checkpoints and logs are saved in `paint/checkpoints/` and `paint/logs/`.
+	- Checkpoints and logs are saved in `checkpoints/` and `logs/`.
 
 ## Configuration
 
@@ -90,9 +88,11 @@ Experience replay uses prioritized sampling and supports checkpointing and buffe
 ```python
 from experiment_modules.architecture_trainer import ArchitectureTrainer
 from experiment_modules.config import OverallConfig
+from experiment_modules.main import load_mnist_data
 
 config = OverallConfig()
-trainer = ArchitectureTrainer(config)
+train_loader, test_loader = load_mnist_data(config.batch_size)
+trainer = ArchitectureTrainer(config, train_loader, test_loader)
 history = trainer.run_training()
 ```
 

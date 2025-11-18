@@ -22,9 +22,24 @@ if torch.cuda.is_available():
         pass
 
 class PositionalEncoding(nn.Module):
-    """Positional encoding for neuron layer positions"""
+    """Positional encoding for neuron layer positions.
+
+    This module adds positional information to the node features based on their
+    normalized layer positions within the neural architecture. It uses a
+    sinusoidal encoding scheme.
+
+    Attributes:
+        hidden_dim (int): The dimensionality of the hidden features.
+        pe (torch.Tensor): The pre-calculated positional encoding matrix.
+    """
     
     def __init__(self, hidden_dim, max_positions=1000):
+        """Initializes the PositionalEncoding module.
+
+        Args:
+            hidden_dim (int): The dimensionality of the hidden features.
+            max_positions (int): The maximum number of positions to encode.
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
         
@@ -41,9 +56,16 @@ class PositionalEncoding(nn.Module):
         self.register_buffer('pe', pe)
     
     def forward(self, node_features, layer_positions):
-        """
-        node_features: [batch_size, num_nodes, hidden_dim]
-        layer_positions: [batch_size, num_nodes] normalized positions (0-1)
+        """Adds positional encoding to node features.
+
+        Args:
+            node_features (torch.Tensor): The input node features of shape
+                [batch_size, num_nodes, hidden_dim].
+            layer_positions (torch.Tensor): The normalized layer positions of
+                nodes (0-1) of shape [batch_size, num_nodes].
+
+        Returns:
+            torch.Tensor: The node features with added positional encoding.
         """
         # Convert layer positions to indices (0-999)
         pos_indices = (layer_positions * 999).long().clamp(0, 999)
@@ -54,14 +76,38 @@ class PositionalEncoding(nn.Module):
         return node_features + pos_encoding
 
 class EdgeAwareAttention(nn.Module):
-    """Multi-head attention with edge feature integration
+    """Multi-head attention with edge feature integration.
     
-    Supports both dense masked attention and sparse edge-indexed attention via torch-scatter.
-    Automatically selects the more efficient implementation based on graph density.
+    Supports both dense masked attention and sparse edge-indexed attention via
+    torch-scatter. Automatically selects the more efficient implementation
+    based on graph density.
+
+    Attributes:
+        hidden_dim (int): The dimensionality of the hidden features.
+        num_heads (int): The number of attention heads.
+        head_dim (int): The dimensionality of each attention head.
+        use_sparse_attention (bool): Whether to use sparse attention.
+        has_torch_scatter (bool): Whether torch_scatter is available.
+        q_linear (nn.Linear): Linear layer for queries.
+        k_linear (nn.Linear): Linear layer for keys.
+        v_linear (nn.Linear): Linear layer for values.
+        edge_encoder (nn.Linear): Linear layer for edge features.
+        output_linear (nn.Linear): Linear layer for the output.
+        dropout (nn.Dropout): Dropout layer.
+        layer_norm (nn.LayerNorm): Layer normalization.
+        scale (float): The attention scaling factor.
     """
 
     def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1, 
                  use_sparse_attention: bool = True):
+        """Initializes the EdgeAwareAttention module.
+
+        Args:
+            hidden_dim (int): The dimensionality of the hidden features.
+            num_heads (int): The number of attention heads.
+            dropout (float): The dropout rate.
+            use_sparse_attention (bool): Whether to use sparse attention.
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
@@ -91,7 +137,15 @@ class EdgeAwareAttention(nn.Module):
         self.scale = 1.0 / math.sqrt(self.head_dim)
         
     def create_adjacency_mask(self, edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
-        """Create adjacency matrix mask from edge indices"""
+        """Create adjacency matrix mask from edge indices.
+
+        Args:
+            edge_index (torch.Tensor): The edge indices of shape [2, num_edges].
+            num_nodes (int): The number of nodes in the graph.
+
+        Returns:
+            torch.Tensor: The adjacency matrix mask.
+        """
         mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
         mask[edge_index[0], edge_index[1]] = True
         return mask
@@ -104,11 +158,16 @@ class EdgeAwareAttention(nn.Module):
         Uses scatter_softmax for O(E) complexity softmax computation.
         Advanced indexing for aggregation (memory efficient).
 
-        Input shapes (after reshaping to multi-head):
-        - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
-        - edge_index: [2, num_edges]
+        Args:
+            Q (torch.Tensor): Queries of shape [batch_size, num_heads, num_nodes, head_dim].
+            K (torch.Tensor): Keys of shape [batch_size, num_heads, num_nodes, head_dim].
+            V (torch.Tensor): Values of shape [batch_size, num_heads, num_nodes, head_dim].
+            edge_index (torch.Tensor): Edge indices of shape [2, num_edges].
+            num_nodes (int): The number of nodes in the graph.
 
-        Returns: [batch_size, num_heads, num_nodes, head_dim]
+        Returns:
+            torch.Tensor: The output of the attention mechanism of shape
+                [batch_size, num_heads, num_nodes, head_dim].
         """
         batch_size, num_heads, _, head_dim = Q.shape
         device = Q.device
@@ -154,10 +213,21 @@ class EdgeAwareAttention(nn.Module):
  
     def _sparse_attention_pure_pytorch(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
                                        edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
-        """Sparse edge-indexed attention using pure PyTorch (no torch_scatter dependency).
+        """Sparse edge-indexed attention using pure PyTorch.
         
         Slower than torch_scatter but avoids external dependency.
         Groups edges by source node and computes softmax per group.
+
+        Args:
+            Q (torch.Tensor): Queries of shape [batch_size, num_heads, num_nodes, head_dim].
+            K (torch.Tensor): Keys of shape [batch_size, num_heads, num_nodes, head_dim].
+            V (torch.Tensor): Values of shape [batch_size, num_heads, num_nodes, head_dim].
+            edge_index (torch.Tensor): Edge indices of shape [2, num_edges].
+            num_nodes (int): The number of nodes in the graph.
+
+        Returns:
+            torch.Tensor: The output of the attention mechanism of shape
+                [batch_size, num_heads, num_nodes, head_dim].
         """
         batch_size, num_heads, _, head_dim = Q.shape
         device = Q.device
@@ -205,13 +275,19 @@ class EdgeAwareAttention(nn.Module):
         return attn_output
     
     def forward(self, node_embeddings: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """
-        node_embeddings: [batch_size, num_nodes, hidden_dim]
-        edge_index: [2, num_edges]
+        """Forward pass for EdgeAwareAttention.
         
         Automatically selects between sparse (torch_scatter) and dense masked attention.
         Sparse attention computes only over edges (O(E) complexity).
         Dense attention computes full QK^T and masks non-edges (O(N^2) complexity).
+
+        Args:
+            node_embeddings (torch.Tensor): Node embeddings of shape
+                [batch_size, num_nodes, hidden_dim].
+            edge_index (torch.Tensor): Edge indices of shape [2, num_edges].
+
+        Returns:
+            torch.Tensor: The output of the attention mechanism.
         """
         batch_size, num_nodes, hidden_dim = node_embeddings.shape
         
@@ -257,13 +333,18 @@ class EdgeAwareAttention(nn.Module):
     
     def _dense_attention_masked(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
                                 edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
-        """Dense masked attention (original implementation): computes full QK^T and masks non-edges.
+        """Dense masked attention: computes full QK^T and masks non-edges.
         
-        Input shapes (after reshaping to multi-head):
-        - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
-        - edge_index: [2, num_edges]
+        Args:
+            Q (torch.Tensor): Queries of shape [batch_size, num_heads, num_nodes, head_dim].
+            K (torch.Tensor): Keys of shape [batch_size, num_heads, num_nodes, head_dim].
+            V (torch.Tensor): Values of shape [batch_size, num_heads, num_nodes, head_dim].
+            edge_index (torch.Tensor): Edge indices of shape [2, num_edges].
+            num_nodes (int): The number of nodes in the graph.
         
-        Returns: [batch_size, num_heads, num_nodes, head_dim]
+        Returns:
+            torch.Tensor: The output of the attention mechanism of shape
+                [batch_size, num_heads, num_nodes, head_dim].
         """
         device = Q.device
         
@@ -294,9 +375,24 @@ class EdgeAwareAttention(nn.Module):
         return attn_output
 
 class HierarchicalPooling(nn.Module):
-    """Hierarchical attention pooling for graph-level representation"""
+    """Hierarchical attention pooling for graph-level representation.
+
+    This module computes a graph-level embedding by pooling node and edge
+    information using attention mechanisms.
+
+    Attributes:
+        hidden_dim (int): The dimensionality of the hidden features.
+        node_attention (nn.Sequential): Attention mechanism for nodes.
+        structure_attention (nn.Sequential): Attention mechanism for edges.
+        global_context (nn.Parameter): A learnable global context vector.
+    """
     
     def __init__(self, hidden_dim: int):
+        """Initializes the HierarchicalPooling module.
+
+        Args:
+            hidden_dim (int): The dimensionality of the hidden features.
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
         
@@ -318,10 +414,16 @@ class HierarchicalPooling(nn.Module):
         self.global_context = nn.Parameter(torch.randn(hidden_dim))
         
     def forward(self, node_embeddings: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        """
-        node_embeddings: [batch_size, num_nodes, hidden_dim]
-        edge_index: [2, num_edges]
-        Returns: [batch_size, hidden_dim * 2] (concatenated node and structure embeddings)
+        """Forward pass for HierarchicalPooling.
+
+        Args:
+            node_embeddings (torch.Tensor): Node embeddings of shape
+                [batch_size, num_nodes, hidden_dim].
+            edge_index (torch.Tensor): Edge indices of shape [2, num_edges].
+
+        Returns:
+            torch.Tensor: The global graph embedding of shape
+                [batch_size, hidden_dim * 2].
         """
         batch_size, num_nodes, hidden_dim = node_embeddings.shape
         
@@ -367,10 +469,36 @@ class HierarchicalPooling(nn.Module):
         return global_embedding
 
 class GraphTransformer(nn.Module):
-    """Complete Graph Transformer for neural architecture encoding"""
+    """Complete Graph Transformer for neural architecture encoding.
+
+    This module combines edge-aware attention layers, feed-forward networks,
+    and hierarchical pooling to create a comprehensive graph transformer model.
+
+    Attributes:
+        hidden_dim (int): The dimensionality of the hidden features.
+        num_layers (int): The number of transformer layers.
+        use_sparse_attention (bool): Whether to use sparse attention.
+        input_projection (nn.Linear): Linear layer for input projection.
+        positional_encoding (PositionalEncoding): Positional encoding module.
+        layers (nn.ModuleList): List of EdgeAwareAttention layers.
+        layer_norms (nn.ModuleList): List of LayerNorm layers.
+        ffns (nn.ModuleList): List of feed-forward networks.
+        pooling (HierarchicalPooling): Hierarchical pooling module.
+        dropout (nn.Dropout): Dropout layer.
+    """
     
     def __init__(self, node_feature_dim: int, hidden_dim: int = 128, num_heads: int = 8, 
                  num_layers: int = 3, dropout: float = 0.1, use_sparse_attention: bool = True):
+        """Initializes the GraphTransformer module.
+
+        Args:
+            node_feature_dim (int): The dimensionality of the node features.
+            hidden_dim (int): The dimensionality of the hidden features.
+            num_heads (int): The number of attention heads.
+            num_layers (int): The number of transformer layers.
+            dropout (float): The dropout rate.
+            use_sparse_attention (bool): Whether to use sparse attention.
+        """
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
@@ -411,24 +539,17 @@ class GraphTransformer(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, graph_data: Dict) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass - handles both single and batched graphs.
+        """Forward pass for the GraphTransformer.
         
-        For single graphs (from MCTS/eval): Works as before
-        For batched graphs (from training): Processes concatenated graph as single batch
-        
-        graph_data: {
-            'node_features': [1, num_nodes, node_feature_dim],
-            'edge_index': [2, num_edges], 
-            'edge_weights': [num_edges],
-            'layer_positions': [1, num_nodes]
-            'batch': [total_nodes] - optional, for batching info (ignored here)
-            'num_graphs': int - optional, for batching info (ignored here)
-        }
-        
+        Handles both single and batched graphs.
+
+        Args:
+            graph_data (Dict): A dictionary containing graph data with keys:
+                'node_features', 'edge_index', 'layer_positions'.
+
         Returns: 
-            global_embedding: [1, hidden_dim * 2]
-            node_embeddings: [1, num_nodes, hidden_dim]
+            Tuple[torch.Tensor, torch.Tensor]: A tuple containing the
+                global graph embedding and the final node embeddings.
         """
         node_features = graph_data['node_features']
         edge_index = graph_data['edge_index']

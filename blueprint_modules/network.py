@@ -8,11 +8,13 @@ import random
 import copy
 
 class NeuronType(Enum):
+    """Enumeration of neuron types."""
     INPUT = "input"
     HIDDEN = "hidden" 
     OUTPUT = "output"
 
 class ActivationType(Enum):
+    """Enumeration of activation function types."""
     RELU = "relu"
     SIGMOID = "sigmoid"
     TANH = "tanh"
@@ -20,6 +22,15 @@ class ActivationType(Enum):
 
 @dataclass
 class Neuron:
+    """Represents a neuron in the neural architecture.
+
+    Attributes:
+        id (int): The unique identifier of the neuron.
+        neuron_type (NeuronType): The type of the neuron.
+        activation (ActivationType): The activation function of the neuron.
+        layer_position (float): The normalized position of the neuron's layer.
+        bias (float): The bias of the neuron.
+    """
     id: int
     neuron_type: NeuronType
     activation: ActivationType
@@ -27,7 +38,11 @@ class Neuron:
     bias: float = 0.0
     
     def to_feature_vector(self):
-        """Convert neuron to feature vector for graph representation"""
+        """Converts the neuron to a feature vector for graph representation.
+
+        Returns:
+            List[float]: The feature vector representation of the neuron.
+        """
         type_encoding = {
             NeuronType.INPUT: [1, 0, 0],
             NeuronType.HIDDEN: [0, 1, 0], 
@@ -43,15 +58,31 @@ class Neuron:
 
 @dataclass 
 class Connection:
+    """Represents a connection between two neurons.
+
+    Attributes:
+        source_id (int): The ID of the source neuron.
+        target_id (int): The ID of the target neuron.
+        weight (float): The weight of the connection.
+        enabled (bool): Whether the connection is enabled.
+    """
     source_id: int
     target_id: int
     weight: float
     enabled: bool = True
 
 class NeuralArchitecture:
-    """Graph-based representation of a neural network"""
+    """A graph-based representation of a neural network.
+
+    Attributes:
+        neurons (Dict[int, Neuron]): A dictionary of neurons in the architecture.
+        connections (List[Connection]): A list of connections in the architecture.
+        next_neuron_id (int): The ID to be assigned to the next new neuron.
+        performance_metrics (Dict): A dictionary of performance metrics.
+    """
     
     def __init__(self):
+        """Initializes the NeuralArchitecture."""
         self.neurons: Dict[int, Neuron] = {}
         self.connections: List[Connection] = []
         self.next_neuron_id = 0
@@ -68,7 +99,7 @@ class NeuralArchitecture:
         self._initialize_mnist_base()
     
     def _initialize_mnist_base(self):
-        """Create initial 784 input + 10 output neurons for MNIST"""
+        """Creates the initial 784 input and 10 output neurons for MNIST."""
         # Initialize connection set for O(1) duplicate checking
         self._connection_set = set()
         
@@ -105,14 +136,20 @@ class NeuralArchitecture:
             self.add_connection(source_hidden_id, output_id, weight=0.1)
         
     def add_neuron(self, neuron_type: NeuronType, activation: ActivationType, layer_position: Optional[float] = None) -> int:
-        """Add a new neuron and return its ID.
+        """Adds a new neuron and returns its ID.
 
-        If `layer_position` is None the neuron is inserted with a safe placeholder
-        position and the topology is recomputed to derive a proper normalized
-        float position for all neurons (via `sync_layer_positions_from_topology`).
+        If `layer_position` is None, the neuron is inserted with a safe
+        placeholder position and the topology is recomputed to derive a proper
+        normalized float position for all neurons.
 
-        This ensures callers can create neurons without explicitly choosing a
-        float position and still obtain consistent positional encodings.
+        Args:
+            neuron_type (NeuronType): The type of the neuron.
+            activation (ActivationType): The activation function of the neuron.
+            layer_position (Optional[float]): The normalized position of the
+                neuron's layer. Defaults to None.
+
+        Returns:
+            int: The ID of the new neuron.
         """
         neuron_id = self.next_neuron_id
         # Use a sensible placeholder while the neuron exists in the graph so
@@ -145,7 +182,16 @@ class NeuralArchitecture:
         return neuron_id
     
     def add_connection(self, source_id: int, target_id: int, weight: float = 0.1) -> bool:
-        """Add connection between neurons if valid"""
+        """Adds a connection between neurons if it is valid.
+
+        Args:
+            source_id (int): The ID of the source neuron.
+            target_id (int): The ID of the target neuron.
+            weight (float): The weight of the connection.
+
+        Returns:
+            bool: True if the connection was added, False otherwise.
+        """
         if source_id not in self.neurons or target_id not in self.neurons:
             return False
         
@@ -171,7 +217,14 @@ class NeuralArchitecture:
         return True
     
     def remove_neuron(self, neuron_id: int) -> bool:
-        """Remove a neuron and all its connections"""
+        """Removes a neuron and all its connections.
+
+        Args:
+            neuron_id (int): The ID of the neuron to remove.
+
+        Returns:
+            bool: True if the neuron was removed, False otherwise.
+        """
         if neuron_id not in self.neurons:
             return False
         
@@ -214,7 +267,15 @@ class NeuralArchitecture:
         return True
     
     def remove_connection(self, source_id: int, target_id: int) -> bool:
-        """Remove a specific connection"""
+        """Removes a specific connection.
+
+        Args:
+            source_id (int): The ID of the source neuron.
+            target_id (int): The ID of the target neuron.
+
+        Returns:
+            bool: True if the connection was removed, False otherwise.
+        """
         conn_key = (source_id, target_id)
         
         # Update connection set if it exists
@@ -240,15 +301,13 @@ class NeuralArchitecture:
         return len(self.connections) < initial_count
     
     def compute_signature(self) -> str:
-        """Compute deterministic canonical signature of architecture for transposition detection.
-        
-        This signature is invariant to neuron ID renumbering but captures the graph structure,
-        neuron types, activations, and layer positions. Two architectures with the same
-        signature are considered identical states in MCTS.
-        
-        The signature format: <neuron_part>||<connection_part>
-        - neuron_part: sorted list of (type, activation, layer_pos) tuples
-        - connection_part: sorted list of (src_idx, tgt_idx) pairs where idx is position in sorted neuron list
+        """Computes a deterministic canonical signature of the architecture.
+
+        This signature is invariant to neuron ID renumbering but captures the
+        graph structure, neuron types, activations, and layer positions.
+
+        Returns:
+            str: The signature of the architecture.
         """
         # Sort neurons by (neuron_type, layer_position, activation, id) for canonical ordering
         sorted_neurons = sorted(
@@ -285,7 +344,11 @@ class NeuralArchitecture:
         return f"{neuron_sig}||{conn_sig}"
     
     def to_graph_representation(self) -> Dict:
-        """Convert architecture to graph format for transformer (optimized)"""
+        """Converts the architecture to a graph format for the transformer.
+
+        Returns:
+            Dict: The graph representation of the architecture.
+        """
         node_ids = self._get_sorted_neuron_ids()
         id_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
         neurons = self.neurons
@@ -329,11 +392,7 @@ class NeuralArchitecture:
         }
 
     def clear_caches(self):
-        """Clear transient caches to free CPU memory held by this architecture.
-
-        This is safe to call when the architecture is no longer needed for
-        immediate computation (e.g., when offloading or dropping MCTS nodes).
-        """
+        """Clears transient caches to free CPU memory."""
         try:
             self._cached_legal_action_mask_cpu = None
         except Exception:
@@ -372,13 +431,21 @@ class NeuralArchitecture:
             pass
     
     def _get_sorted_neuron_ids(self) -> List[int]:
-        """Get sorted neuron IDs (cached) - O(1) after first call, O(n log n) on first call"""
+        """Gets sorted neuron IDs (cached).
+
+        Returns:
+            List[int]: A sorted list of neuron IDs.
+        """
         if self._sorted_neuron_ids is None:
             self._sorted_neuron_ids = sorted(self.neurons.keys())
         return self._sorted_neuron_ids
     
     def _get_connectivity_sets(self) -> Dict[str, set]:
-        """Get connectivity sets (has_incoming, has_outgoing) - cached and reused"""
+        """Gets connectivity sets (cached).
+
+        Returns:
+            Dict[str, set]: A dictionary of connectivity sets.
+        """
         if self._connectivity_cache is None:
             has_incoming = set()
             has_outgoing = set()
@@ -389,21 +456,10 @@ class NeuralArchitecture:
         return self._connectivity_cache
     
     def compute_topological_layers(self) -> Dict[int, int]:
-        """Compute deterministic topological layers based on graph connectivity.
-        
-        Layer assignment with proper handling of isolated neurons:
-        - Input neurons: layer 0 (no incoming connections)
-        - Layer k (k > 0): neurons where max(layer_indices of incoming neurons) == k-1
-        - Isolated HIDDEN neurons: layer -1 (no incoming OR no outgoing connections, by YOUR DEFINITION)
-        
-        CRITICAL: Isolated classification happens AFTER computing layers based on connectivity.
-        This ensures:
-        1. Neurons with only incoming connections get proper layers based on their sources
-        2. When an isolated neuron gains outgoing connections, it can be reassigned to a proper layer
-        3. Outgoing connections from such neurons go to higher layers (enforced by action mask)
-        
+        """Computes deterministic topological layers based on graph connectivity.
+
         Returns:
-            Dict[neuron_id, layer] where layer is int (-1 for isolated hidden neurons, 0+ for connected)
+            Dict[int, int]: A dictionary mapping neuron IDs to layer numbers.
         """
         # Initialize cache attribute if it doesn't exist (for backward compatibility with deserialized objects)
         if not hasattr(self, '_topological_layers_cache'):
@@ -472,16 +528,14 @@ class NeuralArchitecture:
         return layers
     
     def recalculate_affected_layers(self, affected_neuron_ids: set) -> Dict[int, int]:
-        """Efficiently recalculate layers for affected neurons only (local update).
-        
-        This is more efficient than full recalculation when only a few neurons are changed.
-        Used after add_connection, remove_connection, or remove_neuron to update affected neurons.
-        
+        """Efficiently recalculates layers for affected neurons only.
+
         Args:
-            affected_neuron_ids: set of neuron IDs whose layers may have changed
-            
+            affected_neuron_ids (set): A set of neuron IDs whose layers may
+                have changed.
+
         Returns:
-            Updated layers dict (full state)
+            Dict[int, int]: The updated layers dictionary.
         """
         # Initialize cache attribute if it doesn't exist (for backward compatibility)
         if not hasattr(self, '_topological_layers_cache'):
@@ -556,25 +610,13 @@ class NeuralArchitecture:
         return layers
     
     def sync_layer_positions_from_topology(self, center_for_isolated: float = 0.5) -> None:
-        """Synchronize neuron layer_position floats (0..1) with computed topological integer layers.
-        
-        This maps topological layers to normalized float positions:
-        - INPUT neurons: layer 0 -> position 0.0 (FIXED, never changed)
-        - OUTPUT neurons: highest layer -> position 1.0 (FIXED, never changed)
-        - HIDDEN neurons: intermediate layers mapped proportionally to (0, 1), with per-neuron jitter
-        - Isolated HIDDEN neurons (layer -1): fixed at center_for_isolated (default 0.5)
-        
-        CRITICAL FIX: Within each topological layer, add deterministic per-neuron jitter based on ID
-        to break symmetry. Without this, all neurons in the same layer get identical positions,
-        and the graph transformer can't distinguish between them, preventing effective policy learning.
-        
-        Call this after structural changes (add/remove connections, remove neurons) to keep
-        layer_position consistent with the graph topology. Without this, layer_position can
-        drift out of sync with the actual computed layers, breaking positional encodings and
-        layout computations.
-        
+        """Synchronizes neuron layer positions with the computed topology.
+
+        This method maps topological layers to normalized float positions.
+
         Args:
-            center_for_isolated: float in [0, 1], position to assign isolated hidden neurons (default 0.5)
+            center_for_isolated (float): The position to assign to isolated
+                hidden neurons. Defaults to 0.5.
         """
         # Get current topological layer assignments
         layers = self.compute_topological_layers()
@@ -652,25 +694,45 @@ class NeuralArchitecture:
                         neuron.layer_position = base_pos
     
     def get_layer_for_neuron(self, neuron_id: int) -> int:
-        """Get topological layer for a single neuron. Returns -1 if isolated or not found."""
+        """Gets the topological layer for a single neuron.
+
+        Args:
+            neuron_id (int): The ID of the neuron.
+
+        Returns:
+            int: The layer of the neuron, or -1 if isolated or not found.
+        """
         layers = self.compute_topological_layers()
         return layers.get(neuron_id, -1)
 
     # --- Utility helpers for architecture statistics (used by MCTS reward shaping) ---
     def num_neurons(self) -> int:
-        """Total number of neurons in the architecture."""
+        """Gets the total number of neurons in the architecture.
+
+        Returns:
+            int: The total number of neurons.
+        """
         return len(self.neurons)
 
     def num_connections(self) -> int:
-        """Total number of connections (including disabled ones if present)."""
+        """Gets the total number of connections in the architecture.
+
+        Returns:
+            int: The total number of connections.
+        """
         return len(self.connections)
 
     def count_isolated_neurons(self, ignore_ids: set = None, only_hidden: bool = True) -> int:
-        """Count neurons that have no incoming AND no outgoing enabled connections.
+        """Counts the number of isolated neurons.
 
-        ignore_ids: set of neuron ids to exclude from counting (useful for grace-period on newly
-        added neurons).
-        only_hidden: when True, only consider hidden neurons (don't penalize input/output neurons).
+        Args:
+            ignore_ids (set, optional): A set of neuron IDs to ignore.
+                Defaults to None.
+            only_hidden (bool): Whether to count only hidden neurons.
+                Defaults to True.
+
+        Returns:
+            int: The number of isolated neurons.
         """
         if ignore_ids is None:
             ignore_ids = set()
@@ -700,9 +762,14 @@ class NeuralArchitecture:
         return isolated
 
     def connected_fraction(self, ignore_ids: set = None) -> float:
-        """Return fraction of (hidden) neurons that are connected (1 - isolated_fraction).
+        """Returns the fraction of hidden neurons that are connected.
 
-        This normalizes by number of hidden neurons (so metric is stable across sizes).
+        Args:
+            ignore_ids (set, optional): A set of neuron IDs to ignore.
+                Defaults to None.
+
+        Returns:
+            float: The fraction of connected hidden neurons.
         """
         if ignore_ids is None:
             ignore_ids = set()
@@ -713,14 +780,22 @@ class NeuralArchitecture:
         return max(0.0, 1.0 - isolated / total_hidden)
     
     def get_neuron_count(self) -> Dict[NeuronType, int]:
-        """Count neurons by type"""
+        """Counts the number of neurons by type.
+
+        Returns:
+            Dict[NeuronType, int]: A dictionary of neuron counts by type.
+        """
         from collections import Counter
         counts = Counter(neuron.neuron_type for neuron in self.neurons.values())
         # Ensure all neuron types are present in result
         return {neuron_type: counts.get(neuron_type, 0) for neuron_type in NeuronType}
     
     def to_serializable_dict(self) -> dict:
-        """Convert architecture to serializable dict for multiprocessing"""
+        """Converts the architecture to a serializable dictionary.
+
+        Returns:
+            dict: The serializable dictionary representation of the architecture.
+        """
         return {
             'next_neuron_id': self.next_neuron_id,
             'neurons': [
@@ -746,7 +821,14 @@ class NeuralArchitecture:
 
     @classmethod
     def from_serializable_dict(cls, data: dict) -> 'NeuralArchitecture':
-        """Reconstruct architecture from serializable dict"""
+        """Reconstructs an architecture from a serializable dictionary.
+
+        Args:
+            data (dict): The serializable dictionary.
+
+        Returns:
+            NeuralArchitecture: The reconstructed architecture.
+        """
         arch = cls.__new__(cls)  # Create instance without calling __init__
         arch.neurons = {}
         arch.connections = []
@@ -786,11 +868,20 @@ class NeuralArchitecture:
         return arch
 
     def __str__(self):
+        """Returns a string representation of the architecture.
+
+        Returns:
+            str: The string representation of the architecture.
+        """
         counts = self.get_neuron_count()
         return f"NeuralArchitecture(neurons={sum(counts.values())}, connections={len(self.connections)})"
 
     def copy(self) -> 'NeuralArchitecture':
-        """Create a fast deep copy of the architecture without the initialization overhead."""
+        """Creates a fast deep copy of the architecture.
+
+        Returns:
+            NeuralArchitecture: A deep copy of the architecture.
+        """
         new_arch = NeuralArchitecture.__new__(NeuralArchitecture)
         new_arch.neurons = copy.deepcopy(self.neurons)
         new_arch.connections = copy.deepcopy(self.connections)
@@ -812,16 +903,24 @@ class NeuralArchitecture:
         return new_arch
 
 class GraphNeuralNetwork(nn.Module):
-    """
-    Optimized Graph Neural Network that maintains the original interface while being much faster.
-    Key improvements without breaking gradients:
-    1. Batched weight matrices instead of individual connections
-    2. Pre-computed layer connectivity for efficient forward pass
-    3. Vectorized operations without inplace modifications
-    4. Proper gradient flow through all operations
+    """An optimized Graph Neural Network.
+
+    This class maintains the original interface while being much faster due to
+    batched weight matrices, pre-computed layer connectivity, and vectorized
+    operations.
+
+    Attributes:
+        architecture (NeuralArchitecture): The neural architecture.
+        device (torch.device): The device to run on.
     """
     
     def __init__(self, architecture: NeuralArchitecture, device: Optional[str] = None):
+        """Initializes the GraphNeuralNetwork.
+
+        Args:
+            architecture (NeuralArchitecture): The neural architecture.
+            device (Optional[str]): The device to run on. Defaults to None.
+        """
         super().__init__()
         self.architecture = architecture
         self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -839,7 +938,7 @@ class GraphNeuralNetwork(nn.Module):
         self._build_optimized_network()
     
     def _build_optimized_network(self):
-        """Build optimized network structure with batched operations"""
+        """Builds the optimized network structure with batched operations."""
         # Clear old parameter dictionaries to ensure clean rebuild
         self.weight_matrices = nn.ParameterDict()
         self.bias_vectors = nn.ParameterDict()
@@ -860,20 +959,11 @@ class GraphNeuralNetwork(nn.Module):
         self._precompute_activations()
     
     def _group_neurons_by_layer(self) -> Dict[float, List[Neuron]]:
-        """Group neurons by topological layer, ensuring neuron type purity.
-        
-        CRITICAL: INPUT and OUTPUT neurons MUST NEVER be grouped with HIDDEN neurons,
-        regardless of topological layer assignments. This method ensures type-safe grouping.
-        
-        Grouping strategy:
-        - INPUT neurons (all types with neuron_type==INPUT) -> position 0.0 (exact)
-        - OUTPUT neurons (all types with neuron_type==OUTPUT) -> position 1.0 (exact)
-        - HIDDEN neurons (all types with neuron_type==HIDDEN) -> positions in (0.0, 1.0) exclusive
-          * Isolated HIDDEN (topo_layer == -1) -> position 0.5
-          * Connected HIDDEN -> position scaled from topological layer, constrained to (0.01, 0.99)
-        
+        """Groups neurons by topological layer, ensuring neuron type purity.
+
         Returns:
-            Dict mapping float position -> list of neurons
+            Dict[float, List[Neuron]]: A dictionary mapping layer positions to
+                lists of neurons.
         """
         # Get topological layers from architecture
         topological_layers = self.architecture.compute_topological_layers()
@@ -923,7 +1013,7 @@ class GraphNeuralNetwork(nn.Module):
         return {pos: layer_groups[pos] for pos in sorted(layer_groups.keys())}
     
     def _precompute_layer_mappings(self):
-        """Precompute efficient layer-to-layer mappings"""
+        """Precomputes efficient layer-to-layer mappings."""
         self.layer_indices = {}
         self.neuron_to_layer_idx = {}
         
@@ -940,7 +1030,7 @@ class GraphNeuralNetwork(nn.Module):
         self._build_connectivity_matrix()
     
     def _build_connectivity_matrix(self):
-        """Build efficient connectivity representation between layers"""
+        """Builds an efficient connectivity representation between layers."""
         self.layer_connectivity = {}
         num_layers = len(self.layer_positions)
         
@@ -961,7 +1051,7 @@ class GraphNeuralNetwork(nn.Module):
                     )
     
     def _build_efficient_parameters(self):
-        """Build efficient parameter tensors without breaking gradients"""
+        """Builds efficient parameter tensors without breaking gradients."""
         # Build weight matrices for connected layers
         for (src_layer, tgt_layer), connections in self.layer_connectivity.items():
             if not connections:
@@ -1008,7 +1098,7 @@ class GraphNeuralNetwork(nn.Module):
             self.bias_vectors[key] = nn.Parameter(biases.to(self.device))
     
     def _precompute_activations(self):
-        """Precompute activation functions without inplace operations"""
+        """Precomputes activation functions without inplace operations."""
         # Build a cache of activation modules (ActivationType -> nn.Module)
         self.activation_module_cache = {}
         for act in ActivationType:
@@ -1031,7 +1121,14 @@ class GraphNeuralNetwork(nn.Module):
             self.activation_masks[str(layer_idx)] = layer_masks
     
     def _get_activation_module(self, activation_type: ActivationType) -> nn.Module:
-        """Convert activation type to PyTorch module - NO inplace operations"""
+        """Converts an activation type to a PyTorch module.
+
+        Args:
+            activation_type (ActivationType): The activation type.
+
+        Returns:
+            nn.Module: The PyTorch module for the activation function.
+        """
         if activation_type == ActivationType.RELU:
             return nn.ReLU()  # Removed inplace=True
         elif activation_type == ActivationType.SIGMOID:
@@ -1044,10 +1141,15 @@ class GraphNeuralNetwork(nn.Module):
             return nn.ReLU()  # Removed inplace=True
     
     def forward(self, x: torch.Tensor, use_mixed_precision: bool = False) -> torch.Tensor:
-        """
-        Optimized forward pass with batched operations and proper gradient flow
-        x: [batch_size, 784] for MNIST
-        use_mixed_precision: Enable automatic mixed precision for faster computation
+        """The optimized forward pass.
+
+        Args:
+            x (torch.Tensor): The input tensor of shape [batch_size, 784].
+            use_mixed_precision (bool): Whether to use automatic mixed
+                precision.
+
+        Returns:
+            torch.Tensor: The output tensor.
         """
         # Ensure input is on correct device
         x = x.to(self.device)
@@ -1164,16 +1266,27 @@ class GraphNeuralNetwork(nn.Module):
         return final_output
     
     def get_parameter_count(self) -> int:
-        """Count trainable parameters"""
+        """Counts the number of trainable parameters.
+
+        Returns:
+            int: The number of trainable parameters.
+        """
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
     @torch.jit.export
     def jit_forward(self, x: torch.Tensor) -> torch.Tensor:
-        """JIT-compiled forward pass for maximum performance"""
+        """A JIT-compiled forward pass for maximum performance.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         return self.forward(x, use_mixed_precision=False)
 
     def enable_jit_compilation(self):
-        """Compile the forward method with TorchScript for optimization"""
+        """Compiles the forward method with TorchScript for optimization."""
         if not hasattr(self, '_jit_compiled'):
             try:
                 self._jit_compiled = torch.jit.script(self.jit_forward)
@@ -1183,14 +1296,25 @@ class GraphNeuralNetwork(nn.Module):
                 self._jit_compiled = None
 
     def forward_jit(self, x: torch.Tensor) -> torch.Tensor:
-        """Use JIT-compiled forward pass if available"""
+        """Uses the JIT-compiled forward pass if available.
+
+        Args:
+            x (torch.Tensor): The input tensor.
+
+        Returns:
+            torch.Tensor: The output tensor.
+        """
         if hasattr(self, '_jit_compiled') and self._jit_compiled is not None:
             return self._jit_compiled(x)
         else:
             return self.forward(x)
 
     def update_architecture(self, new_architecture: NeuralArchitecture):
-        """Rebuild the network structure for a modified architecture"""
+        """Rebuilds the network structure for a modified architecture.
+
+        Args:
+            new_architecture (NeuralArchitecture): The new architecture.
+        """
         # Save current learned parameters to preserve training progress
         old_weight_matrices = dict(self.weight_matrices)
         old_bias_vectors = dict(self.bias_vectors)
