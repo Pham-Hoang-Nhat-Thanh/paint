@@ -287,7 +287,8 @@ class NeuralMCTS(MCTS):
                 # If expansion produced a child, record its evaluation in the local cycle
                 if expanded_node is not None:
                     self.current_cycle.add_evaluation(value)
-                    if self.current_cycle.should_advance():
+                    if self.current_cycle.should_advance(num_neurons=expanded_node.architecture.num_neurons(),
+                                                        num_connections=expanded_node.architecture.num_connections()):
                         self.current_cycle.advance_phase()
 
                 # ===== STEP 4: BACKUP =====
@@ -555,7 +556,7 @@ class NeuralMCTS(MCTS):
             raise RuntimeError("Node policy_value missing 'value' tensor during expansion.")
 
         total_expand_time = time.time() - expand_start_time
-        #print(f"[MCTS::_expand] total_time={total_expand_time:.4f}s node_id={id(node)} policy_eval={_mcts_policy_eval_time} priors_time={_mcts_priors_time} child_eval={_mcts_child_eval_time}\n")
+        print(f"[MCTS::_expand] total_time={total_expand_time:.4f}s node_id={id(node)} policy_eval={_mcts_policy_eval_time} priors_time={_mcts_priors_time} child_eval={_mcts_child_eval_time}\n")
 
         return child_node, value
 

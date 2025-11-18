@@ -46,7 +46,7 @@ class EvolutionaryCycle:
         except Exception:
             self.phase_iteration_count = 1
 
-    def should_advance(self) -> bool:
+    def should_advance(self, num_neurons = None, num_connections = None) -> bool:
         """Decide whether the episode-level cycle should advance.
 
         Returns True when either stability has been reached, or when the
@@ -60,6 +60,12 @@ class EvolutionaryCycle:
         # Force advance for EXPANDING phase after a limited number of iterations
         if self.current_phase == Phase.EXPANDING and self.phase_iteration_count >= self.max_expanding_iterations:
             return True
+        
+        # Force advance for PRUNING phase if the neurons/connections count is very low
+        if self.current_phase == Phase.PRUNING:
+            if (num_neurons is not None and num_neurons <= 5) or \
+               (num_connections is not None and num_connections <= 10):
+                return True
 
         return False
 
