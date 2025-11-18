@@ -168,6 +168,10 @@ class ActionManager:
         # Cache for masks to avoid recomputation
         self._mask_cache = {}
         self._cache_key_size = 0
+        # Cache used to share computed conditional logits across calls
+        # within an MCTS expand step to avoid recomputation for sibling nodes.
+        # Cleared by calling `start_expand_step()` or `end_expand_step()`.
+        self._expand_step_cache = {}
 
     def _get_action_type_name(self, action_type: int) -> str:
         """Convert action type index to string name"""
@@ -187,80 +191,179 @@ class ActionManager:
 
         device = policy_output['action_type'].device
         n_actions = len(actions)
-        priors = torch.ones(n_actions, device=device)
 
-        # Precompute action type probabilities (squeezed)
-        action_type_logits = policy_output['action_type'].squeeze(0)
-        masked_action_logits = action_type_logits + masks['action_type'].to(device)
-        action_type_probs = F.softmax(masked_action_logits, dim=-1)
+        # Helper: safely squeeze leading batch dim if present
+        def _maybe_squeeze(x: torch.Tensor) -> torch.Tensor:
+            if x is None:
+                return None
+            if torch.is_tensor(x) and x.dim() > 1 and x.shape[0] == 1:
+                return x.squeeze(0)
+            return x
 
-        # Cache conditional logits keyed by (action_type_value, source_neuron_or_-1)
-        cond_cache = {}
+        # Compute log-prob of action types once
+        action_type_logits = _maybe_squeeze(policy_output['action_type'])
+        action_type_mask = masks['action_type'].to(device)
+        log_at = F.log_softmax(action_type_logits + action_type_mask, dim=-1)  # [C]
 
-        # Helper to normalize logits safely (handles batched/unbatched forms)
-        def _softmax_prep(logits_tensor, mask_tensor):
-            # logits_tensor may be 1D (squeezed) or 2D (batch x size)
-            if logits_tensor.dim() == 1:
-                l_full = logits_tensor.unsqueeze(0)
+        # Build flat tensors for action metadata
+        at_vals = torch.tensor([a.action_type.value for a in actions], dtype=torch.long, device=device)
+        src_vals = torch.tensor([(-1 if a.source_neuron is None else int(a.source_neuron)) for a in actions], dtype=torch.long, device=device)
+        tgt_vals = torch.tensor([(-1 if a.target_neuron is None else int(a.target_neuron)) for a in actions], dtype=torch.long, device=device)
+        act_vals = torch.tensor([(-1 if a.activation is None else int(list(ActivationType).index(a.activation))) for a in actions], dtype=torch.long, device=device)
+
+        # Base log-prob from action type
+        logp = log_at[at_vals]  # [n_actions]
+
+        # Group unique (action_type, source) pairs to compute conditional logits once
+        keys = torch.stack([at_vals, src_vals], dim=1)  # [n,2]
+        unique_keys, inv_idx = torch.unique(keys, dim=0, return_inverse=True)
+
+        # Prepare containers for log-prob contributions per unique group
+        G = unique_keys.shape[0]
+        logp_src_per_group = torch.zeros(G, device=device)
+
+        # Precompute masks to use when preparing logits
+        tensor_size = int(masks['tensor_size'])
+        source_mask_full = masks['source_neurons'].to(device)
+        remove_source_mask_full = masks.get('remove_source_neurons', masks['source_neurons']).to(device)
+        modify_source_mask_full = masks.get('modify_source_neurons', masks['source_neurons']).to(device)
+        target_mask_full = masks['target_neurons'].to(device)
+        # Determine activation mask: prefer provided masks, otherwise try to infer
+        activation_mask_full = masks.get('activation', None)
+        if activation_mask_full is None:
+            # Try to infer activation size from policy_output if available
+            inferred_len = None
+            ao = policy_output.get('activation_logits', None)
+            if torch.is_tensor(ao):
+                inferred_len = ao.shape[-1]
             else:
-                l_full = logits_tensor
-            l_prep = self._prepare_logits(l_full, masks['tensor_size'], mask_tensor.to(device))
-            # return 1D probabilities
-            if l_prep.dim() > 1:
-                return F.softmax(l_prep.squeeze(0), dim=-1)
-            return F.softmax(l_prep, dim=-1)
+                # Fallback to previously assumed default of 4 activations
+                inferred_len = 4
+            activation_mask_full = torch.zeros(inferred_len, device=device)
+        else:
+            activation_mask_full = activation_mask_full.to(device)
 
-        # Process each action but reuse conditional computations when possible
-        for i, action in enumerate(actions):
-            at_val = action.action_type.value
-            prior = action_type_probs[at_val]
+        # Cache for conditional logits per unique group key. First check expand-step cache
+        cond_logits_cache = {}
 
-            src_key = action.source_neuron if action.source_neuron is not None else -1
-            cache_key = (at_val, int(src_key))
+        # Precompute list of unique source indices (for precomputing source embeddings)
+        unique_srcs = unique_keys[:, 1]
+        unique_srcs_pos = unique_srcs[unique_srcs >= 0]
+        if unique_srcs_pos.numel() > 0 and 'source_encoder' in policy_output:
+            unique_src_vals = torch.unique(unique_srcs_pos)
+            # Precompute one-hot encodings and source features in batch
+            one_hot = F.one_hot(unique_src_vals.to(device), num_classes=self.max_neurons).float()
+            precomp_feats = policy_output['source_encoder'](one_hot)
+            # Map from source id -> precomputed feature (unsqueezed for concat compatibility)
+            src_to_feat = {int(s.item()): precomp_feats[i].unsqueeze(0) for i, s in enumerate(unique_src_vals)}
+        else:
+            src_to_feat = {}
 
-            if cache_key not in cond_cache:
-                # compute and store conditional logits with batch-dim squeezed where safe
-                cond_logits = self._compute_conditional_logits(policy_output, action.action_type, action.source_neuron)
-                for k, v in list(cond_logits.items()):
+        # Iterate groups and compute/cached conditional logits (use expand cache if available)
+        log_target_rows = torch.full((G, tensor_size), -1e9, device=device)
+        log_activation_rows = torch.full((G, activation_mask_full.shape[0] if activation_mask_full is not None else self.num_activations), -1e9, device=device)
+
+        for g_idx in range(G):
+            a_val = int(unique_keys[g_idx, 0].item())
+            s_val = int(unique_keys[g_idx, 1].item())
+            action_type_enum = ActionType(a_val)
+
+            # Decide appropriate source mask for this action type
+            if action_type_enum == ActionType.REMOVE_NEURON:
+                src_mask = remove_source_mask_full
+            elif action_type_enum == ActionType.MODIFY_ACTIVATION:
+                src_mask = modify_source_mask_full
+            else:
+                src_mask = source_mask_full
+
+            key = (a_val, s_val)
+            # First check global expand-step cache (across sibling expansions)
+            if key in self._expand_step_cache:
+                cached = self._expand_step_cache[key]
+            elif key in cond_logits_cache:
+                cached = cond_logits_cache[key]
+            else:
+                # Use precomputed source feature when available to avoid one-hot creation
+                precomputed_feat = None
+                if s_val >= 0:
+                    precomputed_feat = src_to_feat.get(s_val, None)
+                cond = self._compute_conditional_logits(policy_output, action_type_enum, None if s_val < 0 else s_val,
+                                                       precomputed_source_features=precomputed_feat)
+                # Squeeze singleton batch dims for easier indexing
+                for k, v in list(cond.items()):
                     if torch.is_tensor(v):
-                        v = v.to(device)
-                        # Squeeze leading batch dimension if it's a singleton batch
-                        if v.dim() > 1 and v.shape[0] == 1:
-                            v = v.squeeze(0)
-                        cond_logits[k] = v
-                cond_cache[cache_key] = cond_logits
+                        cond[k] = _maybe_squeeze(v)
 
-            cond = cond_cache[cache_key]
+                # Build cached entry with masked log-probs
+                cached = {}
+                # Source log-prob handled below
+                if 'target_logits' in cond and cond['target_logits'] is not None:
+                    tgt_logits = cond['target_logits']
+                    tgt_logits_prepped = self._prepare_logits(tgt_logits.unsqueeze(0), tensor_size, target_mask_full).squeeze(0)
+                    cached['_log_target'] = F.log_softmax(tgt_logits_prepped, dim=-1)
+                if 'activation_logits' in cond and cond['activation_logits'] is not None:
+                    act_logits = cond['activation_logits']
+                    act_logits_prepped = (act_logits + (activation_mask_full == 0).float() * -1e9) if act_logits.dim() == 1 else act_logits
+                    cached['_log_activation'] = F.log_softmax(act_logits_prepped, dim=-1)
 
-            if action.action_type == ActionType.ADD_NEURON:
-                activation_probs = F.softmax(cond['activation_logits'], dim=-1)
-                activation_idx = list(ActivationType).index(action.activation)
-                prior = prior * activation_probs[activation_idx]
+                # Store raw source logits (if present) so we can compute log probability for the chosen source
+                if 'source_logits' in cond and cond['source_logits'] is not None:
+                    cached['_raw_source_logits'] = cond['source_logits']
 
-            elif action.action_type == ActionType.REMOVE_NEURON:
-                sp = _softmax_prep(cond['source_logits'], masks.get('remove_source_neurons', masks['source_neurons']))
-                prior = prior * sp[action.source_neuron]
+                # Put into both local and expand cache for reuse
+                cond_logits_cache[key] = cached
+                self._expand_step_cache[key] = cached
 
-            elif action.action_type in [ActionType.ADD_CONNECTION, ActionType.REMOVE_CONNECTION]:
-                sp = _softmax_prep(cond['source_logits'], masks['source_neurons'])
+            # Compute source log-prob for this group if applicable
+            if s_val >= 0 and '_raw_source_logits' in cached:
+                src_logits = cached['_raw_source_logits']
+                src_logits_prepped = self._prepare_logits(src_logits.unsqueeze(0), tensor_size, src_mask).squeeze(0)
+                log_src = F.log_softmax(src_logits_prepped, dim=-1)
+                idx = min(s_val, tensor_size - 1)
+                logp_src_per_group[g_idx] = log_src[idx]
+            else:
+                logp_src_per_group[g_idx] = 0.0
 
-                # For target, the cached cond logits may already be conditioned on source (if computed with source),
-                # otherwise it's the unconditioned head and _softmax_prep will pad/softmax correctly.
-                tp = _softmax_prep(cond['target_logits'], masks['target_neurons'])
-                prior = prior * sp[action.source_neuron] * tp[action.target_neuron]
+            # If cached target/activation present, copy into group rows (already masked)
+            if '_log_target' in cached:
+                log_target_rows[g_idx, :cached['_log_target'].shape[0]] = cached['_log_target'][:tensor_size]
+            if '_log_activation' in cached:
+                act_row = cached['_log_activation']
+                log_activation_rows[g_idx, :act_row.shape[0]] = act_row
 
-            elif action.action_type == ActionType.MODIFY_ACTIVATION:
-                sp = _softmax_prep(cond['source_logits'], masks.get('modify_source_neurons', masks['source_neurons']))
-                activation_probs = F.softmax(cond['activation_logits'], dim=-1)
-                activation_idx = list(ActivationType).index(action.activation)
-                prior = prior * sp[action.source_neuron] * activation_probs[activation_idx]
+        # Map group source log-probs back to actions
+        logp_src = logp_src_per_group[inv_idx]
+        logp = logp + logp_src
 
-            priors[i] = prior
+        # Vectorized mapping for target and activation using stacked cached rows
+        # Targets
+        tgt_mask = tgt_vals >= 0
+        if tgt_mask.any():
+            tgt_indices = tgt_vals.clamp(min=0, max=tensor_size - 1)
+            gathered_targets = log_target_rows[inv_idx, tgt_indices]
+            # Zero out positions where target not applicable
+            gathered_targets = gathered_targets * tgt_mask.to(device)
+        else:
+            gathered_targets = torch.zeros(n_actions, device=device)
 
+        # Activations
+        act_mask = act_vals >= 0
+        if act_mask.any():
+            act_indices = act_vals.clamp(min=0, max=log_activation_rows.shape[1] - 1)
+            gathered_acts = log_activation_rows[inv_idx, act_indices]
+            gathered_acts = gathered_acts * act_mask.to(device)
+        else:
+            gathered_acts = torch.zeros(n_actions, device=device)
+
+        logp = logp + gathered_targets + gathered_acts
+
+        # Convert log-probs to linear space priors
+        priors = torch.exp(logp)
+        # Normalize or floor if desired (keep as raw priors)
         return priors
 
     def _compute_conditional_logits(self, policy_output: Dict, action_type: ActionType, 
-                                  source_neuron: int = None) -> Dict[str, torch.Tensor]:
+                                  source_neuron: int = None, precomputed_source_features: torch.Tensor = None) -> Dict[str, torch.Tensor]:
         """Compute conditional logits given action type and optional source"""
         shared_features = policy_output['shared_features']
         action_type_name = self._get_action_type_name(action_type.value)
@@ -279,11 +382,16 @@ class ActionManager:
         # Target logits (conditioned on action type and source)
         if (source_neuron is not None and 'target_heads' in policy_output and 
             action_type_name in policy_output['target_heads']):
-            # Encode source information
-            source_one_hot = F.one_hot(torch.tensor([source_neuron], device=shared_features.device), 
-                                      self.max_neurons).float()
-            source_features = policy_output['source_encoder'](source_one_hot)
-            
+            # Use precomputed source features when provided to avoid one-hot creation
+            if precomputed_source_features is not None:
+                source_features = precomputed_source_features
+                if torch.is_tensor(source_features) and source_features.dim() == 1:
+                    source_features = source_features.unsqueeze(0)
+            else:
+                source_one_hot = F.one_hot(torch.tensor([source_neuron], device=shared_features.device), 
+                                          self.max_neurons).float()
+                source_features = policy_output['source_encoder'](source_one_hot)
+
             # Combine with shared features
             conditioned_features = torch.cat([shared_features, source_features], dim=-1)
             result['target_logits'] = policy_output['target_heads'][action_type_name](conditioned_features)
@@ -296,10 +404,15 @@ class ActionManager:
         # Activation logits (conditioned on action type and source if needed)
         if 'activation_heads' in policy_output and action_type_name in policy_output['activation_heads']:
             if action_type_name == 'modify_activation' and source_neuron is not None:
-                # Condition on source for modify_activation
-                source_one_hot = F.one_hot(torch.tensor([source_neuron], device=shared_features.device), 
-                                          self.max_neurons).float()
-                source_features = policy_output['source_encoder'](source_one_hot)
+                # Condition on source for modify_activation; use precomputed feature if available
+                if precomputed_source_features is not None:
+                    source_features = precomputed_source_features
+                    if torch.is_tensor(source_features) and source_features.dim() == 1:
+                        source_features = source_features.unsqueeze(0)
+                else:
+                    source_one_hot = F.one_hot(torch.tensor([source_neuron], device=shared_features.device), 
+                                              self.max_neurons).float()
+                    source_features = policy_output['source_encoder'](source_one_hot)
                 conditioned_features = torch.cat([shared_features, source_features], dim=-1)
                 result['activation_logits'] = policy_output['activation_heads'][action_type_name](conditioned_features)
             else:
