@@ -310,11 +310,53 @@ class NeuralArchitecture:
         if src_tgt_weight:
             src_list, tgt_list, weight_list = zip(*src_tgt_weight)
             edge_index = torch.tensor([src_list, tgt_list], dtype=torch.long)
-            # If you want edge weights as a tensor, uncomment below:
-            # edge_weights = torch.tensor(weight_list, dtype=torch.float)
+            # Build edge feature vectors (compact, cheap features useful for architecture search)
+            # Features: [delta_layer, is_skip, src_type_onehot(3), tgt_type_onehot(3), src_out_deg_norm, tgt_in_deg_norm]
+            # Compute degree statistics
+            from collections import defaultdict
+            outgoing = defaultdict(int)
+            incoming = defaultdict(int)
+            for src, tgt, _w in src_tgt_weight:
+                outgoing[src] += 1
+                incoming[tgt] += 1
+
+            # Max degrees for normalization
+            max_out = max(outgoing.values()) if outgoing else 1
+            max_in = max(incoming.values()) if incoming else 1
+
+            edge_feats = []
+            for s, t, w in src_tgt_weight:
+                # s and t are indices into node_ids (created via id_to_index),
+                # map back to original neuron IDs for attribute access.
+                s_id = node_ids[s]
+                t_id = node_ids[t]
+                s_pos = neurons[s_id].layer_position
+                t_pos = neurons[t_id].layer_position
+                delta_layer = float(t_pos - s_pos)
+                is_skip = 1.0 if abs(delta_layer) > 0.25 else 0.0
+
+                # Node type one-hot (INPUT, HIDDEN, OUTPUT)
+                def type_onehot(n):
+                    if n.neuron_type.value == 'input':
+                        return [1.0, 0.0, 0.0]
+                    elif n.neuron_type.value == 'hidden':
+                        return [0.0, 1.0, 0.0]
+                    else:
+                        return [0.0, 0.0, 1.0]
+
+                src_type = type_onehot(neurons[s_id])
+                tgt_type = type_onehot(neurons[t_id])
+
+                src_out_norm = float(outgoing[s]) / float(max_out)
+                tgt_in_norm = float(incoming[t]) / float(max_in)
+
+                feat = [delta_layer, is_skip] + src_type + tgt_type + [src_out_norm, tgt_in_norm]
+                edge_feats.append(feat)
+
+            edge_features = torch.tensor(edge_feats, dtype=torch.float)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
-            # edge_weights = torch.empty((0,), dtype=torch.float)
+            edge_features = torch.empty((0, 10), dtype=torch.float)
 
         # Compute layer positions from sorted neuron IDs
         layer_positions = torch.FloatTensor([neurons[neuron_id].layer_position for neuron_id in node_ids])
@@ -322,6 +364,7 @@ class NeuralArchitecture:
         return {
             'node_features': node_features,
             'edge_index': edge_index,
+            'edge_features': edge_features,
             'layer_positions': layer_positions,
             'node_mapping': id_to_index,
             'performance': self.performance_metrics,
