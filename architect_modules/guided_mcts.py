@@ -1,5 +1,6 @@
+import traceback
 from blueprint_modules.mcts import MCTS, MCTSNode
-from blueprint_modules.network import NeuralArchitecture, ActivationType
+from blueprint_modules.network import NeuralArchitecture
 from blueprint_modules.action import Action, ActionSpace
 from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
@@ -7,7 +8,6 @@ from torch.distributions import Categorical
 from typing import Dict, List
 import torch
 import math
-import numpy as np
 import torch.nn.functional as F
 from collections import deque
 
@@ -22,12 +22,14 @@ class NeuralMCTSNode(MCTSNode):
         self.curriculum = curriculum
         # Cache valid actions for this node to check if fully expanded
         self._valid_actions_cache = None
-        # Flag to track if Dirichlet noise has been applied (for root only)
-        self._dirichlet_applied = False
+        self._valid_actions_phase_token = None
         # Incremental set of expanded actions for O(1) filtering (vectorized action filtering)
-        self._expanded_actions_set = set()
+        self._unexpanded_actions_set = set()
         # Cache action masks to avoid recomputation across _compute_action_prior calls
-        self._cached_masks = None
+        self._priors_cache = None
+        self._priors_phase_token = None
+        # Track whether Dirichlet noise has been applied for a given phase (root-only)
+        self._dirichlet_applied_phase_token = None
     
     def is_fully_expanded(self) -> bool:
         """Check if all valid actions have been expanded as children.
@@ -35,39 +37,48 @@ class NeuralMCTSNode(MCTSNode):
         Since NeuralMCTS doesn't use untried_actions list, we need to compare
         the expanded actions (children) with all valid actions for this state.
         """
-        # Get all valid actions for this node (cache it to avoid recomputation)
-        if self._valid_actions_cache is None:
-            # Import here to avoid circular dependency
-            from blueprint_modules.action import ActionSpace
-            # We'll need the action_space from the parent MCTS instance
-            # For now, return False to indicate not fully expanded if we can't check
-            # The MCTS search method will set this properly
-            return False
-        
-        # Check if all valid actions have corresponding children
-        expanded_actions = {child.action for child in self.children if child.action is not None}
-        return len(expanded_actions) >= len(self._valid_actions_cache)
+        return (self._valid_actions_cache is not None and self._unexpanded_actions_set is not None and
+                len(self._unexpanded_actions_set) == 0)
     
     def best_child(self, exploration_weight: float = 1.0) -> 'NeuralMCTSNode':
         """Select best child using PUCT formula (AlphaZero style)"""
         if not self.children:
             return None
+        # Vectorized selection: if any child has zero visits, prefer first such child
+        # (keeps original behavior which returns +inf for zero-visit children).
+        try:
+            visits = torch.tensor([float(child.visits) for child in self.children], dtype=torch.float32)
+            zero_mask = visits == 0.0
+            if zero_mask.any():
+                zero_idxs = torch.nonzero(zero_mask).squeeze(1).tolist()
+                # choose among zero-visit children the one with highest prior
+                priors = [self.children[i].prior_prob for i in zero_idxs]
+                best = zero_idxs[int(torch.argmax(torch.tensor(priors)).item())]
+                return self.children[best]
 
-        def puct_score(child: 'NeuralMCTSNode') -> float:
-            if child.visits == 0:
-                return float('inf')
+            # Q: average value per child
+            values = torch.tensor([float(child.value) for child in self.children], dtype=torch.float32)
+            q_values = values / visits
 
-            # PUCT formula: Q + U
-            # Q: exploitation term (average value)
-            q_value = child.value / child.visits
+            # U: exploration term (PUCT)
+            priors = torch.tensor([float(child.prior_prob) for child in self.children], dtype=torch.float32)
+            parent_visits = float(self.visits) if self.visits > 0 else 1.0
+            u_values = exploration_weight * priors * (math.sqrt(parent_visits) / (1.0 + visits))
 
-            # U: exploration term
-            u_value = exploration_weight * child.prior_prob * \
-                     math.sqrt(self.visits) / (1 + child.visits)
+            scores = q_values + u_values
+            best_idx = int(torch.argmax(scores).item())
+            return self.children[best_idx]
+        except Exception:
+            # Fallback to original Python implementation on any failure
+            def puct_score(child: 'NeuralMCTSNode') -> float:
+                if child.visits == 0:
+                    return float('inf')
 
-            return q_value + u_value
+                q_value = child.value / child.visits
+                u_value = exploration_weight * child.prior_prob * math.sqrt(self.visits) / (1 + child.visits)
+                return q_value + u_value
 
-        return max(self.children, key=puct_score)
+            return max(self.children, key=puct_score)
 
 class NeuralMCTS(MCTS):
     """MCTS enhanced with neural network guidance"""
@@ -105,13 +116,13 @@ class NeuralMCTS(MCTS):
         """Optimized: Convert architecture to graph data for neural network using cached sorted IDs"""
         graph_data = architecture.to_graph_representation()
         
-        # Add batch dimension and move to device
-        graph_data['node_features'] = graph_data['node_features'].unsqueeze(0).to(self.device)
-        graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
+        # Add batch dimension but keep tensors on CPU. Move to device lazily
+        graph_data['node_features'] = graph_data['node_features'].unsqueeze(0)
+        graph_data['edge_index'] = graph_data['edge_index']
         # Use cached sorted neuron IDs from graph representation instead of sorting again
         sorted_neuron_ids = graph_data['sorted_neuron_ids']
         layer_positions = [float(architecture.neurons[neuron_id].layer_position) for neuron_id in sorted_neuron_ids]
-        graph_data['layer_positions'] = torch.FloatTensor([layer_positions]).to(self.device)
+        graph_data['layer_positions'] = torch.FloatTensor([layer_positions])
         
         return graph_data
 
@@ -191,21 +202,6 @@ class NeuralMCTS(MCTS):
             'node_offsets': node_offsets,  # Offsets for extracting per-graph outputs
             'num_graphs': num_graphs
         }
-
-
-    def _evaluate_node(self, node: NeuralMCTSNode, is_simulation: bool = False) -> float:
-        """Evaluate a node using the policy-value network (AlphaZero style).
-        
-        No supervised stage - the policy-value network is the sole evaluator from the start.
-        It learns from MCTS-generated experience and improves over time.
-        """
-        # Ensure we have a policy_value for this node
-        if node.policy_value is None:
-            with torch.no_grad():
-                graph_data = self._prepare_graph_data(node.architecture)
-                node.policy_value = self.policy_value_net(graph_data, phase = self.current_cycle.current_phase.value)
-        
-        return node.policy_value['value'].item()
     
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
                temperature: float = 1.0, reuse_root: NeuralMCTSNode = None) -> NeuralMCTSNode:
@@ -231,25 +227,41 @@ class NeuralMCTS(MCTS):
         # Reuse existing tree root if provided, otherwise create new root
         if reuse_root is not None:
             root = reuse_root
+            # invalidate caches keyed by token so new search_token forces recompute
             root._valid_actions_cache = None
+            root._valid_actions_phase_token = None
+            root._priors_cache = None
+            root._priors_phase_token = None
+            root._dirichlet_applied_phase_token = None
+            if hasattr(root, '_cached_masks'):
+                root._cached_masks = None
+            # optionally reset policy so network is re-evaluated for the new semantic phase
+            root.policy_value = None
         else:
             root = NeuralMCTSNode(initial_architecture)
 
         # Create a local copy of the episode-level cycle for this search so
         # the search can advance phases locally while starting from the
-        # current episode phase. Changes are merged back after the search.
+        # episode-level phase to avoid accidentally copying a
+        # stale search-local cycle from a previous run.
         orig_cycle = self.current_cycle
+        # Make a local search copy so the search can mutate phase/node history
+        # without immediately affecting the episode-level tracker.
         search_cycle = orig_cycle.copy()
         # Point `self.current_cycle` to the local search copy so helper
         # methods naturally use the search-local phase during this call.
         self.current_cycle = search_cycle
+        phase_value = self.current_cycle.get_phase_value()
 
         try:
             # Get neural network predictions for root
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(initial_architecture)
-                policy_value = self.policy_value_net(graph_data, phase = self.current_cycle.current_phase.value)
-                root.policy_value = policy_value
+                graph_data['node_features'] = graph_data['node_features'].to(self.device)
+                graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
+                graph_data['layer_positions'] = graph_data['layer_positions'].to(self.device)
+                policy_value = self.policy_value_net(graph_data, phase=phase_value)
+                root.policy_value = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in policy_value.items()}
 
             # Early stopping tracking
             best_values = deque(maxlen=self.early_stopping_patience)
@@ -258,7 +270,9 @@ class NeuralMCTS(MCTS):
             
             # Add Dirichlet noise to root for exploration (AlphaZero-style)
             # This ensures we explore even when policy network has strong (but potentially wrong) priors
-            self._add_dirichlet_noise_to_root(root)
+            self._apply_dirichlet_noise_to_root(root.policy_value, num_actions=
+                                                len(self.action_space.get_valid_actions(root.architecture,
+                                                                    evolutionary_cycle=self.current_cycle)))
 
             print("Starting MCTS search...")
             for i in range(iterations):
@@ -273,7 +287,7 @@ class NeuralMCTS(MCTS):
                 # If expansion produced a child, record its evaluation in the local cycle
                 if expanded_node is not None:
                     self.current_cycle.add_evaluation(value)
-                    if self.current_cycle.is_stable():
+                    if self.current_cycle.should_advance():
                         self.current_cycle.advance_phase()
 
                 # ===== STEP 4: BACKUP =====
@@ -309,58 +323,38 @@ class NeuralMCTS(MCTS):
                     print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {current_best:.4f}")
 
             # ===== STEP 5: SELECT FINAL ACTION =====
-            # Use visit counts to select final action (most visited = most promising)
-            final_node = self._select_final_action(root, temperature)
-            if final_node and final_node.action:
-                # Update local (search) cycle with final node's value
-                final_value = final_node.value / final_node.visits
-                self.current_cycle.add_evaluation(final_value)
-                if self.current_cycle.is_stable():
-                    self.current_cycle.advance_phase()
+            # Select final action using visit counts but ensure the selection
+            # is legal under the episode-level cycle (`orig_cycle`). The
+            # search used a local copy of the cycle; final action must be
+            # permissible for the episode-level evolutionary phase.
+            try:
+                # Get episode-level valid actions for the root state
+                episode_valid_actions = self.action_space.get_valid_actions(root.architecture,
+                                                                           evolutionary_cycle=orig_cycle)
+                episode_valid_set = set(episode_valid_actions)
+                # Filter children whose actions are legal under the episode-level cycle
+                episode_legal_children = [c for c in root.children if c.action in episode_valid_set]
+            except Exception:
+                # Fallback to considering all children if mask retrieval fails
+                episode_legal_children = list(root.children)
 
+            if episode_legal_children:
+                # Use a lightweight candidate container so `_select_final_action`
+                # picks from the filtered subset.
+                candidate_root = NeuralMCTSNode(root.architecture)
+                candidate_root.children = episode_legal_children
+                final_node = self._select_final_action(candidate_root, temperature)
+            else:
+                final_node = self._select_final_action(root, temperature)
+
+            if final_node and final_node.action:
                 print("MCTS search completed successfully")
                 return (final_node, root)
             else:
                 print("MCTS search completed: no valid action found")
                 return (root, root)  # Return tuple even on failure
         finally:
-            # Merge search-local cycle back to episode-level cycle when appropriate.
-            # Policy: if the search advanced the cycle or reached stability, update
-            # the episode cycle state. Otherwise keep the episode cycle intact.
-            try:
-                # If the search made progress (advanced cycle id) or found stability,
-                # copy the relevant fields back into the episode cycle.
-                if search_cycle.cycle_id != orig_cycle.cycle_id or search_cycle.is_stable():
-                    orig_cycle.cycle_id = search_cycle.cycle_id
-                    orig_cycle.node_values = list(search_cycle.node_values)
-                    orig_cycle.current_phase = search_cycle.current_phase
-                    orig_cycle.stability_threshold = search_cycle.stability_threshold
-            finally:
-                # Always restore the original object reference on the instance
-                self.current_cycle = orig_cycle
-        
-    
-    def _add_dirichlet_noise_to_root(self, root: NeuralMCTSNode, epsilon: float = 0.25, alpha: float = 0.3):
-        """Add Dirichlet noise to root node priors for exploration (AlphaZero-style).
-        
-        This ensures exploration even when the policy network has strong but potentially
-        incorrect priors. The noise is only added at the root of each search.
-        
-        Args:
-            root: Root node of MCTS search
-            epsilon: Weight of noise (0.25 = 75% prior, 25% noise)
-            alpha: Dirichlet concentration parameter (lower = more dispersed)
-        """
-        if not root.children or len(root.children) == 0:
-            return  # No children yet, noise will be applied during expansion
-        
-        # Generate Dirichlet noise
-        num_children = len(root.children)
-        noise = np.random.dirichlet([alpha] * num_children)
-        
-        # Mix noise with existing priors
-        for i, child in enumerate(root.children):
-            child.prior_prob = (1 - epsilon) * child.prior_prob + epsilon * noise[i]
+            self.current_cycle = orig_cycle
     
     def _select_final_action(self, root: NeuralMCTSNode, temperature: float) -> NeuralMCTSNode:
         """Select final action based on visit counts (proportional selection)"""
@@ -371,112 +365,201 @@ class NeuralMCTS(MCTS):
 
         # Proportional selection based on visit counts (standard MCTS final selection)
         visit_probs = visit_counts.float() / visit_counts.sum()
-        selected_idx = Categorical(probs=visit_probs).sample().item()
-
+        if temperature == 0.0:
+            # Deterministic selection of most visited child
+            selected_idx = int(torch.argmax(visit_probs).item())
+        else:
+            # Apply temperature scaling
+            scaled_probs = visit_probs.pow(1.0 / temperature)
+            scaled_probs = scaled_probs / scaled_probs.sum()
+            selected_idx = Categorical(probs=scaled_probs).sample().item()
         return root.children[selected_idx]
     
+    def _select(self, node: NeuralMCTSNode) -> NeuralMCTSNode:
+        """Traverse the tree from the given node to a leaf using PUCT selection."""
+        current_node = node
+        # descend while the current node is fully expanded AND has children to descend into
+        while current_node.children and current_node.is_fully_expanded():
+            current_node = current_node.best_child(self.exploration_weight)
+            if current_node is None:
+                break
+        return current_node
+        
+
     def _expand(self, node: NeuralMCTSNode) -> tuple:
-        """Expand node with optimized batched evaluation and vectorized action filtering.
-        
-        Optimizations:
-        1. Batch parent + child policy evaluations in single forward pass (~2x speedup)
-        2. Node-level policy caching to avoid redundant re-evaluation
-        3. Vectorized action filtering using incremental set tracking (O(1) per action)
-        4. Progressive widening: limit to max_children via top-K action selection by prior
-           (enables deeper tree exploration instead of exhausting budget at root)
-        
-        Implements AlphaZero-style expansion with:
-        - Dirichlet noise applied at root for exploration
-        - Masked logits and vectorized prior computation
-        - Action selection constrained to valid unexpanded actions + top-K by prior
-        
-        Returns:
-            Tuple of (child_node, value) where value is the neural network evaluation
-            or (parent_node, parent_value) if expansion fails (leaf is terminal or max_children reached)
+        """Expand the given node by adding one new child using neural-guided action selection.
         """
+        import time
+        expand_start_time = time.time()
+        _mcts_policy_eval_time = None
+        _mcts_priors_time = None
+        _mcts_child_eval_time = None
         # Ensure parent policy_value is available
         if node.policy_value is None:
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(node.architecture)
-                node.policy_value = self.policy_value_net(graph_data, phase = self.current_cycle.current_phase.value)
+                # Move inputs to device for forward, then cache CPU-detached outputs
+                graph_data['node_features'] = graph_data['node_features'].to(self.device)
+                graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
+                graph_data['layer_positions'] = graph_data['layer_positions'].to(self.device)
+                t_policy = time.time()
+                policy_value = self.policy_value_net(graph_data, phase=self.current_cycle.get_phase_value())
+                _mcts_policy_eval_time = time.time() - t_policy
+                # Handle new network output signature - store all components
+                node.policy_value = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in policy_value.items()}
+                #print(f"[MCTS::_expand] policy_eval_time={_mcts_policy_eval_time:.4f}s node_id={id(node)}")
 
-        # Cache valid actions for this node if not already cached
-        if node._valid_actions_cache is None:
+        # Cache valid actions for this node. Invalidate and recompute when the
+        # search phase changes because valid action sets (masks/rules) may
+        # differ between phases.
+        current_phase_token = self.current_cycle.cycle_id
+        if (node._valid_actions_cache is None or
+            getattr(node, '_valid_actions_phase_token', None) != current_phase_token):
             all_valid_actions = self.action_space.get_valid_actions(
                 node.architecture, evolutionary_cycle=self.current_cycle
             )
             node._valid_actions_cache = all_valid_actions
+            node._unexpanded_actions_set = set(all_valid_actions)
+            # Track which phase the valid-actions cache belongs to separately
+            # from `_priors_phase` which is used for priors caching.
+            node._valid_actions_phase_token = current_phase_token
         all_valid_actions = node._valid_actions_cache
 
         # Vectorized action filtering: use incremental set to filter in O(n) instead of O(n²)
-        valid_actions = [a for a in all_valid_actions if a not in node._expanded_actions_set]
+        valid_actions = list(node._unexpanded_actions_set)
+        if len(valid_actions) == 0:
+            # Extract value from new network output signature
+            value_output = node.policy_value.get('value')
+            if isinstance(value_output, torch.Tensor):
+                value = value_output.item()
+            else:
+                value = 0.0  # Fallback
+            return (node, value)  # No unexpanded actions available
 
-        if not valid_actions:
-            return (node, node.policy_value['value'].item())  # No unexpanded actions available
+        masks = self.action_manager.get_action_masks(node.architecture, phase=self.current_cycle.get_phase_value())
 
-        # Apply Dirichlet noise at root on first expansion
-        is_root = (node.parent is None)
-        if is_root and not node._dirichlet_applied:
-            self._apply_dirichlet_noise_to_policy(node.policy_value, len(valid_actions))
-            node._dirichlet_applied = True
+        # Ensure masks and transient policy tensors are on the model/device
+        model_device = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
+        for k in list(masks.keys()):
+            if k != 'tensor_size' and torch.is_tensor(masks[k]):
+                masks[k] = masks[k].to(model_device)
 
-        # Progressive widening: select top-K actions by prior to limit branching factor
-        # This focuses exploration on most promising actions and enables deeper search
-        top_k_actions = self._select_top_k_actions_by_prior(
-            node.policy_value, valid_actions, node.architecture, k=self.max_children
-        )
+        # Create a transient on-device view of the cached policy outputs so
+        # policy-conditioned heads (which live on the model device) receive
+        # inputs on the same device during priors computation.
+        policy_on_device = {}
+        for k, v in node.policy_value.items():
+            if torch.is_tensor(v):
+                try:
+                    policy_on_device[k] = v.to(model_device)
+                except Exception:
+                    policy_on_device[k] = v
+            else:
+                policy_on_device[k] = v
 
-        # Compute full priors only for the top-K candidates (expensive masked softmax)
-        # This avoids computing full priors for all valid actions.
-        candidate_priors = []
-        for cand in top_k_actions:
-            try:
-                p = self._compute_action_prior(node.policy_value, node.architecture, top_k_actions, node=node)
-            except Exception:
-                p = 0.0
-            candidate_priors.append(float(p))
-
-        # Normalize priors into a probability distribution (fallback to uniform if all zeros)
-        priors_tensor = torch.tensor(candidate_priors, dtype=torch.float32)
-        if priors_tensor.sum().item() <= 0.0:
-            probs = torch.ones_like(priors_tensor) / float(len(priors_tensor))
+        # Compose priors for all top-K valid actions
+        if (node._priors_cache is not None and
+            node._priors_phase_token == current_phase_token):
+            # Reuse cached priors if phase hasn't changed
+            priors_map = node._priors_cache
         else:
-            probs = priors_tensor / priors_tensor.sum()
+            # Prefer the vectorized prior computation for speed and correctness
+            try:
+                # Compute full priors for all valid actions if action space is small
+                t_priors = time.time()
+                priors_tensor = self.action_manager._compute_priors_vectorized(policy_on_device, valid_actions, masks)
+                # Move to CPU numpy for mapping; clamp minimum probability for safety
+                priors_np = priors_tensor.detach().cpu().numpy()
+                priors_map = {a: float(max(float(p), 1e-12)) for a, p in zip(valid_actions, priors_np)}
+                _mcts_priors_time = time.time() - t_priors
+                #print(f"[MCTS::_expand] priors_compute_time={_mcts_priors_time:.4f}s node_id={id(node)} num_actions={len(valid_actions)}")
+            except Exception:
+                traceback.print_exc()
+                raise RuntimeError("Vectorized prior computation failed during expansion.")        
 
-        # Sample one action from the top-K according to the computed priors (AlphaZero-style)
-        selected_idx = Categorical(probs=probs).sample().item()
-        action = top_k_actions[int(selected_idx)]
+            # cache priors and phase version
+            node._priors_cache = priors_map
+            node._priors_phase_token = current_phase_token
 
-        # Apply action to a copied architecture
+        # ----- Select the unexpanded action with highest UCT value -----
+        # UCT: Q + c * P * sqrt(N) / (1 + n)
+        best_uct = -float('inf')
+        selected_action = None
+        c = self.exploration_weight  # exploration coefficient
+
+        # AlphaZero PUCT: U = c_puct * P * sqrt(sum_parent_visits) / (1 + N_child)
+        # For unexpanded actions N_child == 0 and Q is unknown (treated as 0)
+        parent_visits = max(1, node.visits)
+        try:
+            # Build prior tensor in the same order as `valid_actions`
+            priors_list = [priors_map.get(a, node._priors_cache.get(a) if node._priors_cache is not None else 1e-12) for a in valid_actions]
+            P_tensor = torch.tensor(priors_list, dtype=torch.float32)
+
+            # For unexpanded actions, child visit counts are zero -> denominator = 1
+            denom = 1.0
+            u_tensor = c * P_tensor * (math.sqrt(parent_visits) / denom)
+
+            # Select index of maximum U value
+            sel_idx = int(torch.argmax(u_tensor).item())
+            selected_action = valid_actions[sel_idx]
+            best_uct = float(u_tensor[sel_idx].item())
+        except Exception:
+            # Fallback to safe Python loop if vectorized path fails
+            selected_action = None
+            best_uct = -float('inf')
+            for a in valid_actions:
+                Q = 0.0  # exploitation term unknown for unexpanded children
+                N_child = 0  # unexpanded -> zero visits
+                P = priors_map.get(a, node._priors_cache.get(a) if node._priors_cache is not None else 0.0)
+                uct_score = Q + c * P * (math.sqrt(parent_visits) / (1 + N_child))
+                if uct_score > best_uct:
+                    best_uct = uct_score
+                    selected_action = a
+
+        # ----- Apply selected action (lazy expansion) -----
         new_architecture = node._copy_architecture()
-        success = self.action_space.apply_action(new_architecture, action)
-
+        success = self.action_space.apply_action(new_architecture, selected_action)
         if not success:
-            return (node, node.policy_value['value'].item())
+            node._unexpanded_actions_set.remove(selected_action)
+            # Extract value from new network output signature
+            value_output = node.policy_value.get('value')
+            if isinstance(value_output, torch.Tensor):
+                value = value_output.item()
+            else:
+                raise RuntimeError("Node policy_value missing 'value' tensor during failed expansion.")
+            return node, value
 
-        # Evaluate the sampled child architecture
+        # Create child node and evaluate it, caching CPU-detached policy outputs
+        child_node = NeuralMCTSNode(new_architecture, parent=node, action=selected_action)
         with torch.no_grad():
             child_graph = self._prepare_graph_data(new_architecture)
-            child_policy = self.policy_value_net(child_graph, phase = self.current_cycle.current_phase.value)
-            child_value = child_policy['value'].item()
+            child_graph['node_features'] = child_graph['node_features'].to(self.device)
+            child_graph['edge_index'] = child_graph['edge_index'].to(self.device)
+            child_graph['layer_positions'] = child_graph['layer_positions'].to(self.device)
+            t_child = time.time()
+            child_policy = self.policy_value_net(child_graph, phase=self.current_cycle.get_phase_value())
+            _mcts_child_eval_time = time.time() - t_child
+        # Store CPU-detached copy to avoid retaining GPU memory
+        child_node.policy_value = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in child_policy.items()}
+        child_node.prior_prob = node._priors_cache[selected_action]
 
-        # Create child node with the sampled action and evaluated policy
-        child = NeuralMCTSNode(new_architecture, parent=node, action=action)
-        child.policy_value = child_policy
-        
-        # Compute prior for the child using cached masks (used by PUCT in future tree traversals)
-        try:
-            child.prior_prob = float(self._compute_action_prior(node.policy_value, node.architecture, top_k_actions, node=node))
-        except Exception:
-            child.prior_prob = 1.0 / len(top_k_actions)  # Uniform fallback
-        
-        # Update incremental expanded actions set for vectorized filtering
-        node._expanded_actions_set.add(action)
-        node.children.append(child)
-        
-        return (child, child_value)
+        # Update parent
+        node._unexpanded_actions_set.remove(selected_action)
+        node.children.append(child_node)
 
-    def _apply_dirichlet_noise_to_policy(self, policy_output: Dict, num_actions: int, 
+        # Extract value from new network output signature for return
+        value_output = child_node.policy_value.get('value')
+        if isinstance(value_output, torch.Tensor):
+            value = value_output.item()
+        else:
+            raise RuntimeError("Node policy_value missing 'value' tensor during expansion.")
+
+        total_expand_time = time.time() - expand_start_time
+        #print(f"[MCTS::_expand] total_time={total_expand_time:.4f}s node_id={id(node)} policy_eval={_mcts_policy_eval_time} priors_time={_mcts_priors_time} child_eval={_mcts_child_eval_time}\n")
+
+        return child_node, value
+
+    def _apply_dirichlet_noise_to_root(self, policy_output: Dict, num_actions: int, 
                                          epsilon: float = 0.25, alpha: float = 0.3):
         """Apply Dirichlet noise to root policy logits for exploration (AlphaZero-style).
         
@@ -489,104 +572,36 @@ class NeuralMCTS(MCTS):
             epsilon: Weight of noise (0.25 = 75% prior, 25% noise)
             alpha: Dirichlet concentration parameter (lower = more dispersed)
         """
-        # Generate Dirichlet noise for action type head
-        noise = np.random.dirichlet([alpha] * max(1, num_actions))
-        
-        # Extract action type logits and convert noise to log scale for mixing with logits
+        # Handle new network output signature - extract action_type logits
         action_type_logits = policy_output['action_type']
-        # Convert logits to probabilities via softmax
-        action_type_probs = F.softmax(action_type_logits, dim=-1).detach().cpu().numpy()
-        
-        # Mix: noise affects only the action type head (main categorical decision)
-        # Scale noise to match number of action types (5 in this case)
-        if noise.shape[0] < action_type_probs.shape[-1]:
-            # Pad noise if needed (though it shouldn't be)
-            noise = np.pad(noise, (0, action_type_probs.shape[-1] - noise.shape[0]))
-        else:
-            noise = noise[:action_type_probs.shape[-1]]
-        
-        # Mix probabilities with noise
-        mixed_probs = (1.0 - epsilon) * action_type_probs[0] + epsilon * noise
-        
-        # Convert mixed probabilities back to logits and update
-        mixed_logits = np.log(np.clip(mixed_probs, 1e-8, 1.0))
-        policy_output['action_type'] = torch.tensor(mixed_logits, dtype=action_type_logits.dtype, device=action_type_logits.device).unsqueeze(0)
+        # Ensure 1-D probabilities vector
+        probs = F.softmax(action_type_logits, dim=-1)
+        if probs.dim() > 1 and probs.shape[0] == 1:
+            probs = probs.squeeze(0)
 
-    def _compute_action_prior(self, policy_output: Dict, action: Action, 
-                                        architecture: NeuralArchitecture,
-                                        node: 'NeuralMCTSNode' = None) -> float:
-        """Vectorized prior computation using masked logits (consistent with ActionManager masking).
-        
-        Computes the prior probability as the softmax probability of the action under the policy,
-        using the same masks that ActionManager applies when sampling.
-        
-        This ensures priors match the policy distribution over valid actions only.
-        
-        If node is provided and has cached masks, reuse them to avoid recomputation.
-        """
-        # Retrieve or compute action masks (cache on node if provided)
-        if node is not None and node._cached_masks is not None:
-            masks = node._cached_masks.copy()
-            tensor_size = masks.pop('tensor_size')
+        device = probs.device
+        num = probs.shape[-1]
+
+        # Sample Dirichlet noise on the same device
+        if num_actions <= 0:
+            num_actions = num
+        concentration = torch.full((num,), float(alpha), device=device)
+        noise_dist = torch.distributions.Dirichlet(concentration)
+        noise = noise_dist.sample()
+
+        # Mix probabilities with noise and convert back to logit space
+        mixed = (1.0 - epsilon) * probs + epsilon * noise
+        mixed = torch.clamp(mixed, 1e-8, 1.0)
+        mixed_logits = torch.log(mixed)
+
+        # Restore batch dim if needed
+        if action_type_logits.dim() > 1 and action_type_logits.shape[0] == 1:
+            policy_output['action_type'] = mixed_logits.unsqueeze(0)
         else:
-            masks = self.action_manager.get_action_masks(architecture, phase=self.current_cycle.current_phase.value)
-            tensor_size = masks.pop('tensor_size')
-            # Cache masks on node if provided
-            if node is not None:
-                node._cached_masks = {'tensor_size': tensor_size, **masks}
-        
-        # Move masks to policy device
-        device = policy_output['action_type'].device
-        for key in masks:
-            masks[key] = masks[key].to(device)
-        
-        # Helper to safe-index logits (handle both 1-D and 2-D)
-        def safe_squeeze(tensor):
-            return tensor.squeeze(0) if tensor.dim() > 1 and tensor.shape[0] == 1 else tensor
-        
-        prior = 1.0
-        
-        # 1. Action type probability (masked softmax over valid action types)
-        action_type_logits = policy_output['action_type']  # [batch or scalar]
-        action_type_logits = safe_squeeze(action_type_logits)  # [num_actions]
-        # Apply mask
-        masked_action_logits = action_type_logits + masks['action_type']
-        action_type_probs = F.softmax(masked_action_logits, dim=-1)
-        prior *= action_type_probs[action.action_type.value].item()
-        
-        # 2. Source neuron probability (if applicable, masked softmax)
-        if action.source_neuron is not None:
-            # Prepare logits with mask (padding + masking)
-            prepared_source = self.action_manager._prepare_logits(
-                policy_output['source_logits'], tensor_size, masks['source_neurons']
-            )
-            prepared_source = safe_squeeze(prepared_source)
-            source_probs = F.softmax(prepared_source, dim=-1)
-            if action.source_neuron < source_probs.shape[0]:
-                prior *= source_probs[action.source_neuron].item()
-        
-        # 3. Target neuron probability (if applicable, masked softmax)
-        if action.target_neuron is not None:
-            prepared_target = self.action_manager._prepare_logits(
-                policy_output['target_logits'], tensor_size, masks['target_neurons']
-            )
-            prepared_target = safe_squeeze(prepared_target)
-            target_probs = F.softmax(prepared_target, dim=-1)
-            if action.target_neuron < target_probs.shape[0]:
-                prior *= target_probs[action.target_neuron].item()
-        
-        # 4. Activation probability (if applicable, masked softmax)
-        if action.activation is not None:
-            activation_logits = safe_squeeze(policy_output['activation_logits'])  # [num_activations]
-            activation_probs = F.softmax(activation_logits, dim=-1)
-            activation_idx = list(ActivationType).index(action.activation)
-            if activation_idx < activation_probs.shape[0]:
-                prior *= activation_probs[activation_idx].item()
-        
-        return prior
+            policy_output['action_type'] = mixed_logits
 
     def _select_top_k_actions_by_prior(self, policy_output: Dict, valid_actions: List[Action],
-                                       architecture: NeuralArchitecture, k: int) -> List[Action]:
+                                       k: int, masks: Dict) -> List[Action]:
         """Select top-K actions by prior probability for large action spaces (progressive widening).
         
         OPTIMIZED: Uses vectorized action type prior scoring instead of per-action computation.
@@ -610,12 +625,8 @@ class NeuralMCTS(MCTS):
         if len(valid_actions) <= k:
             # Fewer actions than K, return all
             return valid_actions
-        
-        # OPTIMIZATION: Only compute action_type priors (vectorized), not full priors
-        # This is ~20x faster than computing full prior (action_type + source + target + activation)
-        
+
         # Get masks for action types
-        masks = self.action_manager.get_action_masks(architecture, phase=self.current_cycle.current_phase.value)
         device = policy_output['action_type'].device
         masks['action_type'] = masks['action_type'].to(device)
         
@@ -703,3 +714,7 @@ class NeuralMCTS(MCTS):
             visit_probs[visit_counts.argmax()] = 1.0
         
         return visit_probs
+
+# Helper to safe-index logits (handle both 1-D and 2-D)
+def safe_squeeze(tensor):
+    return tensor.squeeze(0) if tensor.dim() > 1 and tensor.shape[0] == 1 else tensor

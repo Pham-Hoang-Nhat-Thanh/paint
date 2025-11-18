@@ -46,9 +46,19 @@ class QuickTrainer:
         - torch.utils.data.TensorDataset (has `.tensors`)
         - torchvision-like datasets with `.data` and `.targets` attributes
         Falls back silently when it cannot move the underlying data.
+        
+        Note: Does not move to CUDA if DataLoader uses multiple workers (num_workers > 0),
+        as CUDA tensors cannot be shared across processes.
         """
         dataset = getattr(loader, 'dataset', None)
         if dataset is None:
+            return False
+
+        # Do not move to CUDA if using multiple workers
+        # `self.device` may be a string (e.g. 'cuda:0') or a torch.device object;
+        # convert to string to perform a safe startswith check.
+        device_str = str(self.device)
+        if device_str.startswith('cuda') and hasattr(loader, 'num_workers') and loader.num_workers > 0:
             return False
 
         try:

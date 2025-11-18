@@ -27,7 +27,7 @@ class MCTSConfig:
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 500
+    max_children: int = 30
     temperature: float = 1.0
     temperature_decay: float = 0.99
 
@@ -50,7 +50,7 @@ class ArchitectureSearchConfig:
     sub_batch_size: int = 8
 
     # Stability threshold for evolutionary cycle
-    stability_threshold: float = 0.001
+    stability_threshold: float = 0.005  # Reduced to allow more exploration
 
     # Termination conditions
     target_accuracy: float = 0.97
@@ -94,7 +94,7 @@ class OverallConfig:
     learning_rate: float = 1e-3
     weight_decay: float = 1e-4
     max_grad_norm: float = 1.0
-    max_episodes: int = 300
+    max_episodes: int = 500
     
     # System
     device: str = "cuda:2"  # Options: "auto", "cpu", or "cuda:X"
@@ -110,7 +110,7 @@ class OverallConfig:
     checkpoint_interval: int = 1
     diagram_save_interval: int = 1
     log_interval: int = 1
-    train_interval: int = 5  # Train every N episodes
+    train_interval: int = 10  # Train every N episodes
 
     # GPU optimizations
     use_mixed_precision: bool = True

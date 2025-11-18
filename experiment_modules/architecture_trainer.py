@@ -10,10 +10,11 @@ import logging
 import traceback
 import warnings
 import gc
+from types import SimpleNamespace
 from PIL import Image, ImageDraw
 from blueprint_modules.network import Neuron, Connection
 from blueprint_modules.action import ActionType
-from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
+from blueprint_modules.evolutionary_cycle import EvolutionaryCycle, Phase
 
 # Suppress TF32 deprecation warnings
 warnings.filterwarnings("ignore", message="Please use the new API settings to control TF32 behavior")
@@ -107,7 +108,6 @@ class ArchitectureTrainer:
         self.episode = 0
         self.best_reward = 0.0
         self.training_history = []
-        self.final_architecture = None
         
         # Create directories
         os.makedirs(config.log_dir, exist_ok=True)
@@ -172,9 +172,11 @@ class ArchitectureTrainer:
             step_start_time = time.time()
             
             # Ensure MCTS uses the episode-level evolutionary cycle so searches
-            # start from the current episode phase and merge progress back
-            # (NeuralMCTS.search makes a local copy and may advance phases).
-            self.neural_mcts.current_cycle = self.evolutionary_cycle
+            # start from the current episode phase and merge progress back.
+            # Instead of overwriting `current_cycle`, expose the episode-level
+            # cycle as `episode_level_cycle` so `NeuralMCTS.search` can copy
+            # it and run a local search-level copy safely.
+            self.neural_mcts.current_cycle = self.evolutionary_cycle.copy()
             # MCTS search (always, no policy_mix_ratio since we're pure AlphaZero now)
             best_node, search_root = self.neural_mcts.search(
                 current_arch,
@@ -238,10 +240,13 @@ class ArchitectureTrainer:
                 mcts_root = best_node
                 mcts_root.parent = None # MEMORY LEAK FIX: Prune parent to allow GC
 
-            # Check for phase transition
+            # Check for phase transition (use conservative advance rule)
             self.evolutionary_cycle.add_evaluation(reward)
-            if self.evolutionary_cycle.is_stable():
+            if self.evolutionary_cycle.should_advance():
+                prev_phase = self.evolutionary_cycle.current_phase
+                prev_iter = self.evolutionary_cycle.phase_iteration_count
                 self.evolutionary_cycle.advance_phase()
+                print(f"Advancing evolutionary phase: {prev_phase} -> {self.evolutionary_cycle.current_phase} after {prev_iter} evaluations")
 
             # Calculate timing information
             step_end_time = time.time()
@@ -298,8 +303,6 @@ class ArchitectureTrainer:
         # ===== LOG EPISODE RESULTS =====
         self._log_episode(episode_metrics)
 
-        # ===== Save final architecture =====
-        self.final_architecture = current_arch.to_serializable_dict()
         # ===== EPISODE-LEVEL CACHE CLEANUP =====
         # Centralized helper: clear MCTS episode-level caches (evaluation cache)
         # and offload node-level policy tensors for the final root so memory
@@ -334,7 +337,7 @@ class ArchitectureTrainer:
         
         gc.collect()
 
-        return episode_metrics
+        return episode_metrics, current_arch.to_serializable_dict()
       
     def _actions_match(self, action1: Action, action2: Action) -> bool:
         """Check if two actions are equivalent"""
@@ -567,159 +570,82 @@ class ArchitectureTrainer:
             'batch': batch_tensor,
             'num_graphs': batch_size
         }
-    
-    def _precompute_mcts_marginals(self, visit_distribution: torch.Tensor, 
-                                    mcts_actions: List[Action]) -> Dict[str, List]:
-            """Precompute per-component MCTS marginal distributions at experience creation time.
-            
-            This avoids repeated marginalization during training and ensures deterministic,
-            cache-friendly computation. Stores as CPU lists for serialization and device safety.
-            
-            Returns Dict with keys:
-            - 'mcts_policy_action_type': [num_action_types] prob distribution (CPU list)
-            - 'mcts_policy_source': [max_neurons] prob distribution if source actions exist (CPU list)
-            - 'mcts_policy_target': [max_neurons] prob distribution if target actions exist (CPU list)
-            - 'mcts_policy_activation': [num_activations] prob distribution if activation actions exist (CPU list)
-            """
-            marginals = {}
 
-            if visit_distribution is None or mcts_actions is None:
-                return marginals
-
-            try:
-                # Cache expensive constants (avoid recomputation if called multiple times in episode)
-                if not hasattr(self, '_mcts_marginal_constants'):
-                    self._mcts_marginal_constants = {
-                        'num_action_types': len(ActionType),
-                        'num_activations': len(ActivationType),
-                        'activation_type_map': {act: idx for idx, act in enumerate(ActivationType)},
-                        'max_neurons': self.config.model.max_neurons
-                    }
-
-                const = self._mcts_marginal_constants
-                # Perform aggregation on the configured device to avoid repeated GPU->CPU syncs.
-                device = self.device
-
-                # Convert visit_distribution to a 1-D tensor on device
-                if torch.is_tensor(visit_distribution):
-                    visit_t = visit_distribution.detach().to(device).reshape(-1)
-                elif isinstance(visit_distribution, np.ndarray):
-                    visit_t = torch.from_numpy(visit_distribution.astype(np.float32)).to(device)
-                else:
-                    visit_t = torch.tensor(visit_distribution, dtype=torch.float32, device=device).reshape(-1)
-
-                if visit_t.numel() == 0:
-                    return marginals
-
-                # Vectorized creation of index tensors
-                act_map = const['activation_type_map']
-                types = torch.tensor([a.action_type.value if a else -1 for a in mcts_actions], dtype=torch.long, device=device)
-                sources = torch.tensor([a.source_neuron if a and a.source_neuron is not None else -1 for a in mcts_actions], dtype=torch.long, device=device)
-                targets = torch.tensor([a.target_neuron if a and a.target_neuron is not None else -1 for a in mcts_actions], dtype=torch.long, device=device)
-                activations = torch.tensor([act_map.get(a.activation, -1) if a else -1 for a in mcts_actions], dtype=torch.long, device=device)
-
-                # Aggregate on-device using scatter/index_add
-                # Action type marginal
-                valid_type_mask = types >= 0
-                if valid_type_mask.any():
-                    type_weights = torch.zeros(const['num_action_types'], dtype=torch.float32, device=device)
-                    type_weights.index_add_(0, types[valid_type_mask], visit_t[valid_type_mask])
-                    normalized = _normalize_clamp(type_weights, 1)
-                    if normalized is not None:
-                        marginals['mcts_policy_action_type'] = normalized
-
-                # Source marginal
-                src_mask = sources >= 0
-                if src_mask.any():
-                    src_weights = torch.zeros(const['max_neurons'], dtype=torch.float32, device=device)
-                    src_weights.index_add_(0, sources[src_mask], visit_t[src_mask])
-                    normalized = _normalize_clamp(src_weights, int(src_mask.sum().item()))
-                    if normalized is not None:
-                        marginals['mcts_policy_source'] = normalized
-
-                # Target marginal
-                tgt_mask = targets >= 0
-                if tgt_mask.any():
-                    tgt_weights = torch.zeros(const['max_neurons'], dtype=torch.float32, device=device)
-                    tgt_weights.index_add_(0, targets[tgt_mask], visit_t[tgt_mask])
-                    normalized = _normalize_clamp(tgt_weights, int(tgt_mask.sum().item()))
-                    if normalized is not None:
-                        marginals['mcts_policy_target'] = normalized
-
-                # Activation marginal
-                act_mask = activations >= 0
-                if act_mask.any():
-                    act_weights = torch.zeros(const['num_activations'], dtype=torch.float32, device=device)
-                    act_weights.index_add_(0, activations[act_mask], visit_t[act_mask])
-                    normalized = _normalize_clamp(act_weights, int(act_mask.sum().item()))
-                    if normalized is not None:
-                        marginals['mcts_policy_activation'] = normalized
-
-            except Exception as e:
-                print(f"    [Warning] Failed to precompute MCTS marginals (vectorized): {e}")
-
-            return marginals   
-     
     def _create_experience(self, state: NeuralArchitecture, action: Action, 
-                            reward: float, next_state: NeuralArchitecture,
-                            search_root=None) -> Dict:
-            """Create experience tuple with MCTS visit distribution for AlphaZero-style training
-            
-            AlphaZero Key Insight: Store MCTS-improved policy π(s) = visit_count(a) / total_visits
-            The network learns to predict this π, not raw network priors. This leverages MCTS's 
-            superior exploration and planning.
-            
-            Optimization: Precompute and store per-component marginal distributions as CPU lists
-            to avoid repeated marginalization during training.
-            """
-            experience = {
-                'state': state,
-                'action': action,
-                'reward': reward,  # Immediate reward (will be replaced with final episode reward)
-                'next_state': next_state,
-                'timestamp': time.time(),
-                'mcts_policy': None,  # Will be filled below
-                'mcts_actions': None,   # For debugging
-                # Per-component precomputed marginals (stored as CPU lists for safety/serialization)
-                'mcts_policy_action_type': None,
-                'mcts_policy_source': None,
-                'mcts_policy_target': None,
-                'mcts_policy_activation': None,
-                # OPTIMIZATION: Cache legal action masks to avoid recomputation during training (52% speedup!)
-                'legal_action_mask': self._get_legal_action_mask_cpu(state),  # Cache computed at episode time
-                'evolutionary_phase': int(self.evolutionary_cycle.current_phase.value)
-            }
-            
-            # Extract MCTS visit distribution (CRITICAL for AlphaZero learning!)
-            if search_root is not None and hasattr(search_root, 'children'):
-                try:
-                    # Get visit distribution from neural_mcts helper
-                    visit_distribution = self.neural_mcts.get_visit_distribution(
-                        search_root, temperature=1.0
-                    )
-                    
-                    if visit_distribution is not None and len(visit_distribution) > 0:
-                        # Store raw distribution as a CPU-native Python list for safety
-                        # (avoids keeping tensors on CUDA inside the replay buffer)
-                        # Simplified and robust conversion to a NumPy array
-                        if torch.is_tensor(visit_distribution):
-                            experience['mcts_policy'] = visit_distribution.detach().cpu().numpy().astype(np.float32)
-                        else:
-                            experience['mcts_policy'] = np.array(visit_distribution, dtype=np.float32)
+                      reward: float, next_state: NeuralArchitecture,
+                      search_root=None) -> Dict:
+        """Create experience with true AlphaZero MCTS policy targets"""
+        exp_phase = int(self.evolutionary_cycle.current_phase.value)
+        
+        experience = {
+            'state': state,
+            'action': action,
+            'reward': reward,
+            'next_state': next_state,
+            'timestamp': time.time(),
+            'mcts_policy': None,  # Raw visit distribution
+            'mcts_actions': None,  # Action objects
+            'evolutionary_phase': exp_phase,
+            'legal_action_mask': self._get_legal_action_mask(state, phase=exp_phase)
+        }
 
-                        # Store actions as plain python list for serialization/safety
-                        experience['mcts_actions'] = [child.action for child in search_root.children]
-                        
-                        # OPTIMIZATION: Precompute per-component marginals at experience creation
-                        # Returns Dict with keys 'mcts_policy_action_type', 'mcts_policy_source', etc. (CPU lists)
-                        marginals = self._precompute_mcts_marginals(visit_distribution, experience['mcts_actions'])
-                        experience.update(marginals)  # Merge marginals into experience
-                except Exception as e:
-                    print(f"    [Warning] Failed to extract MCTS policy: {e}")
-                    # Continue without policy - will train only on value
-            
-            return experience   
-    
+        # Extract MCTS visit distribution (AlphaZero policy improvement)
+        if search_root is not None and hasattr(search_root, 'children'):
+            try:
+                visit_distribution = self.neural_mcts.get_visit_distribution(
+                    search_root, temperature=1.0
+                )
+                
+                if visit_distribution is not None and len(visit_distribution) > 0:
+                    # Store raw distribution as CPU-native for safety
+                    if torch.is_tensor(visit_distribution):
+                        experience['mcts_policy'] = visit_distribution.detach().cpu().numpy().astype(np.float32)
+                    else:
+                        experience['mcts_policy'] = np.array(visit_distribution, dtype=np.float32)
+
+                    # Store the actual action objects
+                    experience['mcts_actions'] = [child.action for child in search_root.children]
+                    
+            except Exception as e:
+                print(f"    [Warning] Failed to extract MCTS policy: {e}")
+                
+        return experience
+
+    def _create_targets(self, experience: Dict) -> Dict:
+        """Create true AlphaZero training targets - direct MCTS policy"""
+        action = experience['action']
+        value_target = experience.get('value_target', 0.0)
+        
+        targets = {
+            'action_type': action.action_type.value,
+            'value': torch.tensor([value_target], dtype=torch.float32, device=self.device)
+        }
+
+        # Store component targets for the taken action (optional supervised learning)
+        if action.source_neuron is not None:
+            targets['source_neuron'] = action.source_neuron
+        
+        if action.target_neuron is not None:
+            targets['target_neuron'] = action.target_neuron
+        
+        if action.activation is not None:
+            targets['activation'] = list(ActivationType).index(action.activation)
+
+        # ===== ALPHAZERO POLICY TARGET =====
+        # Simply store the MCTS visit distribution and corresponding actions
+        if 'mcts_policy' in experience and 'mcts_actions' in experience:
+            # Store as tensors on device
+            if isinstance(experience['mcts_policy'], np.ndarray):
+                targets['mcts_policy'] = torch.tensor(
+                    experience['mcts_policy'], dtype=torch.float32, device=self.device
+                )
+            else:
+                targets['mcts_policy'] = experience['mcts_policy'].to(self.device)
+                
+            targets['mcts_actions'] = experience['mcts_actions']
+                
+        return targets
+
     def _should_terminate_episode(self, architecture: NeuralArchitecture, 
                                  step: int) -> str:
         """Check if episode should terminate"""
@@ -796,30 +722,8 @@ class ArchitectureTrainer:
         novelty_bonus = (neuron_count + connection_count) / 1000
         
         return priority + novelty_bonus
-    
-    def _get_legal_action_mask(self, state: NeuralArchitecture) -> Dict[str, torch.Tensor]:
-        """Create mask for legal actions in this state (FIX #3: Action Legality Masking)
-        
-        Prevents training on impossible action combinations. AlphaZero reference:
-        "We actually have to correct for this manually by masking out illegal moves, 
-        and then re-normalizing the remaining scores"
-        
-        Returns:
-            Dict with masks for action_type, source_neuron, target_neuron, activation
-            (1.0 = legal, 0.0 = illegal) on GPU device
-        """
-        # Get CPU mask first
-        mask_cpu = self._get_legal_action_mask_cpu(state)
-        
-        # Move to GPU
-        return {
-            'action_type': mask_cpu['action_type'].to(self.device),
-            'source_neuron': mask_cpu['source_neuron'].to(self.device),
-            'target_neuron': mask_cpu['target_neuron'].to(self.device),
-            'activation': mask_cpu['activation'].to(self.device),
-        }
-    
-    def _get_legal_action_mask_cpu(self, state: NeuralArchitecture) -> Dict[str, torch.Tensor]:
+      
+    def _get_legal_action_mask(self, state: NeuralArchitecture, phase: int = None) -> Dict[str, torch.Tensor]:
             """Create mask for legal actions on CPU (no GPU transfers).
             
             This is called during batch preparation to avoid per-graph GPU transfers.
@@ -829,10 +733,20 @@ class ArchitectureTrainer:
                 Dict with masks on CPU device
             """
 
-            # Check cache on the architecture instance to avoid recomputation
+            # Determine phase key to use for per-phase caching
             try:
-                if hasattr(state, '_cached_legal_action_mask_cpu') and state._cached_legal_action_mask_cpu is not None:
-                    return state._cached_legal_action_mask_cpu
+                if phase is None:
+                    phase_key = int(self.evolutionary_cycle.current_phase.value) if hasattr(self, 'evolutionary_cycle') else 0
+                else:
+                    phase_key = int(phase)
+            except Exception:
+                phase_key = 0
+
+            # Check cache on the architecture instance to avoid recomputation (per-phase)
+            try:
+                cache_by_phase = getattr(state, '_cached_legal_action_mask_cpu_by_phase', None)
+                if cache_by_phase and isinstance(cache_by_phase, dict) and phase_key in cache_by_phase:
+                    return cache_by_phase[phase_key]
             except Exception:
                 pass
 
@@ -844,9 +758,18 @@ class ArchitectureTrainer:
             
             # Vectorized mask construction for improved performance
             try:
-                # Use the episode-level evolutionary cycle when computing legal actions
-                # so the mask matches the search behavior (phase-dependent action sets).
-                legal_actions = self.action_space.get_valid_actions(state, evolutionary_cycle=self.evolutionary_cycle)
+                # Select evolutionary cycle to use for computing legal actions
+                if phase is not None:
+                    try:
+                        # Lightweight phase-only object to avoid constructing full EvolutionaryCycle
+                        tmp_cycle = SimpleNamespace(current_phase=Phase(int(phase)))
+                        legal_actions = self.action_space.get_valid_actions(state, evolutionary_cycle=tmp_cycle)
+                    except Exception:
+                        legal_actions = self.action_space.get_valid_actions(state, evolutionary_cycle=self.evolutionary_cycle)
+                else:
+                    # Use the episode-level evolutionary cycle when computing legal actions
+                    # so the mask matches the search behavior (phase-dependent action sets).
+                    legal_actions = self.action_space.get_valid_actions(state, evolutionary_cycle=self.evolutionary_cycle)
                 if not legal_actions:
                     # Return empty masks if no legal actions are available
                     return {
@@ -892,9 +815,13 @@ class ArchitectureTrainer:
                 'activation': activation_mask,
             }
 
-            # Cache on the architecture instance for future calls during the same episode
+            # Cache on the architecture instance for future calls during the same episode (per-phase)
             try:
-                setattr(state, '_cached_legal_action_mask_cpu', res)
+                cache_by_phase = getattr(state, '_cached_legal_action_mask_cpu_by_phase', None)
+                if cache_by_phase is None or not isinstance(cache_by_phase, dict):
+                    cache_by_phase = {}
+                cache_by_phase[phase_key] = res
+                setattr(state, '_cached_legal_action_mask_cpu_by_phase', cache_by_phase)
             except Exception:
                 pass
 
@@ -936,19 +863,6 @@ class ArchitectureTrainer:
         if not experiences:
             return None
         
-        # === PRE-COMPUTATION PHASE ===
-        # Cache config values (avoid repeated attribute lookups per graph)
-        ce_anneal_episodes = getattr(self.config.mcts, 'ce_anneal_episodes', 500)
-        initial_ce_weight = getattr(self.config.mcts, 'component_ce_weight', 0.25)
-        mcts_policy_weight = getattr(self.config.mcts, 'mcts_policy_weight', 1.0)
-        final_ce_weight = 0.05
-        
-        # Pre-compute annealed CE weight once (all graphs use same schedule)
-        if self.episode < ce_anneal_episodes:
-            progress = self.episode / max(1, ce_anneal_episodes)
-            annealed_ce_weight = initial_ce_weight * (1.0 - progress) + final_ce_weight * progress
-        else:
-            annealed_ce_weight = final_ce_weight
         
         # Initialize gradient accumulation across all sub-batches
         self.optimizer.zero_grad()
@@ -1085,8 +999,10 @@ class ArchitectureTrainer:
                 cached_masks_used += 1
             else:
                 # Fallback path: Recompute mask for old experiences (backward compat)
+                # Prefer computing the mask for the phase the experience was created in.
                 # This adds ~183ms per graph but only happens for old checkpoints
-                action_mask_cpu = self._get_legal_action_mask_cpu(exp['state'])
+                phase_for_exp = exp.get('evolutionary_phase', None)
+                action_mask_cpu = self._get_legal_action_mask(exp['state'], phase=phase_for_exp)
                 # Cache it for future use (in case buffer is reused)
                 exp['legal_action_mask'] = action_mask_cpu
                 computed_masks_fallback += 1
@@ -1174,61 +1090,7 @@ class ArchitectureTrainer:
         value_loss_sum = torch.tensor(0.0, device=self.device)
         mcts_policy_loss_sum = torch.tensor(0.0, device=self.device)
         try:
-            action_type_logits = predictions['action_type']  # [num_graphs, 5]
-            source_logits = predictions['source_logits']      # [num_graphs, max_neurons]
-            target_logits = predictions['target_logits']      # [num_graphs, max_neurons]
-            activation_logits = predictions['activation_logits']  # [num_graphs, num_activations]
             values = predictions['value']                      # [num_graphs, 1]
-            
-            # === PRE-BATCH ACTION MASKS ON GPU ===
-            # Move all CPU masks to GPU in batch (single operation)
-            action_type_masks_gpu = []
-            source_masks_gpu = []
-            target_masks_gpu = []
-            activation_masks_gpu = []
-            
-            for action_mask in action_masks_list_cpu:
-                action_type_masks_gpu.append(action_mask['action_type'].to(self.device))
-                source_masks_gpu.append(action_mask['source_neuron'].to(self.device))
-                target_masks_gpu.append(action_mask['target_neuron'].to(self.device))
-                activation_masks_gpu.append(action_mask['activation'].to(self.device))
-            
-            # Stack masks for batch operations
-            action_type_masks = torch.stack(action_type_masks_gpu, dim=0)  # [num_graphs, num_action_types]
-            source_masks = torch.stack(source_masks_gpu, dim=0)  # [num_graphs, max_neurons]
-            target_masks = torch.stack(target_masks_gpu, dim=0)  # [num_graphs, max_neurons]
-            activation_masks = torch.stack(activation_masks_gpu, dim=0)  # [num_graphs, num_activations]
-            
-            # === VECTORIZED MASKING ON GPU (entire batch at once) ===
-            # Apply masks to all graphs simultaneously
-            masked_action_logits = action_type_logits.clone()
-            masked_action_logits = masked_action_logits.masked_fill((action_type_masks == 0), -1e9)
-            
-            masked_source_logits = source_logits.clone()
-            masked_source_logits = masked_source_logits.masked_fill((source_masks == 0), -1e9)
-            
-            masked_target_logits = target_logits.clone()
-            masked_target_logits = masked_target_logits.masked_fill((target_masks == 0), -1e9)
-            
-            masked_activation_logits = activation_logits.clone()
-            masked_activation_logits = masked_activation_logits.masked_fill((activation_masks == 0), -1e9)
-            
-            # === PREPARE BATCH TARGETS ===
-            # Prepare optional targets (use -1 for "not applicable" so cross_entropy ignores them)
-            source_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
-            for i, t in enumerate(targets_list):
-                if 'source_neuron' in t:
-                    source_targets[i] = t['source_neuron']
-            
-            target_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
-            for i, t in enumerate(targets_list):
-                if 'target_neuron' in t:
-                    target_targets[i] = t['target_neuron']
-            
-            activation_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
-            for i, t in enumerate(targets_list):
-                if 'activation' in t:
-                    activation_targets[i] = t['activation']
             
             # === VALUE LOSS (vectorized) ===
             value_targets = torch.stack([t['value'].squeeze() if t['value'].dim() > 0 else t['value'] 
@@ -1236,71 +1098,121 @@ class ArchitectureTrainer:
             values_squeezed = values.squeeze(-1)
             value_loss = F.mse_loss(values_squeezed, value_targets, reduction='none')  # [num_graphs]
             
-            # === MCTS POLICY LOSSES (vectorized) ===
-            mcts_losses = torch.zeros(num_graphs, device=self.device)
-            num_mcts_targets_per_graph = torch.zeros(num_graphs, dtype=torch.long, device=self.device)
-            
-            # Process MCTS losses in batches
-            for mcts_head, logits_key, masked_logits_key in [
-                ('mcts_policy_action_type', 'action_type', 'masked_action_logits'),
-                ('mcts_policy_source', 'source_logits', 'masked_source_logits'),
-                ('mcts_policy_target', 'target_logits', 'masked_target_logits'),
-                ('mcts_policy_activation', 'activation_logits', 'masked_activation_logits'),
-            ]:
-                for graph_idx, targets in enumerate(targets_list):
-                    if mcts_head in targets and targets[mcts_head] is not None:
-                        try:
-                            mcts_target = targets[mcts_head].unsqueeze(0).to(self.device)
-                            logits = locals()[masked_logits_key][graph_idx:graph_idx+1]
-                            # Compute raw KL (unclamped) so we can detect pathological graphs
-                            kl_raw = F.kl_div(F.log_softmax(logits, dim=1), mcts_target, reduction='mean')
-                            # Track raw (unclamped) sums for later pathological detection
-                            if 'mcts_raw_sums' not in locals():
-                                mcts_raw_sums = torch.zeros(num_graphs, device=self.device)
-                            mcts_raw_sums[graph_idx] = mcts_raw_sums[graph_idx] + kl_raw.detach()
-                            # Clamp the per-head contribution to avoid numeric explosions
-                            kl_loss = torch.clamp(kl_raw, min=0.0, max=100.0)
-                            mcts_losses[graph_idx] = mcts_losses[graph_idx] + kl_loss
-                            num_mcts_targets_per_graph[graph_idx] = num_mcts_targets_per_graph[graph_idx] + 1
-                        except Exception as e:
-                            print(f"    [ERROR] Graph {graph_idx}: MCTS {mcts_head} KL exception: {e}")
-            
-            # Normalize MCTS losses
-            mcts_losses = torch.where(
-                num_mcts_targets_per_graph > 0,
-                mcts_losses / num_mcts_targets_per_graph.float(),
-                torch.zeros_like(mcts_losses)
-            )
+            # === ALPHAZERO POLICY LOSS (vectorized across sub-batch) ===
+            policy_loss = torch.zeros(num_graphs, device=self.device)
 
-            # Mirror loop behavior: if raw unclamped per-graph KL sum exceeded threshold
-            # then zero out the MCTS loss for that graph to match historical code.
-            try:
-                if 'mcts_raw_sums' in locals():
-                    pathological_mask = mcts_raw_sums > 100.0
-                    if pathological_mask.any():
-                        mcts_losses[pathological_mask] = 0.0
-            except Exception:
-                # If anything goes wrong here, continue without zeroing (safe fallback)
-                pass
+            # Flatten all MCTS actions across graphs in this sub-batch
+            flat_graph_idx = []
+            flat_action_types = []
+            flat_sources = []
+            flat_targets = []
+            flat_activations = []
+            flat_mcts_probs = []
+
+            for g_idx, targets in enumerate(targets_list):
+                if 'mcts_policy' not in targets or 'mcts_actions' not in targets:
+                    continue
+                for action, visit_prob in zip(targets['mcts_actions'], targets['mcts_policy']):
+                    flat_graph_idx.append(g_idx)
+                    flat_action_types.append(int(action.action_type.value))
+                    flat_sources.append(-1 if action.source_neuron is None else int(action.source_neuron))
+                    flat_targets.append(-1 if action.target_neuron is None else int(action.target_neuron))
+                    flat_activations.append(-1 if action.activation is None else int(list(ActivationType).index(action.activation)))
+                    flat_mcts_probs.append(float(visit_prob))
+
+            if len(flat_graph_idx) > 0:
+                device = self.device
+                fg = torch.tensor(flat_graph_idx, dtype=torch.long, device=device)
+                fa = torch.tensor(flat_action_types, dtype=torch.long, device=device)
+                fs = torch.tensor(flat_sources, dtype=torch.long, device=device)
+                ft = torch.tensor(flat_targets, dtype=torch.long, device=device)
+                fact = torch.tensor(flat_activations, dtype=torch.long, device=device)
+                fm = torch.tensor(flat_mcts_probs, dtype=torch.float32, device=device)
+
+                # p(action_type) for each flat entry
+                at_probs = F.softmax(predictions['action_type'], dim=-1)
+                p_at = at_probs[fg, fa]
+
+                # Initialize flat network probabilities
+                p_flat = p_at.clone()
+
+                # Group by (action_type, source) to compute conditional logits efficiently
+                from collections import defaultdict
+                groups = defaultdict(list)
+                for i, (a, s) in enumerate(zip(flat_action_types, flat_sources)):
+                    groups[(a, s)].append(i)
+
+                shared_features = predictions.get('shared_features', None)
+                source_encoder = predictions.get('source_encoder', None)
+
+                for (a_val, s_val), indices in groups.items():
+                    action_name = self.action_manager._get_action_type_name(a_val)
+                    idx_tensor = torch.tensor(indices, dtype=torch.long, device=device)
+
+                    # SOURCE probability if available
+                    if s_val >= 0 and 'source_logits_dict' in predictions and action_name in predictions['source_logits_dict']:
+                        src_logits = predictions['source_logits_dict'][action_name]
+                        src_probs = F.softmax(src_logits, dim=-1)
+                        p_src_vals = src_probs[fg[idx_tensor], fs[idx_tensor]]
+                        p_flat[idx_tensor] = p_flat[idx_tensor] * p_src_vals
+
+                    # TARGET probability if applicable and head exists (requires valid source)
+                    if s_val >= 0 and ft[idx_tensor].min().item() >= 0 and 'target_heads' in predictions and action_name in predictions['target_heads'] and shared_features is not None and source_encoder is not None:
+                        # shared_features for this group's graphs
+                        g_shared = shared_features[fg[idx_tensor]]  # [k, hidden]
+                        # compute source feature once
+                        src_one_hot = F.one_hot(torch.tensor([s_val], device=device), self.config.model.max_neurons).float()
+                        src_feat = source_encoder(src_one_hot)  # [1, h']
+                        src_feat_exp = src_feat.expand(g_shared.shape[0], -1)
+                        conditioned = torch.cat([g_shared, src_feat_exp], dim=-1)
+                        logits = predictions['target_heads'][action_name](conditioned)
+                        probs = F.softmax(logits, dim=-1)
+                        p_t_vals = probs[torch.arange(probs.shape[0], device=device), ft[idx_tensor]]
+                        p_flat[idx_tensor] = p_flat[idx_tensor] * p_t_vals
+
+                    # ACTIVATION probability if applicable
+                    if fact[idx_tensor].min().item() >= 0 and 'activation_heads' in predictions and action_name in predictions['activation_heads'] and shared_features is not None:
+                        g_shared = shared_features[fg[idx_tensor]]
+                        # If source is valid and activation head expects conditioning, condition on source
+                        if s_val >= 0 and source_encoder is not None and action_name == 'modify_activation':
+                            src_one_hot = F.one_hot(torch.tensor([s_val], device=device), self.config.model.max_neurons).float()
+                            src_feat = source_encoder(src_one_hot)
+                            src_feat_exp = src_feat.expand(g_shared.shape[0], -1)
+                            conditioned = torch.cat([g_shared, src_feat_exp], dim=-1)
+                            logits = predictions['activation_heads'][action_name](conditioned)
+                        else:
+                            # Unconditional activation head (e.g., add_neuron)
+                            logits = predictions['activation_heads'][action_name](g_shared)
+                        probs = F.softmax(logits, dim=-1)
+                        p_act_vals = probs[torch.arange(probs.shape[0], device=device), fact[idx_tensor]]
+                        p_flat[idx_tensor] = p_flat[idx_tensor] * p_act_vals
+
+                # Now compute per-graph AlphaZero cross-entropy loss using grouped flat probabilities
+                eps = 1e-8
+                for g in range(num_graphs):
+                    mask = (fg == g)
+                    if mask.sum() == 0:
+                        continue
+                    net_p = p_flat[mask]
+                    mcts_p = fm[mask]
+                    # normalize
+                    net_p = net_p / (net_p.sum() + eps)
+                    mcts_p = mcts_p / (mcts_p.sum() + eps)
+                    policy_loss[g] = -torch.sum(mcts_p * torch.log(net_p + eps))
             
             # === COMBINE LOSSES ===
-            # Apply sample weights
             weights_tensor = torch.tensor(weights_list, dtype=torch.float32, device=self.device)
-            # IMPORTANT: exclude the single-action CE from the optimization loss.
-            graph_losses = (mcts_losses + value_loss) * weights_tensor
-            
-            # Sum all losses
+            graph_losses = (policy_loss + value_loss) * weights_tensor
             total_loss = graph_losses.sum()
-            
+
             # Accumulate metrics (no .item() to avoid GPU sync)
             value_loss_sum = value_loss.sum().detach()
-            mcts_policy_loss_sum = mcts_losses.sum().detach() 
+            mcts_policy_loss_sum = policy_loss.sum().detach()
         except Exception as e:
-            print(f"    [ERROR] Vectorized loss computation failed: {e}")
+            print(f"    [ERROR] Policy+Value loss computation failed: {e}")
             import traceback
             traceback.print_exc()
             raise
-
         
         # Priorities for replay buffer update: outcome + surprise (TD-error proxy)
         # Each experience used for training should have a priority reflecting:
@@ -1337,178 +1249,98 @@ class ArchitectureTrainer:
       
         return {
             'loss': total_loss,
-            'total_loss': total_loss.item(),                   # Raw (unweighted) supervised CE
+            'total_loss': total_loss.item(),                  
             'value_loss': value_loss_val,
-            'mcts_policy_loss': mcts_policy_loss_val,           # Raw (unweighted) MCTS KL
+            'mcts_policy_loss': mcts_policy_loss_val,         
             'num_graphs': num_graphs,
             'valid_indices': valid_indices_list,
             'valid_rewards': valid_rewards,
         }
-    
-    def _create_targets(self, experience: Dict) -> Dict:
-        """Create training targets from experience (AlphaZero-style, complete factorized policy)
         
-        Optimizations:
-        - Cache ActionType enum and ActivationType mapping (avoid O(n) lookups)
-        - Single pass over MCTS actions for all distributions (or use precomputed marginals)
-        - Pre-allocate tensors on device to avoid redundant transfers
-        - Use precomputed per-component marginals from experience if available (fast path)
-        - Fallback to on-the-fly marginalization if precomputed not present (backward compat)
-        
-        AlphaZero trains on:
-        1. Value target: final episode outcome z (credit assignment)
-        2. Policy target: MCTS visit distribution π(s) aggregated by action type
-        3. Action components (only those relevant to the action type)
-        """
-        
-        # Cache expensive imports/lookups
-        if not hasattr(self, '_action_type_set'):
-            self._action_type_set = set([ActionType.ADD_CONNECTION, ActionType.REMOVE_CONNECTION, 
-                                         ActionType.MODIFY_ACTIVATION, ActionType.REMOVE_NEURON])
-            self._target_action_type_set = set([ActionType.ADD_CONNECTION, ActionType.REMOVE_CONNECTION])
-            self._activation_action_type_set = set([ActionType.MODIFY_ACTIVATION, ActionType.ADD_NEURON])
-            self._activation_type_list = list(ActivationType)
-            self._activation_type_map = {act: idx for idx, act in enumerate(self._activation_type_list)}
-            self._num_action_types = len(ActionType)
-            self._num_activations = len(ActivationType)
-        
-        action = experience['action']
-        # Use only final episode reward as the value target. Do NOT fall back
-        # to the immediate per-step reward; that would leak bootstrap signal.
-        value_target = experience.get('value_target', None)
-        if value_target is None:
-            # Missing value_target can happen for very old experiences; set to 0.0
-            # but do not use the immediate 'reward' as a proxy.
-            value_target = 0.0
-        
-        # ===== VALUE TARGET =====
-        targets = {
-            'action_type': action.action_type.value,
-            'value': torch.tensor([value_target], dtype=torch.float32, device=self.device)
-        }
-
-        # ===== COMPLETE FACTORIZED POLICY TARGETS (RELEVANT ONLY) =====
-        if action.action_type in self._action_type_set and action.source_neuron is not None:
-            targets['source_neuron'] = action.source_neuron
-        
-        if action.action_type in self._target_action_type_set and action.target_neuron is not None:
-            targets['target_neuron'] = action.target_neuron
-        
-        if action.action_type in self._activation_action_type_set and action.activation is not None:
-            targets['activation'] = self._activation_type_map.get(action.activation, -1)
-            if targets['activation'] == -1:
-                del targets['activation']
-
-        # ===== MCTS POLICY TARGETS (ALL POLICY HEADS) =====
-        # FAST PATH: Use precomputed marginals from experience if available (typical case)
-        precomputed_marginals = {
-            'mcts_policy_action_type': experience.get('mcts_policy_action_type'),
-            'mcts_policy_source': experience.get('mcts_policy_source'),
-            'mcts_policy_target': experience.get('mcts_policy_target'),
-            'mcts_policy_activation': experience.get('mcts_policy_activation')
-        }
-        
-        # Check if we have any precomputed marginals (new storage format)
-        has_precomputed = any(m is not None for m in precomputed_marginals.values())
-        
-        if has_precomputed:
-            # Use precomputed marginals (stored as CPU lists, convert to GPU tensors)
-            if precomputed_marginals['mcts_policy_action_type'] is not None:
-                targets['mcts_policy_action_type'] = torch.tensor(
-                    precomputed_marginals['mcts_policy_action_type'], 
-                    dtype=torch.float32, device=self.device
-                )
+    def _compute_action_probability(self, predictions, graph_idx, action: Action):
+        """Compute network's probability for a specific composite action"""
+        try:
+            # Get action type probability
+            action_type_logits = predictions['action_type'][graph_idx]
+            action_type_probs = F.softmax(action_type_logits, dim=-1)
+            p_action_type = action_type_probs[action.action_type.value]
             
-            if precomputed_marginals['mcts_policy_source'] is not None:
-                targets['mcts_policy_source'] = torch.tensor(
-                    precomputed_marginals['mcts_policy_source'],
-                    dtype=torch.float32, device=self.device
-                )
+            total_prob = p_action_type
             
-            if precomputed_marginals['mcts_policy_target'] is not None:
-                targets['mcts_policy_target'] = torch.tensor(
-                    precomputed_marginals['mcts_policy_target'],
-                    dtype=torch.float32, device=self.device
-                )
+            # For conditional network, compute conditional probabilities
+            action_type_name = self.action_manager._get_action_type_name(action.action_type.value)
             
-            if precomputed_marginals['mcts_policy_activation'] is not None:
-                targets['mcts_policy_activation'] = torch.tensor(
-                    precomputed_marginals['mcts_policy_activation'],
-                    dtype=torch.float32, device=self.device
-                )
-        
-        elif 'mcts_policy' in experience and 'mcts_actions' in experience:
-            # FALLBACK: On-the-fly marginalization (backward compat for old experiences)
-            mcts_policy = experience['mcts_policy']
-            mcts_actions = experience['mcts_actions']
-            # Fix: avoid ambiguous boolean value for tensors/lists
-            mcts_policy_len = mcts_policy.numel() if torch.is_tensor(mcts_policy) else len(mcts_policy)
-            mcts_actions_len = mcts_actions.numel() if torch.is_tensor(mcts_actions) else len(mcts_actions)
-            if mcts_policy is not None and mcts_actions is not None and mcts_policy_len > 0 and mcts_actions_len > 0:
-                try:
-                    max_neurons = self.config.model.max_neurons
+            # Source probability (if applicable)
+            if (action.source_neuron is not None and 
+                'source_logits_dict' in predictions and
+                action_type_name in predictions['source_logits_dict']):
+                
+                source_logits = predictions['source_logits_dict'][action_type_name][graph_idx]
+                source_probs = F.softmax(source_logits, dim=-1)
+                p_source = source_probs[action.source_neuron]
+                total_prob *= p_source
+                
+                # Target probability (if applicable and conditioned on source)
+                if (action.target_neuron is not None and
+                    'target_heads' in predictions and
+                    action_type_name in predictions['target_heads'] and
+                    'shared_features' in predictions and
+                    'source_encoder' in predictions):
                     
-                    # Pre-allocate all distributions on device (avoid .to(device) transfers)
-                    action_type_dist = torch.zeros(self._num_action_types, dtype=torch.float32, device=self.device)
-                    source_dist = torch.zeros(max_neurons, dtype=torch.float32, device=self.device)
-                    target_dist = torch.zeros(max_neurons, dtype=torch.float32, device=self.device)
-                    activation_dist = torch.zeros(self._num_activations, dtype=torch.float32, device=self.device)
+                    # Encode source for conditioning
+                    source_one_hot = F.one_hot(
+                        torch.tensor([action.source_neuron], device=self.device), 
+                        self.config.model.max_neurons
+                    ).float()
+                    source_features = predictions['source_encoder'](source_one_hot)
+                    graph_features = predictions['shared_features'][graph_idx:graph_idx+1]
+                    conditioned_features = torch.cat([graph_features, source_features], dim=-1)
                     
-                    source_count = target_count = activation_count = 0
+                    # Get conditional target logits
+                    target_logits = predictions['target_heads'][action_type_name](conditioned_features)
+                    target_probs = F.softmax(target_logits, dim=-1)
+                    p_target = target_probs[0, action.target_neuron]
+                    total_prob *= p_target
+                
+                # Activation probability (if applicable)
+                if (action.activation is not None and
+                    'activation_heads' in predictions and
+                    action_type_name in predictions['activation_heads']):
                     
-                    # Single pass over all MCTS actions (4x faster than 4 separate passes)
-                    for prob, act in zip(mcts_policy, mcts_actions):
-                        if act is None:
-                            continue
-                        
-                        prob_val = float(prob)
-                        
-                        # Action type always included
-                        action_type_dist[act.action_type.value] += prob_val
-                        
-                        # Source neuron (for relevant action types)
-                        if act.source_neuron is not None and act.source_neuron < max_neurons:
-                            source_dist[act.source_neuron] += prob_val
-                            source_count += 1
-                        
-                        # Target neuron (for relevant action types)
-                        if act.target_neuron is not None and act.target_neuron < max_neurons:
-                            target_dist[act.target_neuron] += prob_val
-                            target_count += 1
-                        
-                        # Activation (for relevant action types)
-                        if act.activation is not None:
-                            act_idx = self._activation_type_map.get(act.activation)
-                            if act_idx is not None:
-                                activation_dist[act_idx] += prob_val
-                                activation_count += 1
-                                
-                    # Add distributions to targets if count > 0
-                    normalized_action_dist = _normalize_clamp(action_type_dist, 1)  # Always has data
-                    if normalized_action_dist is not None:
-                        targets['mcts_policy_action_type'] = normalized_action_dist
+                    if action_type_name == 'modify_activation' and action.source_neuron is not None:
+                        # Condition on source
+                        source_one_hot = F.one_hot(
+                            torch.tensor([action.source_neuron], device=self.device), 
+                            self.config.model.max_neurons
+                        ).float()
+                        source_features = predictions['source_encoder'](source_one_hot)
+                        graph_features = predictions['shared_features'][graph_idx:graph_idx+1]
+                        conditioned_features = torch.cat([graph_features, source_features], dim=-1)
+                        activation_logits = predictions['activation_heads'][action_type_name](conditioned_features)
+                    else:
+                        # Unconditional
+                        activation_logits = predictions['activation_heads'][action_type_name](
+                            predictions['shared_features'][graph_idx:graph_idx+1]
+                        )
                     
-                    if source_count > 0:
-                        targets['mcts_policy_source'] = _normalize_clamp(source_dist, source_count)
-                    
-                    if target_count > 0:
-                        targets['mcts_policy_target'] = _normalize_clamp(target_dist, target_count)
-                    
-                    if activation_count > 0:
-                        targets['mcts_policy_activation'] = _normalize_clamp(activation_dist, activation_count)
-                    
-                except Exception as e:
-                    print(f"    [Warning] Failed to create MCTS policy targets: {e}")
+                    activation_probs = F.softmax(activation_logits, dim=-1)
+                    activation_idx = list(ActivationType).index(action.activation)
+                    p_activation = activation_probs[0, activation_idx]
+                    total_prob *= p_activation
+            
+            return total_prob.item() if isinstance(total_prob, torch.Tensor) else total_prob
+            
+        except Exception as e:
+            print(f"    [Warning] Failed to compute action probability: {e}")
+            return None
 
-        return targets
-    
     def run_training(self):
         """Run complete training process using AlphaZero-style MCTS + policy network"""
         print("Starting architecture search training...")
         
         while self.episode < self.config.max_episodes:
             # Run training episode
-            episode_metrics = self.run_training_episode()
+            episode_metrics, final_architecture = self.run_training_episode()
             
             # Train on batch(s) if we have enough experiences
             train_interval = getattr(self.config, 'train_interval', 10)
@@ -1566,7 +1398,7 @@ class ArchitectureTrainer:
 
             # Checkpoint periodically
             if (self.episode + 1) % self.config.checkpoint_interval == 0 or self.episode == 0:
-                self._save_checkpoint()
+                self._save_checkpoint(final_architecture=final_architecture)
 
             # Update episode counter
             self.episode += 1
@@ -1722,7 +1554,7 @@ class ArchitectureTrainer:
             'training_history': self.training_history,
             'config': self.config,
             'experience_buffer': self.experience_buffer.state_dict(),
-            'final_architecture': self.final_architecture
+            'final_architecture': final_architecture
         }
 
         filename = f"checkpoint_ep{self.episode}.pth"
@@ -1760,7 +1592,7 @@ class ArchitectureTrainer:
         """
         try:
             # Only draw 10 diagrams per episode to limit I/O
-            if (step + 1) % (self.config.search.max_steps_per_episode // 10) != 0 and step != 0:
+            if (step + 1) % max(self.config.search.max_steps_per_episode // 10, 1) != 0 and step != 0:
                 return
             # Create directory
             os.makedirs(f'architecture_diagrams/ep{self.episode:03d}', exist_ok=True)
@@ -1865,24 +1697,3 @@ class ArchitectureTrainer:
         except Exception as e:
             print(f"Failed to draw architecture diagram: {e}")
             traceback.print_exc()
-
-
-# Normalize and clamp with epsilon guard
-def _normalize_clamp(dist, count):
-    if count == 0:
-        return None
-    policy_sum = dist.sum()
-    # Safe normalization: normalize when sum>0 and avoid forcing tiny
-    # non-zero probabilities up to a hard minimum which would distort
-    # small probability mass in large action spaces. We only guard
-    # against division by zero here.
-    if policy_sum > 0.0:
-        dist = dist / policy_sum
-    else:
-        return None
-    # Do not enforce a global minimum clamp on tiny non-zero probs;
-    # leave small masses as-is so long-tail probability is preserved.
-    # Only ensure numerical stability by renormalizing to sum==1.
-    normalized = dist / dist.sum()
-    # Convert to CPU list for serialization and storage safety
-    return normalized.cpu().tolist()
