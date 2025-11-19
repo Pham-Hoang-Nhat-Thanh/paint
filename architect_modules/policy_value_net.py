@@ -14,7 +14,19 @@ if torch.cuda.is_available():
     torch.backends.cudnn.allow_tf32 = True
 
 class UnifiedPolicyValueNetwork(nn.Module):
-    """Unified network that outputs both policy and value predictions"""
+    """A network that predicts both policy and value from a graph representation.
+
+    This network uses a GraphTransformer to encode the neural architecture and
+    outputs a policy (logits for different actions) and a value (a scalar
+    prediction of the architecture's quality).
+
+    Attributes:
+        hidden_dim (int): The dimensionality of hidden layers.
+        max_neurons (int): The maximum number of neurons the policy heads can
+            handle.
+        num_actions (int): The number of discrete action types.
+        num_activations (int): The number of activation function types.
+    """
     
     def __init__(self, node_feature_dim: int, hidden_dim: int = 128,
                  max_neurons: int = 1000, num_actions: int = 5,
@@ -101,6 +113,18 @@ class UnifiedPolicyValueNetwork(nn.Module):
                     nn.init.constant_(module.bias, 0)
     
     def forward(self, graph_data: Dict, phase: int) -> Dict[str, torch.Tensor]:
+        """Performs the forward pass for the policy-value network.
+
+        Args:
+            graph_data (Dict): A dictionary containing the graph representation
+                of the neural architecture.
+            phase (int): The current evolutionary phase, used for conditioning
+                the network.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the policy logits
+            for various action components and the predicted value.
+        """
         num_graphs = graph_data.get('num_graphs', 1)
         model_device = next(self.parameters()).device
         
@@ -159,7 +183,18 @@ class UnifiedPolicyValueNetwork(nn.Module):
             'value': self.value_head(shared_features)
         }
 class ActionManager:
-    """Manages action selection with masking, validation, and conditional distributions"""
+    """Handles action selection, masking, and validation.
+
+    This class is responsible for generating action masks to prevent invalid
+    actions, computing action probabilities based on the policy network's
+    output, and providing a clean interface for action selection during MCTS.
+
+    Attributes:
+        max_neurons (int): The maximum number of neurons supported.
+        action_space (ActionSpace): The action space definition.
+        exploration_boost (float): A factor to boost exploration of
+            under-represented actions.
+    """
 
     def __init__(self, max_neurons: int = 100, action_space: ActionSpace = None, exploration_boost: float = 0.5):
         self.max_neurons = max_neurons
@@ -381,7 +416,19 @@ class ActionManager:
         return result
 
     def get_action_masks(self, architecture: NeuralArchitecture, phase: int) -> Dict[str, torch.Tensor]:
-        """Get masks for invalid actions"""
+        """Generates masks to prevent illegal actions based on the architecture.
+
+        This method creates several boolean masks that indicate which actions
+        are valid for the current architectural state and evolutionary phase.
+
+        Args:
+            architecture (NeuralArchitecture): The current neural architecture.
+            phase (int): The current evolutionary phase.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary of masks for different action
+            components.
+        """
         neurons = architecture.neurons
         
         # Optimized: filter hidden neurons once and cache neuron type info

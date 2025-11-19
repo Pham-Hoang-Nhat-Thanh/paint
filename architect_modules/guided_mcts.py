@@ -12,7 +12,18 @@ import torch.nn.functional as F
 from collections import deque
 
 class NeuralMCTSNode(MCTSNode):
-    """MCTS node enhanced with neural network predictions"""
+    """Represents a node in the MCTS tree, enhanced with neural network data.
+
+    This class extends the base `MCTSNode` to store policy and value
+    predictions from the neural network, which are used to guide the search
+    process.
+
+    Attributes:
+        policy_value (Dict): A dictionary containing the raw output from the
+            policy-value network for this node's architecture.
+        prior_prob (float): The prior probability of selecting the action that
+            led to this node, as predicted by the policy network.
+    """
 
     def __init__(self, architecture: NeuralArchitecture, policy_value: Dict = None,
                  parent=None, action: Action = None, curriculum=None):
@@ -32,16 +43,31 @@ class NeuralMCTSNode(MCTSNode):
         self._dirichlet_applied_phase_token = None
     
     def is_fully_expanded(self) -> bool:
-        """Check if all valid actions have been expanded as children.
-        
-        Since NeuralMCTS doesn't use untried_actions list, we need to compare
-        the expanded actions (children) with all valid actions for this state.
+        """Checks if all valid actions from this node have been explored.
+
+        A node is considered fully expanded if all possible actions from its
+        state have been added as child nodes.
+
+        Returns:
+            bool: True if the node is fully expanded, False otherwise.
         """
         return (self._valid_actions_cache is not None and self._unexpanded_actions_set is not None and
                 len(self._unexpanded_actions_set) == 0)
     
     def best_child(self, exploration_weight: float = 1.0) -> 'NeuralMCTSNode':
-        """Select best child using PUCT formula (AlphaZero style)"""
+        """Selects the best child node using the PUCT algorithm.
+
+        The PUCT (Polynomial Upper Confidence Trees) formula balances
+        exploitation (choosing nodes with high value) and exploration (choosing
+        nodes with high prior probability and low visit counts).
+
+        Args:
+            exploration_weight (float): The constant controlling the level of
+                exploration.
+
+        Returns:
+            NeuralMCTSNode: The child node with the highest PUCT score.
+        """
         if not self.children:
             return None
         # Vectorized selection: if any child has zero visits, prefer first such child
@@ -81,7 +107,19 @@ class NeuralMCTSNode(MCTSNode):
             return max(self.children, key=puct_score)
 
 class NeuralMCTS(MCTS):
-    """MCTS enhanced with neural network guidance"""
+    """Implements Monte Carlo Tree Search guided by a policy-value network.
+
+    This class orchestrates the MCTS process, using a neural network to provide
+    priors for action selection and to evaluate leaf nodes. It follows the
+    AlphaZero methodology for search.
+
+    Attributes:
+        policy_value_net (UnifiedPolicyValueNetwork): The network used to guide
+            the search.
+        device (str): The device ('cpu' or 'cuda') to run the network on.
+        exploration_weight (float): A constant controlling exploration in the
+            PUCT formula.
+    """
 
     def __init__(self, action_space: ActionSpace, policy_value_net: UnifiedPolicyValueNetwork,
                  device: str = 'cpu', exploration_weight: float = 1.0,
@@ -104,7 +142,11 @@ class NeuralMCTS(MCTS):
         self.max_children = max_children
 
     def cleanup(self):
-        """Clean up resources used by NeuralMCTS"""
+        """Cleans up resources to prevent memory leaks.
+
+        This method should be called after a search is complete to free up
+        memory used by the evaluation cache and to trigger garbage collection.
+        """
         # Clear evaluation cache to free memory
         self.evaluation_cache.clear()
         
@@ -205,23 +247,23 @@ class NeuralMCTS(MCTS):
     
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100,
                temperature: float = 1.0, reuse_root: NeuralMCTSNode = None) -> NeuralMCTSNode:
-        """Run standard neural-guided MCTS search (AlphaZero style).
-        
-        Terminology:
-        - iteration: One complete MCTS cycle (SELECT → EXPAND → BACKUP)
-        - step: One action within a rollout simulation (during _simulate, max_depth steps)
-        - episode: One full architecture design session (in architecture_trainer.py)
-        
-        Each iteration (i):
-        1. SELECT: Traverse tree to leaf using PUCT formula
-        2. EXPAND: Add one new child to leaf and evaluate it (if not terminal)
-        3. BACKUP: Propagate result up the tree
-        
+        """Runs the MCTS search for a given number of iterations.
+
+        This method performs the main MCTS loop: selection, expansion, and
+        backpropagation. It uses the policy-value network to guide the search
+        and can reuse a tree from a previous search to save computation.
+
         Args:
-            initial_architecture: Starting architecture for search
-            iterations: Number of MCTS iterations to run
-            temperature: Temperature for action selection
-            reuse_root: Optional existing tree root to continue search (enables tree reuse)
+            initial_architecture (NeuralArchitecture): The starting point for
+                the search.
+            iterations (int): The number of MCTS iterations to perform.
+            temperature (float): A parameter controlling the exploration in the
+                final action selection.
+            reuse_root (NeuralMCTSNode, optional): An existing node to start
+                the search from, enabling tree reuse. Defaults to None.
+
+        Returns:
+            NeuralMCTSNode: The node corresponding to the best action found.
         """
         
         # Reuse existing tree root if provided, otherwise create new root
@@ -681,20 +723,21 @@ class NeuralMCTS(MCTS):
         return top_k_actions
 
     def get_visit_distribution(self, node: 'NeuralMCTSNode', temperature: float = 1.0) -> torch.Tensor:
-        """Extract visit count distribution from MCTS node.
-        
-        Converts visit counts to probability distribution:
-            π(a|s) = visit_count(a)^(1/temperature) / sum(visit_count^(1/temperature))
-        
-        This is the MCTS-improved policy that AlphaZero trains the network to match.
-        
+        """Extracts the visit count distribution from a node's children.
+
+        This distribution, often referred to as the improved policy, is used as
+        a target for training the policy network. It reflects the knowledge
+        gained during the MCTS search.
+
         Args:
-            node: MCTS node (root of search tree)
-            temperature: Temperature for softening distribution (1.0 = visit counts only)
-                        Higher temperature = more uniform; 0 = greedy (argmax visits)
-        
+            node (NeuralMCTSNode): The node from which to extract the
+                distribution.
+            temperature (float): A parameter to control the softness of the
+                distribution.
+
         Returns:
-            torch.Tensor of shape [num_children] with action probabilities
+            torch.Tensor: A tensor representing the probability distribution over
+            actions.
         """
         if not node.children or len(node.children) == 0:
             # No children explored, return empty tensor

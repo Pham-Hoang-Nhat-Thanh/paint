@@ -6,7 +6,24 @@ import numpy as np
 import copy
 
 class MCTSNode:
-    """Node in the Monte Carlo Tree Search"""
+    """Represents a node in the Monte Carlo Tree Search tree.
+
+    Each node corresponds to a specific neural architecture and stores
+    information about the search process, such as visit counts, value
+    estimates, and child nodes.
+
+    Attributes:
+        architecture (NeuralArchitecture): The neural architecture represented
+            by this node.
+        parent (MCTSNode): The parent node in the search tree.
+        action (Action): The action that led from the parent to this node.
+        children (List[MCTSNode]): A list of child nodes.
+        visits (int): The number of times this node has been visited during
+            the search.
+        value (float): The estimated value of this node's architecture.
+        untried_actions (List[Action]): A list of actions that have not yet
+            been explored from this node.
+    """
     
     def __init__(self, architecture: NeuralArchitecture, parent=None, action: Action = None):
         self.architecture = architecture
@@ -18,10 +35,27 @@ class MCTSNode:
         self.untried_actions: List[Action] = []
         
     def is_fully_expanded(self) -> bool:
+        """Checks if all possible actions from this node have been explored.
+
+        Returns:
+            bool: True if the node is fully expanded, False otherwise.
+        """
         return len(self.untried_actions) == 0
     
     def best_child(self, exploration_weight=1.0):
-        """Select best child using UCB1 formula"""
+        """Selects the best child node using the UCB1 formula.
+
+        The UCB1 (Upper Confidence Bound 1) formula balances exploitation
+        (choosing nodes with high average value) and exploration (choosing nodes
+        that have been visited less frequently).
+
+        Args:
+            exploration_weight (float): A constant that controls the trade-off
+                between exploitation and exploration.
+
+        Returns:
+            MCTSNode: The child node with the highest UCB1 score.
+        """
         if not self.children:
             return None
             
@@ -37,7 +71,18 @@ class MCTSNode:
         return max(self.children, key=ucb_score)
     
     def expand(self, action_space: ActionSpace):
-        """Expand this node by adding a child for an untried action"""
+        """Expands the current node by creating a new child node.
+
+        A new child is created by applying one of the untried actions to the
+        current node's architecture.
+
+        Args:
+            action_space (ActionSpace): The action space, used to get valid
+                actions.
+
+        Returns:
+            MCTSNode: The new child node, or None if expansion fails.
+        """
         if not self.untried_actions:
             # Initialize untried actions if needed
             self.untried_actions = action_space.get_valid_actions(self.architecture)
@@ -99,7 +144,18 @@ class MCTSNode:
         return new_arch
 
 class MCTS:
-    """Monte Carlo Tree Search for architecture exploration"""
+    """Implements a standard Monte Carlo Tree Search algorithm.
+
+    This class orchestrates the MCTS process, including the selection,
+    expansion, simulation, and backpropagation phases.
+
+    Attributes:
+        action_space (ActionSpace): The action space for the search.
+        evaluation_fn (callable): A function that evaluates the performance of
+            a given architecture.
+        exploration_weight (float): A constant controlling the level of
+            exploration.
+    """
     
     def __init__(self, action_space: ActionSpace, evaluation_fn, exploration_weight=1.0):
         self.action_space = action_space
@@ -107,7 +163,16 @@ class MCTS:
         self.exploration_weight = exploration_weight
         
     def search(self, initial_architecture: NeuralArchitecture, iterations: int = 100):
-        """Run MCTS from initial architecture with optimized evaluation"""
+        """Runs the MCTS search for a specified number of iterations.
+
+        Args:
+            initial_architecture (NeuralArchitecture): The starting
+                architecture for the search.
+            iterations (int): The number of iterations to run the search.
+
+        Returns:
+            MCTSNode: The best child node found after the search.
+        """
         root = MCTSNode(initial_architecture)
 
         for i in range(iterations):

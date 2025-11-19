@@ -4,7 +4,17 @@ PAINT is a research-oriented Neural Architecture Search (NAS) framework that tre
 
 ## Overview
 
-PAINT replaces traditional evolutionary search with a neural-guided planning approach. Architectures are represented as graphs (neurons = nodes, connections = edges) and search is performed using a policy-value network to guide MCTS. The framework is designed for experimentation and research: fast topology changes, quick evaluation of candidate networks, and an extensible curriculum for training the policy/value models.
+PAINT is a framework for Neural Architecture Search (NAS) that uses a novel approach to discover new neural network architectures. Instead of relying on traditional evolutionary algorithms, PAINT treats architecture design as a planning problem. It uses a Monte Carlo Tree Search (MCTS) algorithm guided by a policy-value network to explore the vast search space of possible architectures.
+
+The key idea behind PAINT is to represent neural networks as graphs, where neurons are nodes and connections are edges. The MCTS algorithm then iteratively builds and modifies these graphs, guided by a learned policy that suggests promising actions to take. The framework is designed to be highly extensible and customizable, making it a powerful tool for research and experimentation in the field of NAS.
+
+## How it Works
+
+The core of PAINT is the interplay between the MCTS algorithm and the policy-value network. The MCTS algorithm is responsible for exploring the search space of possible architectures, while the policy-value network provides the guidance for this exploration.
+
+The search process starts with a simple initial architecture. The MCTS algorithm then performs a series of simulations, where each simulation consists of a sequence of actions that modify the architecture. The actions are chosen based on a combination of the policy network's predictions and the MCTS algorithm's own exploration strategy.
+
+After each simulation, the resulting architecture is evaluated, and the results are used to update the MCTS tree and the policy-value network. This process is repeated for a fixed number of iterations, and the best architecture found during the search is returned.
 
 ## Key Features
 
@@ -16,76 +26,59 @@ PAINT replaces traditional evolutionary search with a neural-guided planning app
 
 ## Core Components
 
-1. **Graph-based Architecture Representation**
-	- Neurons are nodes and connections are edges (see `blueprint_modules/network.py`).
-	- Architectures are dynamic and can be mutated by actions (add/remove neuron, modify activation, add/remove connection).
-	- Supports serialization, signature computation, and efficient connectivity queries.
+1.  **Graph-based Architecture Representation**:
+    -   Neurons are represented as nodes and connections as edges in a graph structure. This is managed by the `NeuralArchitecture` class in `blueprint_modules/network.py`.
+    -   Architectures are dynamic and can be modified by a set of discrete actions, such as adding or removing neurons and connections.
 
-2. **Neural-guided MCTS**
-	- MCTS base in `blueprint_modules/mcts.py`, extended by `architect_modules/guided_mcts.py` for neural guidance.
-	- Policy-value network (`architect_modules/policy_value_net.py`) uses a `GraphTransformer` encoder (`architect_modules/graph_transformer.py`).
-	- Action selection uses masking, Dirichlet noise, and visit-based selection for robust exploration.
+2.  **Neural-guided MCTS**:
+    -   The MCTS algorithm is implemented in `blueprint_modules/mcts.py` and extended for neural guidance in `architect_modules/guided_mcts.py`.
+    -   The policy-value network, defined in `architect_modules/policy_value_net.py`, uses a `GraphTransformer` encoder to process the graph representation of the architecture and output a policy and a value.
 
-3. **Training and Experimentation**
-	- Training orchestration in `experiment_modules/architecture_trainer.py` and `main.py`.
-	- Supports curriculum: supervised pretraining, mixed exploration, and self-play reinforcement learning.
-	- MNIST is used as a sandbox for rapid prototyping and benchmarking.
+3.  **Training and Experimentation**:
+    -   The training process is orchestrated by the `ArchitectureTrainer` class in `experiment_modules/architecture_trainer.py`.
+    -   The main entry point for running experiments is `experiment_modules/main.py`.
+    -   The framework uses MNIST as a sandbox for rapid prototyping and benchmarking.
 
-## Repository Layout
+## Project Structure
 
-- `blueprint_modules/` — Core data structures and algorithms (graph representation, MCTS base, action space)
-- `architect_modules/` — Model implementations (Graph Transformer, policy/value net) and neural-guided MCTS utilities
-- `experiment_modules/` — Experiments, configuration, and training orchestration (`main.py`, `architecture_trainer.py`, `config.py`)
-- `data/` — (MNIST raw files, not tracked by git)
-- `logs/` — Training logs and metrics
-- `tests/` — Unit tests and examples
+-   `architect_modules/`: Contains the implementations of the Graph Transformer, policy-value network, and other neural-guided MCTS utilities.
+-   `blueprint_modules/`: Defines the core data structures and algorithms, such as the graph-based representation of neural networks, the MCTS algorithm, and the action space.
+-   `experiment_modules/`: Includes the main scripts for running experiments, as well as configuration files and training orchestration.
+-   `data/`: This directory is not tracked by git and is used to store the MNIST dataset.
+-   `logs/`: This directory is used to store training logs and metrics.
 
-## Quick Start (Linux/Mac/Windows)
+## Quick Start
 
-1. **Create & activate a virtual environment (recommended):**
+1.  **Create and activate a virtual environment:**
+    ```bash
+    python -m venv .venv
+    source .venv/bin/activate
+    ```
 
-	```bash
-	python -m venv .venv
-	source .venv/bin/activate  # or .venv\Scripts\activate on Windows
-	```
+2.  **Install the required dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
 
-2. **Install dependencies:**
-
-	```bash
-	pip install -r requirements.txt
-	# Or, for minimal setup:
-	pip install torch torchvision numpy
-	```
-
-3. **Run the entry script:**
-
-	```bash
-	python experiment_modules/main.py
-	```
-
-	- The code will auto-detect CUDA and use GPU if available.
-	- Checkpoints and logs are saved in `paint/checkpoints/` and `paint/logs/`.
+3.  **Run the main training script:**
+    ```bash
+    python experiment_modules/main.py
+    ```
 
 ## Configuration
 
-All main hyperparameters and defaults are in `experiment_modules/config.py` (model sizes, MCTS settings, training, and search constraints). Key options:
+All the main hyperparameters and settings for the framework are located in `experiment_modules/config.py`. This includes configurations for the model, MCTS, and the architecture search process.
 
-- `ModelConfig`: `node_feature_dim`, `hidden_dim`, `num_heads`, `max_neurons`, etc.
-- `MCTSConfig`: `num_simulations`, `exploration_weight`, `max_children`, `dirichlet_alpha`, etc.
-- `ArchitectureSearchConfig`: `max_neurons`, `max_connections`, `max_steps_per_episode`, `reward_accuracy_weight`, `reward_loss_weight`, `reward_complexity_weight`, `priority_surprise_weight`, etc.
-- `OverallConfig`: `batch_size`, `learning_rate`, `device`, `checkpoint_interval`, `train_interval`, `use_mixed_precision`, etc.
+-   `ModelConfig`: Defines the parameters for the Graph Transformer and the policy-value network.
+-   `MCTSConfig`: Contains the settings for the MCTS algorithm, such as the number of simulations and the exploration weight.
+-   `ArchitectureSearchConfig`: Specifies the constraints for the architecture search, such as the maximum number of neurons and connections.
+-   `OverallConfig`: A top-level configuration that aggregates all the other configurations.
 
-The reward function is now:
+## Example Usage
 
-```
-reward = (accuracy_weight × accuracy)
-	- (loss_weight × loss)
-	- (complexity_weight × complexity)
-```
+To run the architecture search, you can use the `main.py` script in the `experiment_modules` directory. This script will load the configuration, create an `ArchitectureTrainer` instance, and start the training process.
 
-Experience replay uses prioritized sampling and supports checkpointing and buffer clearing.
-
-## Example Usage (Programmatic)
+You can also use the framework programmatically by importing the `ArchitectureTrainer` and `OverallConfig` classes:
 
 ```python
 from experiment_modules.architecture_trainer import ArchitectureTrainer
@@ -96,44 +89,17 @@ trainer = ArchitectureTrainer(config)
 history = trainer.run_training()
 ```
 
-Adjust `config` before instantiating the trainer to change search limits, model sizes, or training schedule.
-
 ## Developer Notes
 
-- **Shape mismatches** (e.g., `mat1 and mat2 shapes cannot be multiplied`) usually mean `ModelConfig.node_feature_dim` does not match the feature length produced in `blueprint_modules/network.py` (`Neuron.to_feature_vector()`).
-- **Policy/mask size mismatches** often relate to `max_neurons` vs actual indexed neuron IDs. The `ActionManager` in `architect_modules/policy_value_net.py` builds masks; inspect it for related errors.
-- **Prioritized Experience Replay**: Training uses prioritized sampling, buffer checkpointing, and memory-efficient sub-batching for large graphs.
-- **Reward and Logging**: Reward combines accuracy, loss, and complexity. Logging and checkpointing are robust and episode metrics are always saved.
-- **JIT and Mixed Precision**: The code supports TorchScript JIT and mixed precision for speed on modern GPUs.
-- **Checkpoints**: Training auto-resumes from the latest checkpoint in `checkpoints/` if available.
-
-## Results & Expected Behavior
-
-PAINT is a research prototype. In experiments, it aims to:
-
-- Discover compact architectures that reach competitive accuracy on small benchmarks (MNIST used as a sandbox)
-- Learn transferable priors that speed up search in subsequent runs
-- Produce novel connectivity patterns driven by planning rather than mutation operators
-- Efficiently utilize GPU memory and scale to large search spaces
+-   **Shape Mismatches**: If you encounter shape mismatches, it's likely due to a discrepancy between the `node_feature_dim` in `ModelConfig` and the feature vector length produced by `Neuron.to_feature_vector()` in `blueprint_modules/network.py`.
+-   **Policy/Mask Size Mismatches**: These errors are often related to the `max_neurons` setting and the actual number of indexed neuron IDs. The `ActionManager` in `architect_modules/policy_value_net.py` is a good place to start debugging these issues.
+-   **Prioritized Experience Replay**: The training process uses prioritized experience replay to improve sample efficiency.
+-   **Checkpoints**: The training script automatically resumes from the latest checkpoint in the `checkpoints/` directory if one is available.
 
 ## Contributing
 
-- Fork, add a feature branch, and open a PR with tests and a short description.
-- Keep experiments small for CI and debugging; add larger reproductions in separate experiment scripts.
-
-## Citation
-
-If you use PAINT in research, please cite it:
-
-```bibtex
-@software{paint2024,
-  title = {PAINT: Playing Around In Network Topologies},
-  author = {Pham-Hoang-Nhat-Thanh},
-  year = {2024},
-  url = {https://github.com/Pham-Hoang-Nhat-Thanh/paint}
-}
-```
+Contributions are welcome! Please fork the repository, create a new feature branch, and open a pull request with a clear description of your changes.
 
 ## License
 
-This project does not include a LICENSE file in the repository root. If you plan to publish the code, add a `LICENSE` (MIT, Apache-2.0, etc.) and mention it here.
+This project is not licensed.

@@ -33,7 +33,24 @@ from .experience_replay import ExperienceReplay
 from .config import OverallConfig
 
 class ArchitectureTrainer:
-    """Main class that orchestrates the complete training process"""
+    """Orchestrates the neural architecture search process.
+
+    This class manages the entire training loop, including running MCTS
+    episodes, training the policy-value network, and saving checkpoints.
+
+    Attributes:
+        config (OverallConfig): The overall configuration object.
+        device (torch.device): The device to run training on.
+        policy_value_net (UnifiedPolicyValueNetwork): The policy-value network.
+        action_space (ActionSpace): The action space for the search.
+        neural_mcts (NeuralMCTS): The MCTS search algorithm.
+        experience_buffer (ExperienceReplay): The experience replay buffer.
+        optimizer (optim.Optimizer): The optimizer for the policy-value network.
+        evolutionary_cycle (EvolutionaryCycle): The evolutionary cycle manager.
+        episode (int): The current training episode.
+        best_reward (float): The best reward achieved so far.
+        training_history (List): A history of training metrics.
+    """
     
     def __init__(self, config: OverallConfig, train_loader, test_loader):
         self.config = config
@@ -134,7 +151,7 @@ class ArchitectureTrainer:
         print(f"Starting AlphaZero-style MCTS training (no curriculum, pure self-play)")
     
     def cleanup(self):
-        """Clean up trainer resources"""
+        """Cleans up resources to prevent memory leaks."""
         # Clean up neural MCTS
         if hasattr(self.neural_mcts, 'cleanup'):
             self.neural_mcts.cleanup()
@@ -153,7 +170,15 @@ class ArchitectureTrainer:
         print("Trainer cleanup completed")
     
     def run_training_episode(self) -> Dict[str, Any]:
-        """Run one complete training episode using AlphaZero-style MCTS."""
+        """Runs a single episode of architecture search.
+
+        During an episode, the MCTS algorithm is used to explore the search
+        space and generate experiences, which are then used to train the
+        policy-value network.
+
+        Returns:
+            Dict[str, Any]: A dictionary of metrics for the episode.
+        """
         print(f"Starting episode {self.episode}")
         # Initialize architecture
         current_arch = NeuralArchitecture()
@@ -1335,7 +1360,11 @@ class ArchitectureTrainer:
             return None
 
     def run_training(self):
-        """Run complete training process using AlphaZero-style MCTS + policy network"""
+        """Runs the main training loop for a specified number of episodes.
+
+        Returns:
+            List: A history of training metrics.
+        """
         print("Starting architecture search training...")
         
         while self.episode < self.config.max_episodes:
@@ -1564,7 +1593,11 @@ class ArchitectureTrainer:
         print(f"Checkpoint saved: {filepath}")
     
     def load_checkpoint(self, checkpoint_path: str):
-        """Load training checkpoint"""
+        """Loads a training checkpoint from a file.
+
+        Args:
+            checkpoint_path (str): The path to the checkpoint file.
+        """
         checkpoint = torch.load(checkpoint_path, map_location=self.device, weights_only=False)
 
         self.policy_value_net.load_state_dict(checkpoint['policy_value_net_state'])

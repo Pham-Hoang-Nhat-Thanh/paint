@@ -18,8 +18,20 @@ from experiment_modules.architecture_trainer import ArchitectureTrainer
 _data_cache = {}
 
 def load_mnist_data(batch_size=64):
+    """Loads the MNIST dataset.
+
+    This function handles the downloading, transformation, and loading of the
+    MNIST dataset. It also caches the data loaders to avoid reloading on
+    subsequent calls.
+
+    Args:
+        batch_size (int): The batch size for the data loaders.
+
+    Returns:
+        Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]: A
+        tuple containing the training and test data loaders.
+    """
     global _data_cache
-    """Load MNIST dataset with caching and optimized loading"""
     cache_key = f"mnist_{batch_size}"
     if cache_key in _data_cache:
         return _data_cache[cache_key]
@@ -60,7 +72,15 @@ def load_mnist_data(batch_size=64):
     return train_loader, test_loader
 
 def find_latest_checkpoint(checkpoint_dir: str) -> str:
-    """Find the latest checkpoint file in the checkpoint directory"""
+    """Finds the path to the latest checkpoint file in a directory.
+
+    Args:
+        checkpoint_dir (str): The directory to search for checkpoints.
+
+    Returns:
+        str: The path to the latest checkpoint file, or None if no checkpoint
+        is found.
+    """
     if not os.path.exists(checkpoint_dir):
         return None
 
@@ -84,6 +104,7 @@ def find_latest_checkpoint(checkpoint_dir: str) -> str:
     return os.path.join(checkpoint_dir, latest_file)
 
 def main():
+    """The main entry point for the training process."""
     # Load configuration
     config = OverallConfig()
 
@@ -188,7 +209,7 @@ def main():
         trainer.cleanup()
 
 def cleanup_and_exit():
-    """Clean up resources and exit gracefully"""
+    """Performs cleanup operations before exiting the program."""
     print("\nCleaning up resources...")
     
     # Clear the data cache to help with cleanup
