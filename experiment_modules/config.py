@@ -3,7 +3,21 @@ from typing import List
 
 @dataclass
 class ModelConfig:
-    """Configuration for the Graph Transformer and Policy-Value Network"""
+    """Configuration for the Graph Transformer and Policy-Value Network.
+
+    Attributes:
+        node_feature_dim (int): The dimensionality of the input node features.
+        hidden_dim (int): The hidden dimensionality of the Graph Transformer.
+        num_heads (int): The number of attention heads in the Graph Transformer.
+        num_layers (int): The number of layers in the Graph Transformer.
+        dropout (float): The dropout rate used in the model.
+        use_edge_features (bool): Whether to use edge features in the Graph
+            Transformer.
+        max_neurons (int): The maximum number of neurons the policy-value
+            network can handle.
+        num_actions (int): The number of action types.
+        num_activations (int): The number of activation function types.
+    """
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
     hidden_dim: int = 2048  # Increased for more capacity
@@ -19,7 +33,21 @@ class ModelConfig:
 
 @dataclass
 class MCTSConfig:
-    """Configuration for AlphaZero-style Neural MCTS"""
+    """Configuration for the AlphaZero-style Neural MCTS.
+
+    Attributes:
+        num_simulations (int): The number of simulations to run for each MCTS
+            search.
+        exploration_weight (float): The exploration weight (c_puct) in the PUCT
+            formula.
+        dirichlet_alpha (float): The alpha parameter for the Dirichlet noise
+            added to the root node's policy.
+        dirichlet_epsilon (float): The weight of the Dirichlet noise.
+        max_children (int): The maximum number of child nodes to consider for
+            expansion.
+        temperature (float): The temperature for the final action selection.
+        temperature_decay (float): The decay rate for the temperature.
+    """
     # Search parameters
     num_simulations: int = 500  # Increased for better search quality
     exploration_weight: float = 1.0
@@ -33,7 +61,38 @@ class MCTSConfig:
 
 @dataclass
 class ArchitectureSearchConfig:
-    """Configuration for architecture search process"""
+    """Configuration for the architecture search process.
+
+    Attributes:
+        max_neurons (int): The maximum number of neurons allowed in an
+            architecture.
+        max_connections (int): The maximum number of connections allowed.
+        max_steps_per_episode (int): The maximum number of MCTS steps per
+            episode.
+        min_neurons (int): The minimum number of hidden neurons.
+        min_connections (int): The minimum number of connections.
+        quick_train_epochs (int): The number of epochs for quick training and
+            evaluation.
+        final_train_epochs (int): The number of epochs for final training.
+        evaluation_batch_size (int): The batch size for evaluation.
+        sub_batch_size (int): The sub-batch size for training.
+        stability_threshold (float): The stability threshold for the
+            evolutionary cycle.
+        target_accuracy (float): The target accuracy to stop the search.
+        reward_loss_weight (float): The weight for the loss component in the
+            reward function.
+        reward_complexity_weight (float): The weight for the complexity penalty
+            in the reward function.
+        reward_accuracy_weight (float): The weight for the accuracy component in
+            the reward function.
+        priority_surprise_weight (float): The weight for the surprise factor in
+            prioritized experience replay.
+        action_exploration_boost (float): A boost factor for exploring
+            under-represented actions.
+        connection_candidate_multiplier (int): A multiplier for the number of
+            connection candidates to consider.
+        allowed_actions (List): A list of allowed action types.
+    """
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
@@ -79,7 +138,42 @@ class ArchitectureSearchConfig:
 
 @dataclass
 class OverallConfig:
-    """Complete training configuration for AlphaZero-style MCTS + policy network"""
+    """A comprehensive configuration for the entire training and search process.
+
+    This dataclass aggregates all other configuration objects into a single
+    place.
+
+    Attributes:
+        model (ModelConfig): Configuration for the neural network models.
+        mcts (MCTSConfig): Configuration for the MCTS algorithm.
+        search (ArchitectureSearchConfig): Configuration for the architecture
+            search process.
+        batch_size (int): The batch size for training the policy-value network.
+        learning_rate (float): The learning rate for the optimizer.
+        weight_decay (float): The weight decay for the optimizer.
+        max_grad_norm (float): The maximum gradient norm for gradient clipping.
+        max_episodes (int): The maximum number of training episodes.
+        device (str): The device to run on ('auto', 'cpu', or 'cuda:X').
+        gpu_memory_fraction (float): The fraction of GPU memory to pre-allocate.
+        enable_memory_monitoring (bool): Whether to enable memory monitoring.
+        memory_check_threshold_mb (float): The memory threshold for monitoring.
+        seed (int): The random seed for reproducibility.
+        log_dir (str): The directory for saving logs.
+        checkpoint_dir (str): The directory for saving checkpoints.
+        eval_interval (int): The interval (in episodes) for evaluation.
+        checkpoint_interval (int): The interval for saving checkpoints.
+        diagram_save_interval (int): The interval for saving architecture
+            diagrams.
+        log_interval (int): The interval for logging.
+        train_interval (int): The interval for training the policy-value
+            network.
+        use_mixed_precision (bool): Whether to use automatic mixed precision.
+        gradient_accumulation_steps (int): The number of gradient accumulation
+            steps.
+        enable_tf32 (bool): Whether to enable TF32 for faster matrix math.
+        early_stopping_patience (int): The patience for early stopping.
+        early_stopping_min_delta (float): The minimum delta for early stopping.
+    """
     # Model
     model: ModelConfig = field(default_factory=ModelConfig)
 

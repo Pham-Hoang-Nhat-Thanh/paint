@@ -4,7 +4,21 @@ import torch
 import copy
 
 class ExperienceReplay:
-    """Stores and samples training experiences with prioritization"""
+    """Implements a prioritized experience replay buffer.
+
+    This buffer stores experiences (state, action, reward, etc.) and allows
+    for sampling of experiences with prioritization, which can lead to more
+    efficient training.
+
+    Attributes:
+        capacity (int): The maximum number of experiences to store.
+        alpha (float): The prioritization exponent.
+        beta (float): The importance sampling exponent.
+        buffer (List): The list of stored experiences.
+        priorities (np.ndarray): The priorities of the experiences.
+        position (int): The current position in the buffer.
+        size (int): The number of experiences in the buffer.
+    """
     
     def __init__(self, capacity: int = 10000, alpha: float = 0.6, beta: float = 0.4):
         self.capacity = capacity
@@ -16,7 +30,13 @@ class ExperienceReplay:
         self.size = 0
         
     def add(self, experience: Dict[str, Any], priority: float = None):
-        """Add experience with priority"""
+        """Adds an experience to the replay buffer.
+
+        Args:
+            experience (Dict[str, Any]): The experience to add.
+            priority (float, optional): The priority of the experience. If
+                None, the maximum existing priority is used.
+        """
         if priority is None:
             # Default priority for new experiences
             priority = max(self.priorities.max(), 1.0) if self.size > 0 else 1.0
@@ -32,7 +52,18 @@ class ExperienceReplay:
         self.position = (self.position + 1) % self.capacity
     
     def sample(self, batch_size: int) -> Tuple[List[Dict], List[int], torch.Tensor]:
-        """Sample batch of experiences with priority weighting"""
+        """Samples a batch of experiences from the buffer.
+
+        The sampling is done according to the priorities of the experiences.
+
+        Args:
+            batch_size (int): The number of experiences to sample.
+
+        Returns:
+            Tuple[List[Dict], List[int], torch.Tensor]: A tuple containing the
+            sampled experiences, their indices, and the importance sampling
+            weights.
+        """
         if self.size == 0:
             return [], [], torch.tensor([])
             
@@ -55,7 +86,12 @@ class ExperienceReplay:
         return experiences, indices.tolist(), weights
     
     def update_priorities(self, indices: List[int], priorities: List[float]):
-        """Update priorities for sampled experiences"""
+        """Updates the priorities of a batch of experiences.
+
+        Args:
+            indices (List[int]): The indices of the experiences to update.
+            priorities (List[float]): The new priorities for the experiences.
+        """
         for idx, priority in zip(indices, priorities):
             if idx < self.size:
                 self.priorities[idx] = priority + 1e-6  # Small epsilon to avoid zero priority
@@ -64,11 +100,22 @@ class ExperienceReplay:
         return self.size
     
     def is_ready(self, min_size: int) -> bool:
-        """Check if buffer has enough samples for training"""
+        """Checks if the buffer has enough experiences to start training.
+
+        Args:
+            min_size (int): The minimum number of experiences required.
+
+        Returns:
+            bool: True if the buffer is ready, False otherwise.
+        """
         return self.size >= min_size
 
     def state_dict(self):
-        """Serialize buffer and priorities for checkpointing"""
+        """Returns the state of the replay buffer for checkpointing.
+
+        Returns:
+            dict: A dictionary containing the state of the buffer.
+        """
         return {
             'capacity': self.capacity,
             'alpha': self.alpha,
@@ -80,7 +127,11 @@ class ExperienceReplay:
         }
 
     def load_state_dict(self, state):
-        """Restore buffer and priorities from checkpoint"""
+        """Restores the state of the replay buffer from a checkpoint.
+
+        Args:
+            state (dict): The state dictionary to load.
+        """
         self.capacity = state.get('capacity', 10000)
         self.alpha = state.get('alpha', 0.6)
         self.beta = state.get('beta', 0.4)
@@ -90,7 +141,7 @@ class ExperienceReplay:
         self.size = state.get('size', len(self.buffer))
 
     def clear(self):
-        """Clear all experiences from buffer"""
+        """Removes all experiences from the buffer."""
         self.buffer = []
         self.priorities = np.zeros(self.capacity, dtype=np.float32)
         self.position = 0

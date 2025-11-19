@@ -5,14 +5,35 @@ import os
 import traceback
 
 class Phase(Enum):
-    """Defines the phases of the evolutionary cycle"""
+    """Defines the phases of the evolutionary search cycle.
+
+    - EXPANDING: Focuses on adding new neurons to the architecture.
+    - REFINEMENT: Focuses on adding connections and modifying activations.
+    - PRUNING: Focuses on removing unnecessary neurons and connections.
+    """
     EXPANDING = 0
     REFINEMENT = 1
     PRUNING = 2
 
 @dataclass
 class EvolutionaryCycle:
-    """Tracks the state of an evolutionary cycle for architecture search"""
+    """Manages the state of the evolutionary search cycle.
+
+    This class tracks the current phase of the search, monitors for stability,
+    and determines when to transition to the next phase.
+
+    Attributes:
+        cycle_id (int): A unique identifier for the current cycle.
+        node_values (List[float]): A list of node values from recent
+            evaluations, used to check for stability.
+        stability_threshold (float): The threshold for value stability that
+            can trigger a phase transition.
+        current_phase (Phase): The current phase of the cycle.
+        phase_iteration_count (int): The number of iterations spent in the
+            current phase.
+        max_expanding_iterations (int): The maximum number of iterations for
+            the EXPANDING phase.
+    """
     cycle_id: int = 0
     node_values: List[float] = field(default_factory=list)
     stability_threshold: float = 0.001
@@ -22,12 +43,13 @@ class EvolutionaryCycle:
     # Max iterations the EXPANDING phase may last before forcing an advance
     max_expanding_iterations: int = 5
     def is_stable(self) -> bool:
-        """Determine whether the cycle is stable.
+        """Determines if the search has reached a stable state.
 
-        Stability is based on the range (max-min) of the last N evaluations.
-        To avoid spurious stability detections from very small samples (e.g.
-        a single value with delta==0), require at least `min_samples`
-        evaluations before declaring stability.
+        Stability is determined by checking if the range of the last N evaluation
+        values is below a certain threshold.
+
+        Returns:
+            bool: True if the cycle is stable, False otherwise.
         """
         min_samples = 15
         if len(self.node_values) < min_samples:
@@ -38,7 +60,11 @@ class EvolutionaryCycle:
         return delta <= self.stability_threshold
     
     def add_evaluation(self, value: float):
-        """Add a node value evaluation to the cycle"""
+        """Adds a new evaluation value to the cycle's history.
+
+        Args:
+            value (float): The evaluation value to add.
+        """
         self.node_values.append(value)
         # Track how many evaluations we've seen in this phase
         try:
@@ -47,11 +73,17 @@ class EvolutionaryCycle:
             self.phase_iteration_count = 1
 
     def should_advance(self, num_neurons = None, num_connections = None) -> bool:
-        """Decide whether the episode-level cycle should advance.
+        """Determines if the cycle should advance to the next phase.
 
-        Returns True when either stability has been reached, or when the
-        EXPANDING phase has lasted for at least `max_expanding_iterations`.
-        This prevents the expanding phase from persisting indefinitely.
+        The cycle advances if the search is stable or if the current phase has
+        exceeded its maximum allowed iterations.
+
+        Args:
+            num_neurons (int, optional): The current number of neurons.
+            num_connections (int, optional): The current number of connections.
+
+        Returns:
+            bool: True if the cycle should advance, False otherwise.
         """
         # If stable by value-range criterion, advance
         if self.is_stable():
@@ -70,10 +102,10 @@ class EvolutionaryCycle:
         return False
 
     def copy(self) -> 'EvolutionaryCycle':
-        """Return a shallow copy of the cycle suitable for local/search use.
+        """Creates a copy of the evolutionary cycle.
 
-        The copy is independent (lists are shallow-copied) so searches can
-        advance phases locally without mutating the episode-level cycle.
+        Returns:
+            EvolutionaryCycle: A new instance with the same state.
         """
         return EvolutionaryCycle(
             cycle_id=self.cycle_id,
@@ -83,7 +115,11 @@ class EvolutionaryCycle:
         )
     
     def advance_phase(self):
-        """Advances to the next phase and resets the cycle's tracking data."""
+        """Transitions the cycle to the next phase.
+
+        This method updates the current phase and resets the cycle's tracking
+        data.
+        """
         # Optional tracing: when enabled via environment variable, print
         # a stack trace and object id so callers that unexpectedly trigger
         # phase advances during simulations can be identified.
@@ -104,6 +140,10 @@ class EvolutionaryCycle:
         return self.cycle_id
     
     def get_phase_value(self):
-        """Return the semantic phase value (the one to pass to policy/mask APIs)."""
+        """Returns the integer value of the current phase.
+
+        Returns:
+            int: The integer representation of the current phase.
+        """
         # Keep calling code simple: always use this helper for the "phase value"
         return self.current_phase.value

@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from .evolutionary_cycle import EvolutionaryCycle
 
 class ActionType(Enum):
+    """Defines the types of actions that can modify a neural architecture."""
     ADD_NEURON = 0
     REMOVE_NEURON = 1
     MODIFY_ACTIVATION = 2
@@ -19,6 +20,18 @@ class ActionType(Enum):
 
 @dataclass
 class Action:
+    """Represents a single modification to a neural architecture.
+
+    Attributes:
+        action_type (ActionType): The type of action to be performed.
+        source_neuron (Optional[int]): The ID of the source neuron, if
+            applicable.
+        target_neuron (Optional[int]): The ID of the target neuron, if
+            applicable.
+        activation (Optional[ActivationType]): The activation function, if
+            applicable.
+        parameters (Dict): Additional parameters for the action.
+    """
     action_type: ActionType
     source_neuron: Optional[int] = None
     target_neuron: Optional[int] = None
@@ -43,7 +56,18 @@ class Action:
         return hash((self.action_type, self.source_neuron, self.target_neuron, self.activation))
 
 class ActionSpace:
-    """Manages valid actions for a given neural architecture"""
+    """Defines and manages the set of valid actions for a neural architecture.
+
+    This class is responsible for generating all possible valid actions that can
+    be taken from a given architectural state, subject to various constraints.
+
+    Attributes:
+        max_neurons (int): The maximum number of neurons allowed in an
+            architecture.
+        max_connections (int): The maximum number of connections allowed.
+        model_max_neurons (int): The hard limit of neurons supported by the
+            policy network model.
+    """
 
     def __init__(self, max_neurons: int = 1000, max_connections: int = 10000,
                  max_steps_per_episode: int = 50, connection_candidate_multiplier: int = 3,
@@ -62,7 +86,19 @@ class ActionSpace:
 
     def get_valid_actions(self, architecture: NeuralArchitecture,
                          evolutionary_cycle: Optional['EvolutionaryCycle'] = None) -> List[Action]:
-        """Get valid actions for the current architecture state based on the evolutionary phase."""
+        """Returns a list of valid actions for the given architecture.
+
+        The set of valid actions can be filtered based on the current
+        evolutionary phase to guide the search process.
+
+        Args:
+            architecture (NeuralArchitecture): The current architecture.
+            evolutionary_cycle (Optional['EvolutionaryCycle']): The current
+                evolutionary cycle, which determines the phase.
+
+        Returns:
+            List[Action]: A list of valid actions.
+        """
         if evolutionary_cycle is None:
             return self._get_full_action_space(architecture)
 
@@ -317,7 +353,18 @@ class ActionSpace:
         return valid_actions
 
     def apply_action(self, architecture: NeuralArchitecture, action: Action) -> bool:
-        """Apply an action to the architecture, return success status"""
+        """Applies a given action to the architecture.
+
+        This method modifies the architecture in-place based on the provided
+        action.
+
+        Args:
+            architecture (NeuralArchitecture): The architecture to modify.
+            action (Action): The action to apply.
+
+        Returns:
+            bool: True if the action was applied successfully, False otherwise.
+        """
         try:
             if action.action_type == ActionType.ADD_NEURON:
                 # New neurons are added as isolated (layer -1)
@@ -441,7 +488,11 @@ class ActionSpace:
             return self._full_action_primitives.get(sig, None)
 
     def clear_cache(self):
-        """Clear cached action primitives and release memory held by numpy arrays/lists."""
+        """Clears the action cache to free memory.
+
+        This is useful to call periodically to prevent the cache from growing
+        indefinitely.
+        """
         try:
             self._full_action_primitives.clear()
         except Exception:
