@@ -240,7 +240,7 @@ class ActionSpace:
                 pass
 
         return valid_actions
-    
+
     def _get_expanding_actions(self, architecture: NeuralArchitecture) -> List[Action]:
         """Actions for the expanding phase: only adding new neurons."""
         valid_actions: List[Action] = []
@@ -253,6 +253,17 @@ class ActionSpace:
     
     def _get_refinement_actions(self, architecture: NeuralArchitecture) -> List[Action]:
         """Actions for the refinement phase: adding connections and modifying activations."""
+        # --- Caching Optimization ---
+        try:
+            sig = architecture.compute_signature()
+            if sig in self._full_action_primitives:
+                cached_data = self._full_action_primitives[sig]
+                # Ensure we return a list of Action objects, not just primitives
+                if 'actions' in cached_data:
+                    return cached_data['actions']
+        except Exception:
+            sig = None  # Fallback if signature computation fails
+
         valid_actions: List[Action] = []
         neurons = architecture.neurons
         hidden_ids = sorted([nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN])
@@ -264,51 +275,56 @@ class ActionSpace:
                 if act != current_act:
                     valid_actions.append(Action(action_type=ActionType.MODIFY_ACTIVATION, source_neuron=nid, activation=act))
         
-        all_ids = np.array(sorted(neurons.keys()), dtype=int)
-        n = len(all_ids)
-        if n > 0:
-            id_to_idx = {int(nid): i for i, nid in enumerate(all_ids)}
-            layers = np.array([architecture.get_layer_for_neuron(int(nid)) for nid in all_ids], dtype=int)
-            is_output = np.array([neurons[int(nid)].neuron_type == NeuronType.OUTPUT for nid in all_ids], dtype=bool)
-            is_input = np.array([neurons[int(nid)].neuron_type == NeuronType.INPUT for nid in all_ids], dtype=bool)
-            adjacency = np.zeros((n, n), dtype=bool)
-            for conn in architecture.connections:
-                s = conn.source_id
-                t = conn.target_id
-                if s in id_to_idx and t in id_to_idx:
-                    adjacency[id_to_idx[s], id_to_idx[t]] = True
+        # --- Optimized ADD_CONNECTION Generation ---
+        # Pre-filter valid sources and targets to reduce the number of pairs to check.
+        # This is more memory-efficient than generating all N*N pairs.
+        valid_sources = np.array(sorted([
+            nid for nid, n in neurons.items() if n.neuron_type != NeuronType.OUTPUT
+        ]), dtype=int)
 
-            # Create grid of all pairs via repeated indices
-            src_idx = np.repeat(np.arange(n, dtype=int), n)
-            tgt_idx = np.tile(np.arange(n, dtype=int), n)
+        valid_targets = np.array(sorted([
+            nid for nid, n in neurons.items() if n.neuron_type != NeuronType.INPUT
+        ]), dtype=int)
+        
+        if len(valid_sources) > 0 and len(valid_targets) > 0:
+            # Create a grid of only the valid pairs.
+            src_ids = np.repeat(valid_sources, len(valid_targets))
+            tgt_ids = np.tile(valid_targets, len(valid_sources))
 
-            # Exclude self-connections
-            neq_mask = src_idx != tgt_idx
+            # --- Filtering Masks ---
+            # 1. Exclude self-connections
+            not_self = src_ids != tgt_ids
 
-            # Exclude already existing connections
-            adj_flat = adjacency.reshape(-1)
-            not_existing_mask = ~adj_flat
+            # 2. Exclude existing connections
+            existing_connections = frozenset(
+                (c.source_id, c.target_id) for c in architecture.connections
+            )
+            is_new = np.array([
+                (s, t) not in existing_connections for s, t in zip(src_ids, tgt_ids)
+            ], dtype=bool)
 
-            # Type-based rules: source not OUTPUT, target not INPUT
-            src_not_output = ~is_output[src_idx]
-            tgt_not_input = ~is_input[tgt_idx]
+            # 3. Layer rule: source_layer <= target_layer or isolated
+            layers = {nid: architecture.get_layer_for_neuron(nid) for nid in np.union1d(valid_sources, valid_targets)}
+            src_layers = np.array([layers[s] for s in src_ids], dtype=int)
+            tgt_layers = np.array([layers[t] for t in tgt_ids], dtype=int)
+            
+            # Allow connections if either neuron is isolated (layer -1) or if the source
+            # layer is less than or equal to the target layer.
+            layer_ok = (src_layers <= tgt_layers) | (src_layers == -1) | (tgt_layers == -1)
 
-            # Layer rule: allow if either isolated (-1) or src_layer <= tgt_layer
-            # Additionally explicitly allow pairs involving isolated hidden neurons
-            src_layers = layers[src_idx]
-            tgt_layers = layers[tgt_idx]
-            layer_ok = (src_layers == -1) | (tgt_layers == -1) | (src_layers <= tgt_layers)
+            # Combine masks to find valid pairs
+            final_mask = not_self & is_new & layer_ok
+            
+            valid_src_tgt_pairs = np.stack((src_ids[final_mask], tgt_ids[final_mask]), axis=1)
 
-            valid_pair_mask = neq_mask & not_existing_mask & src_not_output & tgt_not_input & layer_ok
-
-            valid_positions = np.nonzero(valid_pair_mask)[0]
-            # Append Actions in deterministic order implied by all_ids sorting and index flattening
-            for pos in valid_positions:
-                s_idx = int(src_idx[pos])
-                t_idx = int(tgt_idx[pos])
-                s_id = int(all_ids[s_idx])
-                t_id = int(all_ids[t_idx])
-                valid_actions.append(Action(action_type=ActionType.ADD_CONNECTION, source_neuron=s_id, target_neuron=t_id))
+            # Append valid actions. The sorting of valid_sources and valid_targets
+            # combined with the structured pair generation ensures determinism.
+            for s_id, t_id in valid_src_tgt_pairs:
+                valid_actions.append(Action(
+                    action_type=ActionType.ADD_CONNECTION,
+                    source_neuron=int(s_id),
+                    target_neuron=int(t_id)
+                ))
 
         # Build primitive numpy arrays for fast downstream scoring and membership tests
         try:
