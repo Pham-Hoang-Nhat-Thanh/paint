@@ -397,14 +397,16 @@ class NeuralMCTS(MCTS):
                 # Fallback to considering all children if mask retrieval fails
                 episode_legal_children = root.children
 
+            # Always use a candidate root to ensure the children attribute has a consistent type (dict)
+            # when passed to _select_final_action.
+            candidate_root = NeuralMCTSNode(root.architecture)
             if episode_legal_children:
-                # Use a lightweight candidate container so `_select_final_action`
-                # picks from the filtered subset.
-                candidate_root = NeuralMCTSNode(root.architecture)
                 candidate_root.children = episode_legal_children
-                final_node = self._select_final_action(candidate_root, temperature)
             else:
-                final_node = self._select_final_action(root, temperature)
+                # If there are no legal children, pass the original children dictionary
+                candidate_root.children = root.children
+
+            final_node = self._select_final_action(candidate_root, temperature)
 
             if final_node and final_node.action:
                 print("MCTS search completed successfully")
@@ -603,7 +605,27 @@ class NeuralMCTS(MCTS):
             graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
             graph_data['layer_positions'] = graph_data['layer_positions'].to(self.device)
             policy_value = self.policy_value_net(graph_data, phase=self.current_cycle.get_phase_value())
-            node.policy_value = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in policy_value.items()}
+
+            # --- Correctly cache network output ---
+            # Separate computed tensors from module references for a clean, CPU-only cache.
+            # This prevents holding references to large parts of the model on the MCTS node
+            # and resolves the KeyError by ensuring nested dicts are handled correctly.
+            def detach_to_cpu(data):
+                if torch.is_tensor(data):
+                    return data.detach().cpu()
+                elif isinstance(data, dict):
+                    return {k: detach_to_cpu(v) for k, v in data.items()}
+                return data
+
+            tensor_keys_to_cache = {
+                'action_type', 'source_logits_dict', 'shared_features', 'value'
+            }
+
+            node.policy_value = {
+                key: detach_to_cpu(value)
+                for key, value in policy_value.items()
+                if key in tensor_keys_to_cache
+            }
         expand_profile['eval'] = time.time() - t0
 
         # --- 2. Get valid actions and compute priors ---
@@ -631,12 +653,25 @@ class NeuralMCTS(MCTS):
             value_output = node.policy_value.get('value')
             return float(value_output.item()) if isinstance(value_output, torch.Tensor) else 0.0
 
-        # Create a transient on-device view of policy outputs for prior computation
-        policy_on_device = {}
+        # --- Reconstruct the full policy dictionary for prior computation ---
+        # Move the cached tensors back to the device and merge them with fresh
+        # references to the model's conditional heads.
         t0 = time.time()
-        for k, v in node.policy_value.items():
-            if torch.is_tensor(v):
-                policy_on_device[k] = v.to(self.device)
+        def move_to_device(data, device):
+            if torch.is_tensor(data):
+                return data.to(device)
+            elif isinstance(data, dict):
+                return {k: move_to_device(v, device) for k, v in data.items()}
+            return data
+
+        policy_on_device = move_to_device(node.policy_value, self.device)
+
+        # Add back the references to the model's callable modules
+        policy_on_device.update({
+            'target_heads': self.policy_value_net.conditional_target_heads,
+            'activation_heads': self.policy_value_net.conditional_activation_heads,
+            'source_encoder': self.policy_value_net.source_encoder
+        })
         expand_profile['policy_transfer'] = time.time() - t0
 
         # Compute priors for all valid actions
@@ -723,7 +758,7 @@ class NeuralMCTS(MCTS):
             return torch.tensor([], dtype=torch.float32)
         
         # Extract visit counts for each child
-        visit_counts = torch.tensor([child.visits for child in node.children], 
+        visit_counts = torch.tensor([child.visits for child in node.children.values()],
                                    dtype=torch.float32)
         
         # Apply temperature scaling

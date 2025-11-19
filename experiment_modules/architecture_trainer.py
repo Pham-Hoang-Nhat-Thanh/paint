@@ -629,7 +629,7 @@ class ArchitectureTrainer:
                         experience['mcts_policy'] = np.array(visit_distribution, dtype=np.float32)
 
                     # Store the actual action objects
-                    experience['mcts_actions'] = [child.action for child in search_root.children]
+                    experience['mcts_actions'] = [child.action for child in search_root.children.values()]
                     
             except Exception as e:
                 print(f"    [Warning] Failed to extract MCTS policy: {e}")
