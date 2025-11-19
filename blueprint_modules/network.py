@@ -6,6 +6,8 @@ import torch.nn as nn
 from torch.amp import autocast
 import random
 import copy
+import numpy as np
+import traceback
 
 class NeuronType(Enum):
     """Defines the type of a neuron in the neural architecture."""
@@ -356,82 +358,87 @@ class NeuralArchitecture:
         return f"{neuron_sig}||{conn_sig}"
     
     def to_graph_representation(self) -> Dict:
-        """Converts the architecture to a graph format for the transformer.
-
-        This method creates a dictionary containing tensors that represent the
-        node features, edge connectivity, and other graph attributes.
-
+        """Converts the architecture to a graph format (optimized for large graphs).
+        
         Returns:
             Dict: A dictionary containing the graph representation.
         """
         node_ids = self._get_sorted_neuron_ids()
-        id_to_index = {node_id: idx for idx, node_id in enumerate(node_ids)}
         neurons = self.neurons
         connections = self.connections
 
         # Build node features efficiently
-        if node_ids:
-            node_features = torch.as_tensor(
-                [neurons[nid].to_feature_vector() for nid in node_ids],
-                dtype=torch.float
-            )
-        else:
-            node_features = torch.empty((0, 9), dtype=torch.float)
+        try:
+            # Vectorize if possible, or at least use numpy for intermediate storage
+            node_features_list = [neurons[nid].to_feature_vector() for nid in node_ids]
+            node_features = torch.as_tensor(node_features_list, dtype=torch.float)
+        except Exception:
+            traceback.print_exc()
+            raise RuntimeError("Failed to build node features in to_graph_representation()")
 
         # Build edge index and weights using list comprehensions
         enabled_conns = [conn for conn in connections if conn.enabled]
-        src_tgt_weight = [
-            (id_to_index.get(conn.source_id), id_to_index.get(conn.target_id), conn.weight)
-            for conn in enabled_conns
-            if id_to_index.get(conn.source_id) is not None and id_to_index.get(conn.target_id) is not None
-        ]
-        if src_tgt_weight:
-            src_list, tgt_list, weight_list = zip(*src_tgt_weight)
+        src_tgt = [(conn.source_id, conn.target_id) for conn in enabled_conns]
+        
+        if src_tgt:
+            src_list, tgt_list = zip(*src_tgt)
             edge_index = torch.tensor([src_list, tgt_list], dtype=torch.long)
-            # Build edge feature vectors (compact, cheap features useful for architecture search)
-            # Features: [delta_layer, is_skip, src_type_onehot(3), tgt_type_onehot(3), src_out_deg_norm, tgt_in_deg_norm]
-            # Compute degree statistics
-            from collections import defaultdict
-            outgoing = defaultdict(int)
-            incoming = defaultdict(int)
-            for src, tgt, _w in src_tgt_weight:
-                outgoing[src] += 1
-                incoming[tgt] += 1
-
-            # Max degrees for normalization
-            max_out = max(outgoing.values()) if outgoing else 1
-            max_in = max(incoming.values()) if incoming else 1
-
-            edge_feats = []
-            for s, t, w in src_tgt_weight:
-                # s and t are indices into node_ids (created via id_to_index),
-                # map back to original neuron IDs for attribute access.
-                s_id = node_ids[s]
-                t_id = node_ids[t]
-                s_pos = neurons[s_id].layer_position
-                t_pos = neurons[t_id].layer_position
-                delta_layer = float(t_pos - s_pos)
-                is_skip = 1.0 if abs(delta_layer) > 0.25 else 0.0
-
-                # Node type one-hot (INPUT, HIDDEN, OUTPUT)
-                def type_onehot(n):
-                    if n.neuron_type.value == 'input':
-                        return [1.0, 0.0, 0.0]
-                    elif n.neuron_type.value == 'hidden':
-                        return [0.0, 1.0, 0.0]
-                    else:
-                        return [0.0, 0.0, 1.0]
-
-                src_type = type_onehot(neurons[s_id])
-                tgt_type = type_onehot(neurons[t_id])
-
-                src_out_norm = float(outgoing[s]) / float(max_out)
-                tgt_in_norm = float(incoming[t]) / float(max_in)
-
-                feat = [delta_layer, is_skip] + src_type + tgt_type + [src_out_norm, tgt_in_norm]
-                edge_feats.append(feat)
-
-            edge_features = torch.tensor(edge_feats, dtype=torch.float)
+            
+            # ===== OPTIMIZED EDGE FEATURES =====
+            # Pre-compute all neuron attributes as arrays
+            num_nodes = len(node_ids)
+            neuron_layer_pos = np.array([neurons[nid].layer_position for nid in node_ids], dtype=np.float32)
+            
+            # Pre-compute neuron types as integer codes (0=input, 1=hidden, 2=output)
+            type_map = {'input': 0, 'hidden': 1, 'output': 2}
+            neuron_types = np.array([type_map[neurons[nid].neuron_type.value] for nid in node_ids], dtype=np.int32)
+            
+            # Compute degree statistics using numpy
+            num_edges = len(src_list)
+            src_arr = np.array(src_list, dtype=np.int32)
+            tgt_arr = np.array(tgt_list, dtype=np.int32)
+            
+            outgoing = np.bincount(src_arr, minlength=num_nodes).astype(np.float32)
+            incoming = np.bincount(tgt_arr, minlength=num_nodes).astype(np.float32)
+            
+            max_out = max(outgoing.max(), 1.0)
+            max_in = max(incoming.max(), 1.0)
+            
+            # Vectorized edge feature computation
+            # Get source and target attributes
+            src_pos = neuron_layer_pos[src_arr]  # [num_edges]
+            tgt_pos = neuron_layer_pos[tgt_arr]  # [num_edges]
+            src_type = neuron_types[src_arr]     # [num_edges]
+            tgt_type = neuron_types[tgt_arr]     # [num_edges]
+            src_out_deg = outgoing[src_arr]      # [num_edges]
+            tgt_in_deg = incoming[tgt_arr]       # [num_edges]
+            
+            # Compute features
+            delta_layer = tgt_pos - src_pos      # [num_edges]
+            is_skip = (np.abs(delta_layer) > 0.25).astype(np.float32)  # [num_edges]
+            
+            # One-hot encode types (vectorized)
+            src_type_onehot = np.zeros((num_edges, 3), dtype=np.float32)
+            src_type_onehot[np.arange(num_edges), src_type] = 1.0
+            
+            tgt_type_onehot = np.zeros((num_edges, 3), dtype=np.float32)
+            tgt_type_onehot[np.arange(num_edges), tgt_type] = 1.0
+            
+            # Normalize degrees
+            src_out_norm = src_out_deg / max_out  # [num_edges]
+            tgt_in_norm = tgt_in_deg / max_in     # [num_edges]
+            
+            # Concatenate all features: [delta_layer, is_skip, src_type(3), tgt_type(3), src_out_norm, tgt_in_norm]
+            edge_features = np.column_stack([
+                delta_layer,                    # 1
+                is_skip,                        # 1
+                src_type_onehot,                # 3
+                tgt_type_onehot,                # 3
+                src_out_norm,                   # 1
+                tgt_in_norm                     # 1
+            ])  # Shape: [num_edges, 10]
+            
+            edge_features = torch.from_numpy(edge_features)
         else:
             edge_index = torch.empty((2, 0), dtype=torch.long)
             edge_features = torch.empty((0, 10), dtype=torch.float)
@@ -444,11 +451,9 @@ class NeuralArchitecture:
             'edge_index': edge_index,
             'edge_features': edge_features,
             'layer_positions': layer_positions,
-            'node_mapping': id_to_index,
             'performance': self.performance_metrics,
-            'sorted_neuron_ids': node_ids
         }
-
+    
     def clear_caches(self):
         """Clears internal caches to free up memory.
 

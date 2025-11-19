@@ -20,9 +20,9 @@ class ModelConfig:
     """
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
-    hidden_dim: int = 2048  # Increased for more capacity
+    hidden_dim: int = 1024  # Increased for more capacity
     num_heads: int = 16
-    num_layers: int = 6
+    num_layers: int = 3
     dropout: float = 0.2  # Increased dropout for better regularization
     use_edge_features: bool = True
     
@@ -191,7 +191,7 @@ class OverallConfig:
     max_episodes: int = 500
     
     # System
-    device: str = "cuda:2"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:0"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000

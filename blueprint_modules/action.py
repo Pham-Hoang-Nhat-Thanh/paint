@@ -85,7 +85,7 @@ class ActionSpace:
         self._full_action_primitives = {}
 
     def get_valid_actions(self, architecture: NeuralArchitecture,
-                         evolutionary_cycle: Optional['EvolutionaryCycle'] = None) -> List[Action]:
+                        evolutionary_cycle: Optional['EvolutionaryCycle'] = None) -> List[Action]:
         """Returns a list of valid actions for the given architecture.
 
         The set of valid actions can be filtered based on the current
@@ -112,6 +112,170 @@ class ActionSpace:
         else:
             return []
 
+    def _cache_actions(self, architecture: NeuralArchitecture, valid_actions: List[Action]) -> None:
+        """Cache action primitives for fast lookup."""
+        try:
+            sig = architecture.compute_signature()
+            if sig is None:
+                return
+            
+            act_to_idx = {act: i for i, act in enumerate(ActivationType)}
+            
+            types = np.array([int(a.action_type.value) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
+            sources = np.array([(-1 if a.source_neuron is None else int(a.source_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
+            targets = np.array([(-1 if a.target_neuron is None else int(a.target_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
+            activations = np.array([(-1 if a.activation is None else act_to_idx.get(a.activation, -1)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
+            
+            self._full_action_primitives[sig] = {
+                'actions': valid_actions,
+                'types': types,
+                'sources': sources,
+                'targets': targets,
+                'activations': activations
+            }
+        except Exception:
+            pass  # Best-effort caching
+
+    def _try_get_cached_actions(self, architecture: NeuralArchitecture) -> Optional[List[Action]]:
+        """Try to retrieve cached actions."""
+        try:
+            sig = architecture.compute_signature()
+            if sig in self._full_action_primitives:
+                cached_data = self._full_action_primitives[sig]
+                if 'actions' in cached_data:
+                    return cached_data['actions']
+        except Exception:
+            pass
+        return None
+
+    def _get_add_neuron_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Generate ADD_NEURON actions if allowed."""
+        valid_actions = []
+        num_neurons = len(architecture.neurons)
+        can_add_neuron = num_neurons < self.max_neurons and architecture.next_neuron_id < self.model_max_neurons
+        if can_add_neuron:
+            for activation in ActivationType:
+                valid_actions.append(Action(action_type=ActionType.ADD_NEURON, activation=activation))
+        return valid_actions
+
+    def _get_remove_neuron_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Generate REMOVE_NEURON actions for isolated hidden neurons."""
+        isolated_hidden = self._get_isolated_hidden_neurons(architecture)
+        removable = sorted([nid for nid, n in architecture.neurons.items() 
+                        if n.neuron_type == NeuronType.HIDDEN and nid in isolated_hidden])
+        return [Action(action_type=ActionType.REMOVE_NEURON, source_neuron=nid) for nid in removable]
+
+    def _get_modify_activation_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Generate MODIFY_ACTIVATION actions for all hidden neurons."""
+        valid_actions = []
+        neurons = architecture.neurons
+        hidden_ids = sorted([nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN])
+        
+        for nid in hidden_ids:
+            current_act = neurons[nid].activation
+            for act in ActivationType:
+                if act != current_act:
+                    valid_actions.append(Action(action_type=ActionType.MODIFY_ACTIVATION, 
+                                            source_neuron=nid, activation=act))
+        return valid_actions
+
+    def _get_add_connection_actions_vectorized(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Generate ADD_CONNECTION actions using optimized vectorized approach."""
+        valid_actions = []
+        neurons = architecture.neurons
+        
+        # Pre-filter valid sources and targets
+        valid_sources = np.array(sorted([
+            nid for nid, n in neurons.items() if n.neuron_type != NeuronType.OUTPUT
+        ]), dtype=int)
+        
+        valid_targets = np.array(sorted([
+            nid for nid, n in neurons.items() if n.neuron_type != NeuronType.INPUT
+        ]), dtype=int)
+        
+        if len(valid_sources) == 0 or len(valid_targets) == 0:
+            return valid_actions
+        
+        # Create grid of valid pairs
+        src_ids = np.repeat(valid_sources, len(valid_targets))
+        tgt_ids = np.tile(valid_targets, len(valid_sources))
+        
+        # Apply filters
+        not_self = src_ids != tgt_ids
+        
+        existing_connections = frozenset(
+            (c.source_id, c.target_id) for c in architecture.connections
+        )
+        is_new = np.array([
+            (s, t) not in existing_connections for s, t in zip(src_ids, tgt_ids)
+        ], dtype=bool)
+        
+        # Layer validation with isolation support
+        layers = {nid: architecture.get_layer_for_neuron(nid) 
+                for nid in np.union1d(valid_sources, valid_targets)}
+        src_layers = np.array([layers[s] for s in src_ids], dtype=int)
+        tgt_layers = np.array([layers[t] for t in tgt_ids], dtype=int)
+        layer_ok = (src_layers <= tgt_layers) | (src_layers == -1) | (tgt_layers == -1)
+        
+        # Combine all filters
+        final_mask = not_self & is_new & layer_ok
+        valid_pairs = np.stack((src_ids[final_mask], tgt_ids[final_mask]), axis=1)
+        
+        for s_id, t_id in valid_pairs:
+            valid_actions.append(Action(
+                action_type=ActionType.ADD_CONNECTION,
+                source_neuron=int(s_id),
+                target_neuron=int(t_id)
+            ))
+        
+        return valid_actions
+
+    def _get_remove_connection_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Generate REMOVE_CONNECTION actions for all existing connections."""
+        return [Action(action_type=ActionType.REMOVE_CONNECTION, 
+                    source_neuron=conn.source_id, 
+                    target_neuron=conn.target_id) 
+                for conn in architecture.connections]
+
+    def _get_expanding_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Actions for the expanding phase: only adding new neurons."""
+        # Check cache first
+        cached = self._try_get_cached_actions(architecture)
+        if cached is not None:
+            return cached
+        
+        valid_actions = self._get_add_neuron_actions(architecture)
+        self._cache_actions(architecture, valid_actions)
+        return valid_actions
+
+    def _get_refinement_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Actions for the refinement phase: adding connections and modifying activations."""
+        # Check cache first
+        cached = self._try_get_cached_actions(architecture)
+        if cached is not None:
+            return cached
+        
+        valid_actions = []
+        valid_actions.extend(self._get_modify_activation_actions(architecture))
+        valid_actions.extend(self._get_add_connection_actions_vectorized(architecture))
+        
+        self._cache_actions(architecture, valid_actions)
+        return valid_actions
+
+    def _get_pruning_actions(self, architecture: NeuralArchitecture) -> List[Action]:
+        """Actions for the pruning phase: removing neurons and connections."""
+        # Check cache first
+        cached = self._try_get_cached_actions(architecture)
+        if cached is not None:
+            return cached
+        
+        valid_actions = []
+        valid_actions.extend(self._get_remove_neuron_actions(architecture))
+        valid_actions.extend(self._get_remove_connection_actions(architecture))
+        
+        self._cache_actions(architecture, valid_actions)
+        return valid_actions
+
     def _get_full_action_space(self, architecture: NeuralArchitecture) -> List[Action]:
         """Return the full set of valid actions for the architecture.
 
@@ -120,254 +284,23 @@ class ActionSpace:
         ordered by neuron ids and activation enumeration to make behaviour stable
         across runs.
         """
-        valid_actions: List[Action] = []
-        neurons = architecture.neurons
-
-        # ADD_NEURON: propose for each activation type if we can add neurons
-        num_neurons = len(neurons)
-        can_add_neuron = num_neurons < self.max_neurons and architecture.next_neuron_id < self.model_max_neurons
-        if can_add_neuron:
-            # Deterministically propose one ADD_NEURON per ActivationType (policy heads can map them)
-            for activation in ActivationType:
-                valid_actions.append(Action(action_type=ActionType.ADD_NEURON, activation=activation))
-
-        # REMOVE_NEURON: propose removal for isolated hidden neurons (deterministic order)
-        isolated_hidden = self._get_isolated_hidden_neurons(architecture)
-        removable = sorted([nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN and nid in isolated_hidden])
-        for nid in removable:
-            valid_actions.append(Action(action_type=ActionType.REMOVE_NEURON, source_neuron=nid))
-
-        # MODIFY_ACTIVATION: every hidden neuron may change to any other activation
-        hidden_ids = sorted([nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN])
-        for nid in hidden_ids:
-            current_act = neurons[nid].activation
-            for act in ActivationType:
-                if act != current_act:
-                    valid_actions.append(Action(action_type=ActionType.MODIFY_ACTIVATION, source_neuron=nid, activation=act))
-
-        # ADD_CONNECTION: vectorized enumeration of ordered pairs (src != tgt) that are valid and not present
-        all_ids = np.array(sorted(neurons.keys()), dtype=int)
-        n = len(all_ids)
-        if n > 0:
-            # Build index mapping and arrays for neuron properties
-            id_to_idx = {int(nid): i for i, nid in enumerate(all_ids)}
-            # Layers (may be cached inside architecture)
-            layers = np.array([architecture.get_layer_for_neuron(int(nid)) for nid in all_ids], dtype=int)
-            # Types
-            is_output = np.array([neurons[int(nid)].neuron_type == NeuronType.OUTPUT for nid in all_ids], dtype=bool)
-            is_input = np.array([neurons[int(nid)].neuron_type == NeuronType.INPUT for nid in all_ids], dtype=bool)
-
-            # Adjacency matrix for existing connections (small loop over connections)
-            adjacency = np.zeros((n, n), dtype=bool)
-            for conn in architecture.connections:
-                s = conn.source_id
-                t = conn.target_id
-                if s in id_to_idx and t in id_to_idx:
-                    adjacency[id_to_idx[s], id_to_idx[t]] = True
-
-            # Create grid of all pairs via repeated indices
-            src_idx = np.repeat(np.arange(n, dtype=int), n)
-            tgt_idx = np.tile(np.arange(n, dtype=int), n)
-
-            # Exclude self-connections
-            neq_mask = src_idx != tgt_idx
-
-            # Exclude already existing connections
-            adj_flat = adjacency.reshape(-1)
-            not_existing_mask = ~adj_flat
-
-            # Type-based rules: source not OUTPUT, target not INPUT
-            src_not_output = ~is_output[src_idx]
-            tgt_not_input = ~is_input[tgt_idx]
-
-            # Layer rule: allow if either isolated (-1) or src_layer <= tgt_layer
-            # Additionally explicitly allow pairs involving isolated hidden neurons
-            src_layers = layers[src_idx]
-            tgt_layers = layers[tgt_idx]
-            layer_ok = (src_layers == -1) | (tgt_layers == -1) | (src_layers <= tgt_layers)
-
-            # Explicitly include isolated hidden neurons (topo layer == -1)
-            try:
-                if isolated_hidden:
-                    # Build boolean masks for sampled flattened indices
-                    src_isolated = np.isin(all_ids[src_idx], list(isolated_hidden))
-                    tgt_isolated = np.isin(all_ids[tgt_idx], list(isolated_hidden))
-                    layer_ok = layer_ok | src_isolated | tgt_isolated
-            except Exception:
-                # If isolation detection fails for any reason, fall back to previous rule
-                pass
-
-            valid_pair_mask = neq_mask & not_existing_mask & src_not_output & tgt_not_input & layer_ok
-
-            valid_positions = np.nonzero(valid_pair_mask)[0]
-            # Append Actions in deterministic order implied by all_ids sorting and index flattening
-            for pos in valid_positions:
-                s_idx = int(src_idx[pos])
-                t_idx = int(tgt_idx[pos])
-                s_id = int(all_ids[s_idx])
-                t_id = int(all_ids[t_idx])
-                valid_actions.append(Action(action_type=ActionType.ADD_CONNECTION, source_neuron=s_id, target_neuron=t_id))
-
-        # REMOVE_CONNECTION: every existing connection can be removed (preserve input order)
-        for conn in architecture.connections:
-            valid_actions.append(Action(action_type=ActionType.REMOVE_CONNECTION, source_neuron=conn.source_id, target_neuron=conn.target_id))
-
-        # Build primitive numpy arrays for fast downstream scoring and membership tests
-        try:
-            sig = architecture.compute_signature()
-        except Exception:
-            sig = None
-
-        # Map ActivationType to small integer indices for compact encoding
-        act_to_idx = {act: i for i, act in enumerate(ActivationType)}
-
-        types = np.array([int(a.action_type.value) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-        sources = np.array([(-1 if a.source_neuron is None else int(a.source_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-        targets = np.array([(-1 if a.target_neuron is None else int(a.target_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-        activations = np.array([(-1 if a.activation is None else act_to_idx.get(a.activation, -1)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-
-        if sig is not None:
-            try:
-                self._full_action_primitives[sig] = {
-                    'actions': valid_actions,
-                    'types': types,
-                    'sources': sources,
-                    'targets': targets,
-                    'activations': activations
-                }
-            except Exception:
-                # Best-effort caching: if any issue occurs, continue without failing
-                pass
-
-        return valid_actions
-
-    def _get_expanding_actions(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Actions for the expanding phase: only adding new neurons."""
-        valid_actions: List[Action] = []
-        num_neurons = len(architecture.neurons)
-        can_add_neuron = num_neurons < self.max_neurons and architecture.next_neuron_id < self.model_max_neurons
-        if can_add_neuron:
-            for activation in ActivationType:
-                valid_actions.append(Action(action_type=ActionType.ADD_NEURON, activation=activation))
+        # Check cache first
+        cached = self._try_get_cached_actions(architecture)
+        if cached is not None:
+            return cached
+        
+        valid_actions = []
+        
+        # Collect all action types
+        valid_actions.extend(self._get_add_neuron_actions(architecture))
+        valid_actions.extend(self._get_remove_neuron_actions(architecture))
+        valid_actions.extend(self._get_modify_activation_actions(architecture))
+        valid_actions.extend(self._get_add_connection_actions_vectorized(architecture))
+        valid_actions.extend(self._get_remove_connection_actions(architecture))
+        
+        self._cache_actions(architecture, valid_actions)
         return valid_actions
     
-    def _get_refinement_actions(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Actions for the refinement phase: adding connections and modifying activations."""
-        # --- Caching Optimization ---
-        try:
-            sig = architecture.compute_signature()
-            if sig in self._full_action_primitives:
-                cached_data = self._full_action_primitives[sig]
-                # Ensure we return a list of Action objects, not just primitives
-                if 'actions' in cached_data:
-                    return cached_data['actions']
-        except Exception:
-            sig = None  # Fallback if signature computation fails
-
-        valid_actions: List[Action] = []
-        neurons = architecture.neurons
-        hidden_ids = sorted([nid for nid, n in neurons.items() if n.neuron_type == NeuronType.HIDDEN])
-
-        # MODIFY_ACTIVATION: every hidden neuron may change to any other activation
-        for nid in hidden_ids:
-            current_act = neurons[nid].activation
-            for act in ActivationType:
-                if act != current_act:
-                    valid_actions.append(Action(action_type=ActionType.MODIFY_ACTIVATION, source_neuron=nid, activation=act))
-        
-        # --- Optimized ADD_CONNECTION Generation ---
-        # Pre-filter valid sources and targets to reduce the number of pairs to check.
-        # This is more memory-efficient than generating all N*N pairs.
-        valid_sources = np.array(sorted([
-            nid for nid, n in neurons.items() if n.neuron_type != NeuronType.OUTPUT
-        ]), dtype=int)
-
-        valid_targets = np.array(sorted([
-            nid for nid, n in neurons.items() if n.neuron_type != NeuronType.INPUT
-        ]), dtype=int)
-        
-        if len(valid_sources) > 0 and len(valid_targets) > 0:
-            # Create a grid of only the valid pairs.
-            src_ids = np.repeat(valid_sources, len(valid_targets))
-            tgt_ids = np.tile(valid_targets, len(valid_sources))
-
-            # --- Filtering Masks ---
-            # 1. Exclude self-connections
-            not_self = src_ids != tgt_ids
-
-            # 2. Exclude existing connections
-            existing_connections = frozenset(
-                (c.source_id, c.target_id) for c in architecture.connections
-            )
-            is_new = np.array([
-                (s, t) not in existing_connections for s, t in zip(src_ids, tgt_ids)
-            ], dtype=bool)
-
-            # 3. Layer rule: source_layer <= target_layer or isolated
-            layers = {nid: architecture.get_layer_for_neuron(nid) for nid in np.union1d(valid_sources, valid_targets)}
-            src_layers = np.array([layers[s] for s in src_ids], dtype=int)
-            tgt_layers = np.array([layers[t] for t in tgt_ids], dtype=int)
-            
-            # Allow connections if either neuron is isolated (layer -1) or if the source
-            # layer is less than or equal to the target layer.
-            layer_ok = (src_layers <= tgt_layers) | (src_layers == -1) | (tgt_layers == -1)
-
-            # Combine masks to find valid pairs
-            final_mask = not_self & is_new & layer_ok
-            
-            valid_src_tgt_pairs = np.stack((src_ids[final_mask], tgt_ids[final_mask]), axis=1)
-
-            # Append valid actions. The sorting of valid_sources and valid_targets
-            # combined with the structured pair generation ensures determinism.
-            for s_id, t_id in valid_src_tgt_pairs:
-                valid_actions.append(Action(
-                    action_type=ActionType.ADD_CONNECTION,
-                    source_neuron=int(s_id),
-                    target_neuron=int(t_id)
-                ))
-
-        # Build primitive numpy arrays for fast downstream scoring and membership tests
-        try:
-            sig = architecture.compute_signature()
-        except Exception:
-            sig = None
-
-        # Map ActivationType to small integer indices for compact encoding
-        act_to_idx = {act: i for i, act in enumerate(ActivationType)}
-
-        types = np.array([int(a.action_type.value) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-        sources = np.array([(-1 if a.source_neuron is None else int(a.source_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-        targets = np.array([(-1 if a.target_neuron is None else int(a.target_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-        activations = np.array([(-1 if a.activation is None else act_to_idx.get(a.activation, -1)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
-
-        if sig is not None:
-            try:
-                self._full_action_primitives[sig] = {
-                    'actions': valid_actions,
-                    'types': types,
-                    'sources': sources,
-                    'targets': targets,
-                    'activations': activations
-                }
-            except Exception:
-                # Best-effort caching: if any issue occurs, continue without failing
-                pass
-
-        return valid_actions
-    
-    def _get_pruning_actions(self, architecture: NeuralArchitecture) -> List[Action]:
-        """Actions for the pruning phase: removing neurons and connections."""
-        valid_actions: List[Action] = []
-        isolated_hidden = self._get_isolated_hidden_neurons(architecture)
-        removable = sorted([nid for nid, n in architecture.neurons.items() if n.neuron_type == NeuronType.HIDDEN and nid in isolated_hidden])
-        for nid in removable:
-            valid_actions.append(Action(action_type=ActionType.REMOVE_NEURON, source_neuron=nid))
-        
-        for conn in architecture.connections:
-            valid_actions.append(Action(action_type=ActionType.REMOVE_CONNECTION, source_neuron=conn.source_id, target_neuron=conn.target_id))
-        
-        return valid_actions
-
     def apply_action(self, architecture: NeuralArchitecture, action: Action) -> bool:
         """Applies a given action to the architecture.
 

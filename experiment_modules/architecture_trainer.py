@@ -482,11 +482,8 @@ class ArchitectureTrainer:
         # Move to GPU immediately for single-graph evaluation
         graph_data['node_features'] = graph_data['node_features'].unsqueeze(0).to(self.device)
         graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
-
-        # Use cached sorted neuron IDs from graph representation instead of sorting again
-        sorted_neuron_ids = graph_data['sorted_neuron_ids']
-        layer_positions = [architecture.neurons[neuron_id].layer_position for neuron_id in sorted_neuron_ids]
-        graph_data['layer_positions'] = torch.FloatTensor([layer_positions]).to(self.device)
+        graph_data['layer_positions'] = graph_data['layer_positions'].to(self.device)
+        graph_data['edge_features'] = graph_data['edge_features'].to(self.device) if graph_data['edge_features'] is not None else None
         
         return graph_data
     
@@ -520,6 +517,7 @@ class ArchitectureTrainer:
             
             edge_idx = gd['edge_index'].to(self.device) if gd['edge_index'].device.type == 'cpu' else gd['edge_index']
             layer_pos = gd['layer_positions']
+            edge_features = gd['edge_features'].to(self.device) if gd['edge_features'].device.type == 'cpu' else gd['edge_features']
             if layer_pos.device.type == 'cpu':
                 layer_pos = layer_pos.to(self.device)
             else:
@@ -529,6 +527,7 @@ class ArchitectureTrainer:
             return {
                 'node_features': node_feats.unsqueeze(0) if node_feats.dim() == 2 else node_feats,
                 'edge_index': edge_idx,
+                'edge_features': edge_features,
                 'layer_positions': layer_pos.unsqueeze(0) if layer_pos.dim() == 2 else layer_pos,
                 'batch': torch.zeros(num_nodes, dtype=torch.long, device=self.device),
                 'num_graphs': 1
@@ -541,6 +540,7 @@ class ArchitectureTrainer:
         all_node_features = []
         all_layer_positions = []
         all_edge_indices = []
+        all_edge_features = []
         batch_tensor = []
         
         node_offset = 0
@@ -564,6 +564,8 @@ class ArchitectureTrainer:
             if edge_index.shape[1] > 0:
                 offset_edges = edge_index + node_offset
                 all_edge_indices.append(offset_edges)
+
+            all_edge_features.append(gd['edge_features'])
             
             # Track graph assignment
             batch_tensor.append(torch.full((num_nodes,), graph_idx, dtype=torch.long))
@@ -584,6 +586,9 @@ class ArchitectureTrainer:
         
         with torch.cuda.stream(streams[3]):
             batch_tensor = torch.cat(batch_tensor, dim=0).to(self.device)
+
+        with torch.cuda.streams(streams):
+            batched_edge_features = torch.cat(all_edge_features, dim=0).to(self.device)
         
         # Synchronize all streams before returning
         torch.cuda.synchronize()
@@ -591,6 +596,7 @@ class ArchitectureTrainer:
         return {
             'node_features': batched_features,
             'edge_index': batched_edges, 
+            'edge_features': batched_edge_features,
             'layer_positions': batched_positions,
             'batch': batch_tensor,
             'num_graphs': batch_size
