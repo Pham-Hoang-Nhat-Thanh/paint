@@ -9,7 +9,8 @@ from typing import Dict, List
 import torch
 import math
 import torch.nn.functional as F
-from collections import deque
+from collections import deque, defaultdict
+import time
 
 class NeuralMCTSNode(MCTSNode):
     """Represents a node in the MCTS tree, enhanced with neural network data.
@@ -140,6 +141,11 @@ class NeuralMCTS(MCTS):
         # Reusable ActionManager instance
         self.action_manager = ActionManager(action_space=self.action_space, max_neurons=max_neurons)
         self.max_children = max_children
+        # Profiling containers for expand timings
+        # `_expand_profiler` accumulates totals per timing key across the search
+        # `_expand_profiles` stores recent per-expand breakdowns for inspection
+        self._expand_profiler = defaultdict(float)
+        self._expand_profiles = deque(maxlen=2000)
 
     def cleanup(self):
         """Cleans up resources to prevent memory leaks.
@@ -317,14 +323,22 @@ class NeuralMCTS(MCTS):
                                                                     evolutionary_cycle=self.current_cycle)))
 
             print("Starting MCTS search...")
+            select_duration = 0.0
+            expand_duration = 0.0
+            backup_duration = 0.0
+            final_action_duration = 0.0
             for i in range(iterations):
+                select_time = time.time()
                 # ===== STEP 1: SELECT =====
                 # Traverse tree using PUCT until reaching a leaf node
                 node = self._select(root)
+                select_duration += time.time() - select_time
 
+                expand_time = time.time()
                 # ===== STEP 2: EXPAND & EVALUATE =====
                 # Expand one new child and get its value in one step (no redundant re-evaluation)
                 expanded_node, value = self._expand(node)
+                expand_duration += time.time() - expand_time
 
                 # If expansion produced a child, record its evaluation in the local cycle
                 if expanded_node is not None:
@@ -333,9 +347,11 @@ class NeuralMCTS(MCTS):
                                                         num_connections=expanded_node.architecture.num_connections()):
                         self.current_cycle.advance_phase()
 
+                backup_time = time.time()
                 # ===== STEP 4: BACKUP =====
                 # Propagate value up the tree
                 self._backpropagate(expanded_node, value)
+                backup_duration += time.time() - backup_time
 
                 # Early stopping check - only after sufficient new visits on reused trees
                 new_visits = root.visits - initial_visits
@@ -364,7 +380,8 @@ class NeuralMCTS(MCTS):
 
                 if (i + 1) % max(1, iterations // 10) == 0:
                     print(f"MCTS iteration {i + 1}/{iterations} completed, best value: {current_best:.4f}")
-
+                
+            final_action_time = time.time()
             # ===== STEP 5: SELECT FINAL ACTION =====
             # Select final action using visit counts but ensure the selection
             # is legal under the episode-level cycle (`orig_cycle`). The
@@ -398,6 +415,14 @@ class NeuralMCTS(MCTS):
                 return (root, root)  # Return tuple even on failure
         finally:
             self.current_cycle = orig_cycle
+            final_action_duration += time.time() - final_action_time
+            # Print timing summary for expand profiling
+            try:
+                self.dump_expand_profile()
+            except Exception:
+                pass
+            #print(f"Timing Summary: Selection: {select_duration:.4f}s, Expansion: {expand_duration:.4f}s, "
+            #    f"Backup: {backup_duration:.4f}s, Final Action: {final_action_duration:.4f}s")
     
     def _select_final_action(self, root: NeuralMCTSNode, temperature: float) -> NeuralMCTSNode:
         """Select final action based on visit counts (proportional selection)"""
@@ -432,30 +457,40 @@ class NeuralMCTS(MCTS):
     def _expand(self, node: NeuralMCTSNode) -> tuple:
         """Expand the given node by adding one new child using neural-guided action selection.
         """
-        import time
-        expand_start_time = time.time()
-        _mcts_policy_eval_time = None
-        _mcts_priors_time = None
-        _mcts_child_eval_time = None
+        # Profiling: per-call breakdown
+        expand_profile = {
+            'start': time.time(),
+            'eval': 0.0,
+            'valid_actions': 0.0,
+            'mask_prep': 0.0,
+            'policy_transfer': 0.0,
+            'priors_compute': 0.0,
+            'selection': 0.0,
+            'apply_action': 0.0,
+            'child_eval': 0.0,
+            'update_parent': 0.0,
+            'total': 0.0
+        }
+
         # Ensure parent policy_value is available
         if node.policy_value is None:
+            t0 = time.time()
             with torch.no_grad():
                 graph_data = self._prepare_graph_data(node.architecture)
                 # Move inputs to device for forward, then cache CPU-detached outputs
                 graph_data['node_features'] = graph_data['node_features'].to(self.device)
                 graph_data['edge_index'] = graph_data['edge_index'].to(self.device)
                 graph_data['layer_positions'] = graph_data['layer_positions'].to(self.device)
-                t_policy = time.time()
                 policy_value = self.policy_value_net(graph_data, phase=self.current_cycle.get_phase_value())
-                _mcts_policy_eval_time = time.time() - t_policy
                 # Handle new network output signature - store all components
                 node.policy_value = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in policy_value.items()}
-                #print(f"[MCTS::_expand] policy_eval_time={_mcts_policy_eval_time:.4f}s node_id={id(node)}")
+            expand_profile['eval'] = time.time() - t0
 
         # Cache valid actions for this node. Invalidate and recompute when the
         # search phase changes because valid action sets (masks/rules) may
         # differ between phases.
         current_phase_token = self.current_cycle.cycle_id
+        t0 = time.time()
         if (node._valid_actions_cache is None or
             getattr(node, '_valid_actions_phase_token', None) != current_phase_token):
             all_valid_actions = self.action_space.get_valid_actions(
@@ -466,6 +501,7 @@ class NeuralMCTS(MCTS):
             # Track which phase the valid-actions cache belongs to separately
             # from `_priors_phase` which is used for priors caching.
             node._valid_actions_phase_token = current_phase_token
+        expand_profile['valid_actions'] = time.time() - t0
         all_valid_actions = node._valid_actions_cache
 
         # Vectorized action filtering: use incremental set to filter in O(n) instead of O(n²)
@@ -483,14 +519,17 @@ class NeuralMCTS(MCTS):
 
         # Ensure masks and transient policy tensors are on the model/device
         model_device = self.device if isinstance(self.device, torch.device) else torch.device(self.device)
+        t0 = time.time()
         for k in list(masks.keys()):
             if k != 'tensor_size' and torch.is_tensor(masks[k]):
                 masks[k] = masks[k].to(model_device)
+        expand_profile['mask_prep'] = time.time() - t0
 
         # Create a transient on-device view of the cached policy outputs so
         # policy-conditioned heads (which live on the model device) receive
         # inputs on the same device during priors computation.
         policy_on_device = {}
+        t0 = time.time()
         for k, v in node.policy_value.items():
             if torch.is_tensor(v):
                 try:
@@ -499,6 +538,7 @@ class NeuralMCTS(MCTS):
                     policy_on_device[k] = v
             else:
                 policy_on_device[k] = v
+        expand_profile['policy_transfer'] = time.time() - t0
 
         # Compose priors for all top-K valid actions
         if (node._priors_cache is not None and
@@ -509,13 +549,12 @@ class NeuralMCTS(MCTS):
             # Prefer the vectorized prior computation for speed and correctness
             try:
                 # Compute full priors for all valid actions if action space is small
-                t_priors = time.time()
+                t0 = time.time()
                 priors_tensor = self.action_manager._compute_priors_vectorized(policy_on_device, valid_actions, masks)
+                expand_profile['priors_compute'] = time.time() - t0
                 # Move to CPU numpy for mapping; clamp minimum probability for safety
                 priors_np = priors_tensor.detach().cpu().numpy()
                 priors_map = {a: float(max(float(p), 1e-12)) for a, p in zip(valid_actions, priors_np)}
-                _mcts_priors_time = time.time() - t_priors
-                #print(f"[MCTS::_expand] priors_compute_time={_mcts_priors_time:.4f}s node_id={id(node)} num_actions={len(valid_actions)}")
             except Exception:
                 traceback.print_exc()
                 raise RuntimeError("Vectorized prior computation failed during expansion.")        
@@ -534,6 +573,7 @@ class NeuralMCTS(MCTS):
         # For unexpanded actions N_child == 0 and Q is unknown (treated as 0)
         parent_visits = max(1, node.visits)
         try:
+            t0 = time.time()
             # Build prior tensor in the same order as `valid_actions`
             priors_list = [priors_map.get(a, node._priors_cache.get(a) if node._priors_cache is not None else 1e-12) for a in valid_actions]
             P_tensor = torch.tensor(priors_list, dtype=torch.float32)
@@ -546,6 +586,7 @@ class NeuralMCTS(MCTS):
             sel_idx = int(torch.argmax(u_tensor).item())
             selected_action = valid_actions[sel_idx]
             best_uct = float(u_tensor[sel_idx].item())
+            expand_profile['selection'] = time.time() - t0
         except Exception:
             # Fallback to safe Python loop if vectorized path fails
             selected_action = None
@@ -558,10 +599,14 @@ class NeuralMCTS(MCTS):
                 if uct_score > best_uct:
                     best_uct = uct_score
                     selected_action = a
+            # record selection time as negligible for fallback
+            expand_profile['selection'] = 0.0
 
         # ----- Apply selected action (lazy expansion) -----
         new_architecture = node._copy_architecture()
+        t0 = time.time()
         success = self.action_space.apply_action(new_architecture, selected_action)
+        expand_profile['apply_action'] = time.time() - t0
         if not success:
             node._unexpanded_actions_set.remove(selected_action)
             # Extract value from new network output signature
@@ -574,21 +619,23 @@ class NeuralMCTS(MCTS):
 
         # Create child node and evaluate it, caching CPU-detached policy outputs
         child_node = NeuralMCTSNode(new_architecture, parent=node, action=selected_action)
+        t0 = time.time()
         with torch.no_grad():
             child_graph = self._prepare_graph_data(new_architecture)
             child_graph['node_features'] = child_graph['node_features'].to(self.device)
             child_graph['edge_index'] = child_graph['edge_index'].to(self.device)
             child_graph['layer_positions'] = child_graph['layer_positions'].to(self.device)
-            t_child = time.time()
             child_policy = self.policy_value_net(child_graph, phase=self.current_cycle.get_phase_value())
-            _mcts_child_eval_time = time.time() - t_child
+        expand_profile['child_eval'] = time.time() - t0
         # Store CPU-detached copy to avoid retaining GPU memory
         child_node.policy_value = {k: v.detach().cpu() if torch.is_tensor(v) else v for k, v in child_policy.items()}
         child_node.prior_prob = node._priors_cache[selected_action]
 
         # Update parent
+        t0 = time.time()
         node._unexpanded_actions_set.remove(selected_action)
         node.children.append(child_node)
+        expand_profile['update_parent'] = time.time() - t0
 
         # Extract value from new network output signature for return
         value_output = child_node.policy_value.get('value')
@@ -596,9 +643,17 @@ class NeuralMCTS(MCTS):
             value = value_output.item()
         else:
             raise RuntimeError("Node policy_value missing 'value' tensor during expansion.")
-
-        total_expand_time = time.time() - expand_start_time
-        print(f"[MCTS::_expand] total_time={total_expand_time:.4f}s node_id={id(node)} policy_eval={_mcts_policy_eval_time} priors_time={_mcts_priors_time} child_eval={_mcts_child_eval_time}\n")
+        # Finalize profiling for this expand call
+        expand_profile['total'] = time.time() - expand_profile['start']
+        # Store per-call breakdown and update cumulative totals
+        try:
+            self._expand_profiles.append(expand_profile)
+            for k, v in expand_profile.items():
+                if k == 'start':
+                    continue
+                self._expand_profiler[k] += float(v or 0.0)
+        except Exception:
+            pass
 
         return child_node, value
 
@@ -759,6 +814,65 @@ class NeuralMCTS(MCTS):
         
         return visit_probs
 
+    def dump_expand_profile(self, last_n: int = 10, show_cumulative: bool = True, reset: bool = False):
+        """Print a human-readable summary of expand timing profiling.
+
+        - last_n: show the last N per-expand breakdowns (most recent first)
+        - show_cumulative: print cumulative totals and per-call averages
+        - reset: clear collected profiling data after printing
+        """
+        # Defensive: ensure attributes exist
+        if not hasattr(self, '_expand_profiles') or not hasattr(self, '_expand_profiler'):
+            print("No expand profiling data available.")
+            return
+
+        profiles = list(self._expand_profiles)
+        total_calls = len(profiles)
+
+        print("\n=== NeuralMCTS Expand Profiling Summary ===")
+        print(f"Total tracked expand calls: {total_calls}")
+
+        if total_calls == 0:
+            print("(no expand calls recorded)")
+        else:
+            # Print last N calls
+            n = min(last_n, total_calls)
+            print(f"\nLast {n} expand calls (most recent first):")
+            for i, prof in enumerate(reversed(profiles[-n:])):
+                idx = total_calls - i
+                total = prof.get('total', 0.0)
+                eval_t = prof.get('eval', 0.0)
+                priors_t = prof.get('priors_compute', 0.0)
+                sel_t = prof.get('selection', 0.0)
+                child_t = prof.get('child_eval', 0.0)
+                apply_t = prof.get('apply_action', 0.0)
+                mask_t = prof.get('mask_prep', 0.0)
+                policy_t = prof.get('policy_transfer', 0.0)
+                update_t = prof.get('update_parent', 0.0)
+                valid_t = prof.get('valid_actions', 0.0)
+                print(f"#{idx}: total={total:.6f}s eval={eval_t:.6f}s priors={priors_t:.6f}s sel={sel_t:.6f}s child={child_t:.6f}s apply={apply_t:.6f}s mask={mask_t:.6f}s policy={policy_t:.6f}s update={update_t:.6f}s valid_actions={valid_t:.6f}s")
+
+        if show_cumulative:
+            print("\nCumulative totals and averages:")
+            cumul = self._expand_profiler
+            calls = total_calls if total_calls > 0 else 1
+            # Keys to display in priority order
+            keys = ['eval', 'valid_actions', 'mask_prep', 'policy_transfer', 'priors_compute', 'selection', 'apply_action', 'child_eval', 'update_parent', 'total']
+            for k in keys:
+                v = float(cumul.get(k, 0.0))
+                print(f"{k}: total={v:.6f}s avg={(v / calls):.6f}s")
+
+        print("=== End Expand Profiling ===\n")
+
+        if reset:
+            try:
+                self._expand_profiles.clear()
+                for k in list(self._expand_profiler.keys()):
+                    self._expand_profiler[k] = 0.0
+            except Exception:
+                pass
+
 # Helper to safe-index logits (handle both 1-D and 2-D)
 def safe_squeeze(tensor):
     return tensor.squeeze(0) if tensor.dim() > 1 and tensor.shape[0] == 1 else tensor
+
