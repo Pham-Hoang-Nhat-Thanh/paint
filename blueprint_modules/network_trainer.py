@@ -49,17 +49,6 @@ class QuickTrainer:
         # Initialize model as None - will be set when architecture is provided
         self.model = None
 
-    def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
-        """Trains and evaluates a neural network for a given architecture.
-
-        Args:
-            architecture (NeuralArchitecture): The architecture to train and
-                evaluate.
-
-        Returns:
-            Tuple[float, float]: A tuple containing the final accuracy and
-            average loss.
-        """
     def _move_loader_dataset_to_device(self, loader) -> bool:
         """Attempt to move an entire DataLoader.dataset to `self.device`.
 
@@ -119,12 +108,15 @@ class QuickTrainer:
         return False
     
     def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
-        """Train the graph-based network and return (final_accuracy, last_epoch_avg_loss)
+        """Trains and evaluates a neural network for a given architecture.
 
-        Supports fractional epochs (e.g., 2.5 epochs = 2 full epochs + half of the third)
+        Args:
+            architecture (NeuralArchitecture): The architecture to train and
+                evaluate.
 
         Returns:
-            (accuracy, loss)
+            Tuple[float, float]: A tuple containing the final accuracy and
+            average loss.
         """
         try:
             # Convert architecture to executable model
