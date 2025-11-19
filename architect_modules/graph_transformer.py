@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Dict, Tuple
-
 # Try to import torch_scatter for efficient sparse attention
 try:
     from torch_scatter import scatter_softmax
@@ -337,9 +336,6 @@ class EdgeAwareAttention(nn.Module):
         """
         batch_size, num_nodes, hidden_dim = node_embeddings.shape
         
-        # Store residual
-        residual = node_embeddings
-        
         # Linear projections
         Q = self.q_linear(node_embeddings)  # [batch_size, num_nodes, hidden_dim]
         K = self.k_linear(node_embeddings)
@@ -383,10 +379,7 @@ class EdgeAwareAttention(nn.Module):
                 attn_output = self._sparse_attention_pure_pytorch_per_batch(Q, K, V, edge_index, num_nodes)
             else:
                 attn_output = self._sparse_attention_pure_pytorch(Q, K, V, edge_index, num_nodes)
-        else:
-            # Use dense masked attention (original implementation) - dense mask can be per-batch
-            attn_output = self._dense_attention_masked(Q, K, V, edge_index, num_nodes, edge_features_list)
-        
+
         # Concatenate heads - [batch_size, num_nodes, hidden_dim]
         attn_output = attn_output.transpose(1, 2).contiguous().view(
             batch_size, num_nodes, hidden_dim
@@ -397,91 +390,6 @@ class EdgeAwareAttention(nn.Module):
         output = self.dropout(output)
         # Return projected output (residual + layer-norm is applied by GraphTransformer)
         return output
-    
-    def _dense_attention_masked(self, Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor,
-                                edge_index: torch.Tensor, num_nodes: int, edge_features_list=None) -> torch.Tensor:
-        """Dense masked attention (original implementation): computes full QK^T and masks non-edges.
-        
-        Input shapes (after reshaping to multi-head):
-        - Q, K, V: [batch_size, num_heads, num_nodes, head_dim]
-        - edge_index: [2, num_edges]
-        
-        Returns: [batch_size, num_heads, num_nodes, head_dim]
-        """
-        device = Q.device
-        batch_size = Q.shape[0]
-        
-        # Compute attention scores: Q @ K^T
-        attn_scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
-        # [batch_size, num_heads, num_nodes, num_nodes]
-        
-        # Use dtype-safe large negative value for masking (avoids fp16 overflow)
-        large_neg = torch.finfo(attn_scores.dtype).min / 2
-
-        # Support per-batch edge_index (list/tuple) or a single edge_index tensor
-        if isinstance(edge_index, (list, tuple)):
-            # Build per-batch mask: [batch_size, 1, num_nodes, num_nodes]
-            mask = torch.zeros((batch_size, 1, num_nodes, num_nodes), dtype=torch.bool, device=device)
-            for b, ei in enumerate(edge_index):
-                if ei is None or ei.shape[1] == 0:
-                    continue
-                src = ei[0].to(device)
-                tgt = ei[1].to(device)
-                mask[b, 0, src, tgt] = True
-            attn_scores = attn_scores.masked_fill(~mask, large_neg)
-            # If per-batch edge features provided, apply biases and V modulation per batch
-            if edge_features_list is not None and self.edge_bias_encoder is not None:
-                # edge_features_list is list of [E_b, feat_dim]
-                for b, ef in enumerate(edge_features_list):
-                    if ef is None or ef.shape[0] == 0:
-                        continue
-                    ef = ef.to(device)
-                    ei = edge_index[b]
-                    src = ei[0].to(device)
-                    tgt = ei[1].to(device)
-                    bias = self.edge_bias_encoder(ef).transpose(0,1)  # [H, E]
-                    for e_i, (s_i, t_i) in enumerate(zip(src.tolist(), tgt.tolist())):
-                        attn_scores[b, :, s_i, t_i] = attn_scores[b, :, s_i, t_i] + bias[:, e_i]
-                    # V modulation
-                    if self.edge_v_encoder is not None:
-                        vmod = self.edge_v_encoder(ef).view(-1, self.num_heads, self.head_dim)
-                        # Add vmod to target positions in V
-                        for e_i, t_i in enumerate(tgt.tolist()):
-                            V[b, :, t_i, :] = V[b, :, t_i, :] + vmod[e_i]
-        else:
-            if edge_index.shape[1] > 0:
-                # Build mask: [num_nodes, num_nodes]
-                mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool, device=device)
-                mask[edge_index[0].to(device), edge_index[1].to(device)] = True
-                mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, num_nodes, num_nodes]
-                # Apply mask: set non-edges to a large negative constant
-                attn_scores = attn_scores.masked_fill(~mask, large_neg)
-                # Apply edge feature based bias/modulation for single-graph case
-                if hasattr(self, '_edge_features') and self._edge_features is not None and self.edge_bias_encoder is not None:
-                    ef = self._edge_features.to(device)
-                    src_idx = edge_index[0].to(device)
-                    tgt_idx = edge_index[1].to(device)
-                    bias = self.edge_bias_encoder(ef).transpose(0,1)  # [H, E]
-                    # Add bias to attn_scores at positions (src,tgt)
-                    for e_i, (s_i, t_i) in enumerate(zip(src_idx.tolist(), tgt_idx.tolist())):
-                        attn_scores[:, :, s_i, t_i] = attn_scores[:, :, s_i, t_i] + bias[:, e_i]
-                    # V modulation
-                    if self.edge_v_encoder is not None:
-                        vmod = self.edge_v_encoder(ef).view(-1, self.num_heads, self.head_dim)
-                        for e_i, t_i in enumerate(tgt_idx.tolist()):
-                            V[:, :, t_i, :] = V[:, :, t_i, :] + vmod[e_i].unsqueeze(0)
-            else:
-                # No edges: set to large negative
-                attn_scores = torch.full_like(attn_scores, large_neg)
-        
-        # Softmax and dropout
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        
-        # Apply attention to values
-        attn_output = torch.matmul(attn_weights, V)  # [batch_size, num_heads, num_nodes, head_dim]
-        
-        return attn_output
 
 class HierarchicalPooling(nn.Module):
     """Performs hierarchical pooling to obtain a graph-level representation.
