@@ -32,17 +32,15 @@ class NeuralMCTSNode(MCTSNode):
         self.policy_value = policy_value  # Neural network predictions
         self.prior_prob = 0.0  # Prior probability from policy network
         self.curriculum = curriculum
-        # Cache valid actions for this node to check if fully expanded
-        self._valid_actions_phase_token = None
         # Incremental dict of expanded actions for O(1) filtering (vectorized action filtering)
         self._unexpanded_actions_dict = {}
         # Cache action masks to avoid recomputation across _compute_action_prior calls
         self._priors_cache = None # torch.Tensor of priors
-        self._priors_phase_token = None
+        self._priors_phase = None
         # Track whether Dirichlet noise has been applied for a given phase (root-only)
         self._dirichlet_applied_phase_token = None
     
-    def is_fully_expanded(self) -> bool:
+    def is_fully_expanded(self, max_children = 100) -> bool:
         """Checks if all valid actions from this node have been explored.
 
         A node is considered fully expanded if all possible actions from its
@@ -51,8 +49,9 @@ class NeuralMCTSNode(MCTSNode):
         Returns:
             bool: True if the node is fully expanded, False otherwise.
         """
-        return (self._unexpanded_actions_dict is not None and
-                len(self._unexpanded_actions_dict) == 0)
+        return self._unexpanded_actions_dict is not None and \
+              (len(self._unexpanded_actions_dict) == 0 or
+               len(self.children) >= max_children)
     
     def best_child(self, exploration_weight: float = 1.0) -> 'NeuralMCTSNode':
         """Selects the best child node using the PUCT algorithm.
@@ -269,29 +268,19 @@ class NeuralMCTS(MCTS):
         if reuse_root is not None:
             root = reuse_root
             # invalidate caches keyed by token so new search_token forces recompute
-            root._valid_actions_cache = None
-            root._valid_actions_phase_token = None
             root._priors_cache = None
-            root._priors_phase_token = None
+            root._priors_phase = None
             root._dirichlet_applied_phase_token = None
-            if hasattr(root, '_cached_masks'):
-                root._cached_masks = None
             # optionally reset policy so network is re-evaluated for the new semantic phase
             root.policy_value = None
         else:
             root = NeuralMCTSNode(initial_architecture)
 
-        # Create a local copy of the episode-level cycle for this search so
-        # the search can advance phases locally while starting from the
-        # episode-level phase to avoid accidentally copying a
-        # stale search-local cycle from a previous run.
-        orig_cycle = self.current_cycle
-        # Make a local search copy so the search can mutate phase/node history
-        # without immediately affecting the episode-level tracker.
-        search_cycle = orig_cycle.copy()
-        # Point `self.current_cycle` to the local search copy so helper
-        # methods naturally use the search-local phase during this call.
-        self.current_cycle = search_cycle
+        # Populate root node with current valid action
+        root_valid_actions = self.action_space.get_valid_actions(root.architecture, self.current_cycle)
+        root._unexpanded_actions_dict = {a: i for i, a in enumerate(root_valid_actions)}
+
+        orig_cycle = self.current_cycle.copy()
         phase_value = self.current_cycle.get_phase_value()
 
         try:
@@ -440,7 +429,7 @@ class NeuralMCTS(MCTS):
         """Traverse the tree from the given node to a leaf using PUCT selection."""
         current_node = node
         # descend while the current node is fully expanded AND has children to descend into
-        while current_node.children and current_node.is_fully_expanded():
+        while current_node.children and current_node.is_fully_expanded(self.max_children):
             current_node = current_node.best_child(self.exploration_weight)
             if current_node is None:
                 break
@@ -467,20 +456,18 @@ class NeuralMCTS(MCTS):
         # Cache valid actions for this node. Invalidate and recompute when the
         # search phase changes because valid action sets (masks/rules) may
         # differ between phases.
-        current_phase_token = self.current_cycle.cycle_id
+        current_phase = self.current_cycle.get_phase_value()
         t0 = time.time()
-        if (node._unexpanded_actions_dict is None or
-            getattr(node, '_valid_actions_phase_token', None) != current_phase_token):
+        if (node._unexpanded_actions_dict is None):
             all_valid_actions = self.action_space.get_valid_actions(
                 node.architecture, evolutionary_cycle=self.current_cycle
             )
             node._unexpanded_actions_dict = {a: i for i, a in enumerate(all_valid_actions)}
             # Track which phase the valid-actions cache belongs to separately
             # from `_priors_phase` which is used for priors caching.
-            node._valid_actions_phase_token = current_phase_token
             # Invalidate priors cache when valid actions change
             node._priors_cache = None
-            node._priors_phase_token = None
+            node._priors_phase = None
         expand_profile['valid_actions'] = time.time() - t0
 
         # Vectorized action filtering: use incremental set to filter in O(n) instead of O(n²)
@@ -494,7 +481,7 @@ class NeuralMCTS(MCTS):
                 value = 0.0  # Fallback
             return (node, value)  # No unexpanded actions available
 
-        masks = self.action_manager.get_action_masks(node.architecture, phase=self.current_cycle.get_phase_value())
+        masks = self.action_manager.get_action_masks(node.architecture, phase=current_phase)
 
         # Ensure masks and transient policy tensors are on the model/device
         t0 = time.time()
@@ -520,7 +507,7 @@ class NeuralMCTS(MCTS):
 
         # Compose priors for all valid actions
         if (node._priors_cache is not None and
-            node._priors_phase_token == current_phase_token):
+            node._priors_phase == current_phase):
             # Reuse cached priors if phase hasn't changed
             t0 = time.time()
             P_tensor = node._priors_cache.to(self.device)
@@ -539,7 +526,7 @@ class NeuralMCTS(MCTS):
 
             # cache priors and phase version
             node._priors_cache = P_tensor.cpu() # store CPU-detached copy
-            node._priors_phase_token = current_phase_token
+            node._priors_phase = current_phase
 
         # ----- Select the unexpanded action with highest UCT value -----
         # UCT: Q + c * P * sqrt(N) / (1 + n)

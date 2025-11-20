@@ -49,13 +49,13 @@ class MCTSConfig:
         temperature_decay (float): The decay rate for the temperature.
     """
     # Search parameters
-    num_simulations: int = 10000  # Increased for better search quality
+    num_simulations: int = 1000  # Increased for better search quality
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
     
     # Node expansion
-    max_children: int = 200
+    max_children: int = 100
     temperature: float = 1.0
     temperature_decay: float = 0.99
 

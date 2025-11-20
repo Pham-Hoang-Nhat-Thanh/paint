@@ -34,7 +34,6 @@ class EvolutionaryCycle:
         max_expanding_iterations (int): The maximum number of iterations for
             the EXPANDING phase.
     """
-    cycle_id: int = 0
     node_values: List[float] = field(default_factory=list)
     stability_threshold: float = 0.001
     current_phase: Phase = Phase.EXPANDING
@@ -108,7 +107,6 @@ class EvolutionaryCycle:
             EvolutionaryCycle: A new instance with the same state.
         """
         return EvolutionaryCycle(
-            cycle_id=self.cycle_id,
             node_values=list(self.node_values),
             stability_threshold=self.stability_threshold,
             current_phase=self.current_phase
@@ -132,12 +130,11 @@ class EvolutionaryCycle:
             pass
 
         # Advance the phase and reset tracking
-        self.cycle_id += 1
         self.current_phase = Phase((self.current_phase.value + 1) % len(Phase))
         self.node_values.clear()
         # Reset the per-phase iteration counter on phase advancement
         self.phase_iteration_count = 0
-        return self.cycle_id
+        return self.current_phase.value
     
     def get_phase_value(self):
         """Returns the integer value of the current phase.
