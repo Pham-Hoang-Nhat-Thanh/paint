@@ -6,8 +6,6 @@ import traceback
 from .network import NeuralArchitecture, NeuronType, ActivationType, Neuron
 import gc
 
-if TYPE_CHECKING:
-    from .evolutionary_cycle import EvolutionaryCycle
 
 class ActionType(Enum):
     ADD_NEURON = 0
@@ -59,14 +57,8 @@ class ActionSpace:
         #                              'targets': np.ndarray, 'activations': np.ndarray}
         self._full_action_primitives = {}
     
-    def get_valid_actions(self, architecture: NeuralArchitecture,
-                         evolutionary_cycle: Optional['EvolutionaryCycle'] = None) -> List[Action]:
+    def get_valid_actions(self, architecture: NeuralArchitecture) -> List[Action]:
         """Get valid actions for the current architecture state.
-
-        By default (`full=True`) this returns the full validated action space (ADD_NEURON,
-        REMOVE_NEURON, MODIFY_ACTIVATION, ADD_CONNECTION, REMOVE_CONNECTION) in a
-        deterministic ordering. If `full=False` the previous prioritized behavior
-        (cycle-aware or simple) is preserved for backward compatibility.
         """
         return self._get_full_action_space(architecture)
 
@@ -240,53 +232,6 @@ class ActionSpace:
             return False
 
         return False
-
-    def _add_cycle_aware_actions(self, valid_actions: List[Action], architecture: NeuralArchitecture,
-                                evolutionary_cycle: 'EvolutionaryCycle'):
-        """Add actions with evolutionary cycle-aware prioritization"""
-        neurons = architecture.neurons
-        num_neurons = len(neurons)
-        
-        # Filter hidden neurons once
-        hidden_neurons = [nid for nid, neuron in neurons.items()
-                         if neuron.neuron_type == NeuronType.HIDDEN]
-
-        # Always allow structural changes (add/remove neurons)
-        if num_neurons < self.max_neurons:
-            # Propose adding neurons with any available activation type
-            for activation in ActivationType:
-                valid_actions.append(Action(
-                    action_type=ActionType.ADD_NEURON,
-                    activation=activation
-                ))
-
-        if hidden_neurons:
-            valid_actions.append(Action(
-                action_type=ActionType.REMOVE_NEURON,
-                source_neuron=np.random.choice(hidden_neurons)
-            ))
-
-        # Determine phase based on cycle stability and isolated neurons
-        isolated_hidden = self._get_isolated_hidden_neurons(architecture)
-        prioritize_deisolation = len(isolated_hidden) > 0 and evolutionary_cycle.should_prioritize_deisolation()
-
-        if prioritize_deisolation:
-            # De-isolation phase: prioritize connections that fix isolated neurons
-            self._add_deisolation_actions(valid_actions, architecture, isolated_hidden)
-        else:
-            # Refinement phase: allow activation changes and general connections
-            self._add_refinement_actions(valid_actions, architecture, hidden_neurons)
-
-        # Always allow connection removal if we have connections
-        if architecture.connections:
-            sample_conns = np.random.choice(architecture.connections,
-                                          size=min(5, len(architecture.connections)), replace=False)
-            for conn in sample_conns:
-                valid_actions.append(Action(
-                    action_type=ActionType.REMOVE_CONNECTION,
-                    source_neuron=conn.source_id,
-                    target_neuron=conn.target_id
-                ))
 
     def _get_isolated_hidden_neurons(self, architecture: NeuralArchitecture) -> set:
         """Get set of isolated hidden neurons - O(n) where n is number of neurons.

@@ -1,7 +1,6 @@
 from blueprint_modules.mcts import MCTS, MCTSNode
-from blueprint_modules.network import NeuralArchitecture, ActivationType, NeuronType, Neuron, Connection
+from blueprint_modules.network import NeuralArchitecture, ActivationType
 from blueprint_modules.action import Action, ActionSpace, ActionType
-from blueprint_modules.evolutionary_cycle import EvolutionaryCycle
 from .policy_value_net import UnifiedPolicyValueNetwork, ActionManager
 from torch.distributions import Categorical
 from typing import Dict, List
@@ -86,20 +85,12 @@ class NeuralMCTS(MCTS):
         self.early_stopping_min_delta = early_stopping_min_delta
         # Cache for evaluations to avoid redundant computations
         self.evaluation_cache = {}
-        # Evolutionary cycle tracking
-        self.current_cycle = EvolutionaryCycle()
         # Reusable ActionManager instance
         self.action_manager = ActionManager(action_space=self.action_space, max_neurons=max_neurons)
         self.max_children = max_children
 
     def cleanup(self):
         """Clean up resources used by NeuralMCTS"""
-        # Clear evaluation cache to free memory
-        self.evaluation_cache.clear()
-        
-        # Reset evolutionary cycle
-        self.current_cycle.reset() if hasattr(self.current_cycle, 'reset') else None
-        
         # Force garbage collection
         import gc
         gc.collect()
@@ -298,19 +289,6 @@ class NeuralMCTS(MCTS):
         # Use visit counts to select final action (most visited = most promising)
         final_node = self._select_final_action(root, temperature)
         if final_node and final_node.action:
-            # Update evolutionary cycle with final node's value
-            final_value = final_node.value / final_node.visits
-            self.current_cycle.add_evaluation(final_value)
-
-            # Reset cycle if structural change
-            if final_node.action.action_type in [ActionType.ADD_NEURON, ActionType.REMOVE_NEURON]:
-                self.current_cycle.reset()
-
-            print("MCTS search completed successfully")
-            
-            # Return tuple: (selected_child, search_root)
-            # selected_child becomes new root for next search (tree reuse)
-            # search_root provides visit distribution for training
             return (final_node, root)
         else:
             print("MCTS search completed: no valid action found")
@@ -379,9 +357,7 @@ class NeuralMCTS(MCTS):
 
         # Cache valid actions for this node if not already cached
         if node._valid_actions_cache is None:
-            all_valid_actions = self.action_space.get_valid_actions(
-                node.architecture, evolutionary_cycle=self.current_cycle
-            )
+            all_valid_actions = self.action_space.get_valid_actions(node.architecture)
             node._valid_actions_cache = all_valid_actions
         all_valid_actions = node._valid_actions_cache
 

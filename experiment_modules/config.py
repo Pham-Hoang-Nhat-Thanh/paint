@@ -6,9 +6,9 @@ class ModelConfig:
     """Configuration for the Graph Transformer and Policy-Value Network"""
     # Graph Transformer
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
-    hidden_dim: int = 2048  # Increased for more capacity
+    hidden_dim: int = 1024  # Increased for more capacity
     num_heads: int = 16
-    num_layers: int = 6
+    num_layers: int = 4
     dropout: float = 0.2  # Increased dropout for better regularization
     use_edge_features: bool = True
     
@@ -21,7 +21,7 @@ class ModelConfig:
 class MCTSConfig:
     """Configuration for AlphaZero-style Neural MCTS"""
     # Search parameters
-    num_simulations: int = 500  # Increased for better search quality
+    num_simulations: int = 250  # Increased for better search quality
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -37,7 +37,7 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 1000  # Increased to allow more complex architectures
+    max_steps_per_episode: int = 10000  # Increased to allow more complex architectures
     min_neurons: int = 25  # Minimum number of hidden neurons to prevent oversimplification
     min_connections: int = 250  # Minimum number of connections to prevent oversimplification
 
