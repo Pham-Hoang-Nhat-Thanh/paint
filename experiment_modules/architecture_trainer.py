@@ -201,13 +201,13 @@ class ArchitectureTrainer:
             # Instead of overwriting `current_cycle`, expose the episode-level
             # cycle as `episode_level_cycle` so `NeuralMCTS.search` can copy
             # it and run a local search-level copy safely.
-            self.neural_mcts.current_cycle = self.evolutionary_cycle.copy()
             # MCTS search (always, no policy_mix_ratio since we're pure AlphaZero now)
             best_node, search_root = self.neural_mcts.search(
                 current_arch,
                 iterations=self.config.mcts.num_simulations,
                 temperature=self.config.mcts.temperature,
-                reuse_root=mcts_root  # Reuse tree from previous step
+                reuse_root=mcts_root,  # Reuse tree from previous step
+                evolutionary_cycle=self.evolutionary_cycle  # Pass current evolutionary cycle
             )
             
             next_action = best_node.action if best_node else None

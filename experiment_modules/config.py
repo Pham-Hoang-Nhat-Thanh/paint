@@ -22,7 +22,7 @@ class ModelConfig:
     node_feature_dim: int = 9  # Based on neuron feature vector (3 type + 4 activation + position + bias)
     hidden_dim: int = 1024  # Increased for more capacity
     num_heads: int = 16
-    num_layers: int = 3
+    num_layers: int = 4
     dropout: float = 0.2  # Increased dropout for better regularization
     use_edge_features: bool = True
     

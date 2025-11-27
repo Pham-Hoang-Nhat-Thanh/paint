@@ -367,6 +367,13 @@ class NeuralArchitecture:
         neurons = self.neurons
         connections = self.connections
 
+        # --- ID to Index Mapping ---
+        # Create a mapping from potentially non-contiguous neuron IDs to 
+        # contiguous zero-based indices. This is critical for correctly
+        # indexing into tensors and numpy arrays.
+        id_to_idx = {nid: i for i, nid in enumerate(node_ids)}
+
+
         # Build node features efficiently
         try:
             # Vectorize if possible, or at least use numpy for intermediate storage
@@ -378,15 +385,17 @@ class NeuralArchitecture:
 
         # Build edge index and weights using list comprehensions
         enabled_conns = [conn for conn in connections if conn.enabled]
-        src_tgt = [(conn.source_id, conn.target_id) for conn in enabled_conns]
-        
-        if src_tgt:
-            src_list, tgt_list = zip(*src_tgt)
-            edge_index = torch.tensor([src_list, tgt_list], dtype=torch.long)
+
+        if enabled_conns:
+            # Use the id_to_idx mapping to create edge_index with correct, contiguous indices
+            src_indices = [id_to_idx[conn.source_id] for conn in enabled_conns]
+            tgt_indices = [id_to_idx[conn.target_id] for conn in enabled_conns]
+            edge_index = torch.tensor([src_indices, tgt_indices], dtype=torch.long)
             
             # ===== OPTIMIZED EDGE FEATURES =====
             # Pre-compute all neuron attributes as arrays
             num_nodes = len(node_ids)
+            # These arrays are already correctly indexed from 0 to num_nodes-1
             neuron_layer_pos = np.array([neurons[nid].layer_position for nid in node_ids], dtype=np.float32)
             
             # Pre-compute neuron types as integer codes (0=input, 1=hidden, 2=output)
@@ -394,10 +403,12 @@ class NeuralArchitecture:
             neuron_types = np.array([type_map[neurons[nid].neuron_type.value] for nid in node_ids], dtype=np.int32)
             
             # Compute degree statistics using numpy
-            num_edges = len(src_list)
-            src_arr = np.array(src_list, dtype=np.int32)
-            tgt_arr = np.array(tgt_list, dtype=np.int32)
+            num_edges = len(src_indices)
+            # Convert lists of indices to numpy arrays for vectorized operations
+            src_arr = np.array(src_indices, dtype=np.int32)
+            tgt_arr = np.array(tgt_indices, dtype=np.int32)
             
+            # bincount now works correctly because src_arr/tgt_arr contain contiguous indices
             outgoing = np.bincount(src_arr, minlength=num_nodes).astype(np.float32)
             incoming = np.bincount(tgt_arr, minlength=num_nodes).astype(np.float32)
             
@@ -405,7 +416,7 @@ class NeuralArchitecture:
             max_in = max(incoming.max(), 1.0)
             
             # Vectorized edge feature computation
-            # Get source and target attributes
+            # Get source and target attributes using the index arrays
             src_pos = neuron_layer_pos[src_arr]  # [num_edges]
             tgt_pos = neuron_layer_pos[tgt_arr]  # [num_edges]
             src_type = neuron_types[src_arr]     # [num_edges]

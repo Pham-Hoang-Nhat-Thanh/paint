@@ -112,13 +112,18 @@ class ActionSpace:
         else:
             return []
 
-    def _cache_actions(self, architecture: NeuralArchitecture, valid_actions: List[Action]) -> None:
-        """Cache action primitives for fast lookup."""
+    def _cache_actions(self, architecture: NeuralArchitecture, valid_actions: List[Action],
+                       phase: Optional[Phase]) -> None:
+        """Cache action primitives for fast lookup, keyed by architecture and phase."""
         try:
             sig = architecture.compute_signature()
             if sig is None:
                 return
             
+            # Use a phase-specific key
+            phase_key = phase.name if phase is not None else "FULL"
+            cache_key = (sig, phase_key)
+
             act_to_idx = {act: i for i, act in enumerate(ActivationType)}
             
             types = np.array([int(a.action_type.value) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
@@ -126,7 +131,7 @@ class ActionSpace:
             targets = np.array([(-1 if a.target_neuron is None else int(a.target_neuron)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
             activations = np.array([(-1 if a.activation is None else act_to_idx.get(a.activation, -1)) for a in valid_actions], dtype=int) if valid_actions else np.empty((0,), dtype=int)
             
-            self._full_action_primitives[sig] = {
+            self._full_action_primitives[cache_key] = {
                 'actions': valid_actions,
                 'types': types,
                 'sources': sources,
@@ -136,12 +141,16 @@ class ActionSpace:
         except Exception:
             pass  # Best-effort caching
 
-    def _try_get_cached_actions(self, architecture: NeuralArchitecture) -> Optional[List[Action]]:
-        """Try to retrieve cached actions."""
+    def _try_get_cached_actions(self, architecture: NeuralArchitecture,
+                              phase: Optional[Phase]) -> Optional[List[Action]]:
+        """Try to retrieve cached actions for a specific architecture and phase."""
         try:
             sig = architecture.compute_signature()
-            if sig in self._full_action_primitives:
-                cached_data = self._full_action_primitives[sig]
+            phase_key = phase.name if phase is not None else "FULL"
+            cache_key = (sig, phase_key)
+
+            if cache_key in self._full_action_primitives:
+                cached_data = self._full_action_primitives[cache_key]
                 if 'actions' in cached_data:
                     return cached_data['actions']
         except Exception:
@@ -240,18 +249,18 @@ class ActionSpace:
     def _get_expanding_actions(self, architecture: NeuralArchitecture) -> List[Action]:
         """Actions for the expanding phase: only adding new neurons."""
         # Check cache first
-        cached = self._try_get_cached_actions(architecture)
+        cached = self._try_get_cached_actions(architecture, Phase.EXPANDING)
         if cached is not None:
             return cached
         
         valid_actions = self._get_add_neuron_actions(architecture)
-        self._cache_actions(architecture, valid_actions)
+        self._cache_actions(architecture, valid_actions, Phase.EXPANDING)
         return valid_actions
 
     def _get_refinement_actions(self, architecture: NeuralArchitecture) -> List[Action]:
         """Actions for the refinement phase: adding connections and modifying activations."""
         # Check cache first
-        cached = self._try_get_cached_actions(architecture)
+        cached = self._try_get_cached_actions(architecture, Phase.REFINEMENT)
         if cached is not None:
             return cached
         
@@ -259,13 +268,13 @@ class ActionSpace:
         valid_actions.extend(self._get_modify_activation_actions(architecture))
         valid_actions.extend(self._get_add_connection_actions_vectorized(architecture))
         
-        self._cache_actions(architecture, valid_actions)
+        self._cache_actions(architecture, valid_actions, Phase.REFINEMENT)
         return valid_actions
 
     def _get_pruning_actions(self, architecture: NeuralArchitecture) -> List[Action]:
         """Actions for the pruning phase: removing neurons and connections."""
         # Check cache first
-        cached = self._try_get_cached_actions(architecture)
+        cached = self._try_get_cached_actions(architecture, Phase.PRUNING)
         if cached is not None:
             return cached
         
@@ -273,7 +282,7 @@ class ActionSpace:
         valid_actions.extend(self._get_remove_neuron_actions(architecture))
         valid_actions.extend(self._get_remove_connection_actions(architecture))
         
-        self._cache_actions(architecture, valid_actions)
+        self._cache_actions(architecture, valid_actions, Phase.PRUNING)
         return valid_actions
 
     def _get_full_action_space(self, architecture: NeuralArchitecture) -> List[Action]:
@@ -285,7 +294,7 @@ class ActionSpace:
         across runs.
         """
         # Check cache first
-        cached = self._try_get_cached_actions(architecture)
+        cached = self._try_get_cached_actions(architecture, None)
         if cached is not None:
             return cached
         
@@ -298,7 +307,7 @@ class ActionSpace:
         valid_actions.extend(self._get_add_connection_actions_vectorized(architecture))
         valid_actions.extend(self._get_remove_connection_actions(architecture))
         
-        self._cache_actions(architecture, valid_actions)
+        self._cache_actions(architecture, valid_actions, None)
         return valid_actions
     
     def apply_action(self, architecture: NeuralArchitecture, action: Action) -> bool:
