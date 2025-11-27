@@ -955,7 +955,7 @@ class ArchitectureTrainer:
             sub_result = self._process_sub_batch(sub_experiences, sub_weights, sub_indices, 
                                                  annealed_ce_weight, mcts_policy_weight)
             
-            if sub_result is not None:
+            if sub_result is not None and sub_result.get('loss') is not None:
                 # Backward on this sub-batch (accumulates gradients)
                 loss_tensor = sub_result['loss']
                 
@@ -976,14 +976,16 @@ class ArchitectureTrainer:
                     print(f"  [WARNING] No gradients after backward pass")
                 
                 # Accumulate metrics (raw and weighted)
-                total_loss_accum += sub_result['total_loss']
-                value_loss_accum += sub_result['value_loss']
-                mcts_policy_loss_accum += sub_result['mcts_policy_loss']
-                num_processed += sub_result['num_graphs']
+                total_loss_accum += sub_result.get('total_loss', 0.0)
+                value_loss_accum += sub_result.get('value_loss', 0.0)
+                mcts_policy_loss_accum += sub_result.get('mcts_policy_loss', 0.0)
+                num_processed += sub_result.get('num_graphs', 0)
+
                 
                 # Track for priority updates
-                valid_indices_list.extend(sub_result['valid_indices'])
-                valid_rewards_list.extend(sub_result['valid_rewards'])
+                valid_indices_list.extend(sub_result.get('valid_indices', []))
+                valid_rewards_list.extend(sub_result.get('valid_rewards', []))
+
             
             # (removed per-sub-batch GPU cache clearing to avoid forcing frequent
             # GPU memory synchronization which reduces utilization)
@@ -1128,7 +1130,7 @@ class ArchitectureTrainer:
         self.policy_value_net.to(self.device)
         self.policy_value_net.train()  # CRITICAL: Ensure network is in training mode
 
-        predictions = self.policy_value_net(batched_graph_data, sub_batch_size=num_graphs)
+        predictions = self.policy_value_net(batched_graph_data)
         
         # DIAGNOSTIC: Check if predictions are on GPU
         pred_device = predictions['action_type'].device
@@ -1137,9 +1139,9 @@ class ArchitectureTrainer:
             print(f"    Batched data node_features device: {batched_graph_data['node_features'].device}")
             print(f"    Network device: {next(self.policy_value_net.parameters()).device}")
             # Force predictions to GPU immediately
-            for k in predictions:
-                if torch.is_tensor(predictions[k]):
-                    predictions[k] = predictions[k].to(self.device)
+            for k, v in predictions.items():
+                if torch.is_tensor(v):
+                    predictions[k] = v.to(self.device)
 
         # Compute losses for this sub-batch
         # Keep total_loss as the autograd-carrying tensor; accumulate monitoring
@@ -1149,122 +1151,68 @@ class ArchitectureTrainer:
         value_loss_sum = torch.tensor(0.0, device=self.device)
         mcts_policy_loss_sum = torch.tensor(0.0, device=self.device)
         try:
-            action_type_logits = predictions['action_type']  # [num_graphs, 5]
-            source_logits = predictions['source_logits']      # [num_graphs, max_neurons]
-            target_logits = predictions['target_logits']      # [num_graphs, max_neurons]
-            activation_logits = predictions['activation_logits']  # [num_graphs, num_activations]
-            values = predictions['value']                      # [num_graphs, 1]
-            
-            # === PRE-BATCH ACTION MASKS ON GPU ===
-            # Move all CPU masks to GPU in batch (single operation)
-            action_type_masks_gpu = []
-            source_masks_gpu = []
-            target_masks_gpu = []
-            activation_masks_gpu = []
-            
-            for action_mask in action_masks_list_cpu:
-                action_type_masks_gpu.append(action_mask['action_type'].to(self.device))
-                source_masks_gpu.append(action_mask['source_neuron'].to(self.device))
-                target_masks_gpu.append(action_mask['target_neuron'].to(self.device))
-                activation_masks_gpu.append(action_mask['activation'].to(self.device))
-            
-            # Stack masks for batch operations
-            action_type_masks = torch.stack(action_type_masks_gpu, dim=0)  # [num_graphs, num_action_types]
-            source_masks = torch.stack(source_masks_gpu, dim=0)  # [num_graphs, max_neurons]
-            target_masks = torch.stack(target_masks_gpu, dim=0)  # [num_graphs, max_neurons]
-            activation_masks = torch.stack(activation_masks_gpu, dim=0)  # [num_graphs, num_activations]
-            
-            # === VECTORIZED MASKING ON GPU (entire batch at once) ===
-            # Apply masks to all graphs simultaneously
-            masked_action_logits = action_type_logits.clone()
-            masked_action_logits = masked_action_logits.masked_fill((action_type_masks == 0), -1e9)
-            
-            masked_source_logits = source_logits.clone()
-            masked_source_logits = masked_source_logits.masked_fill((source_masks == 0), -1e9)
-            
-            masked_target_logits = target_logits.clone()
-            masked_target_logits = masked_target_logits.masked_fill((target_masks == 0), -1e9)
-            
-            masked_activation_logits = activation_logits.clone()
-            masked_activation_logits = masked_activation_logits.masked_fill((activation_masks == 0), -1e9)
-            
-            # === PREPARE BATCH TARGETS ===
-            # Prepare optional targets (use -1 for "not applicable" so cross_entropy ignores them)
-            source_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
-            for i, t in enumerate(targets_list):
-                if 'source_neuron' in t:
-                    source_targets[i] = t['source_neuron']
-            
-            target_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
-            for i, t in enumerate(targets_list):
-                if 'target_neuron' in t:
-                    target_targets[i] = t['target_neuron']
-            
-            activation_targets = torch.full((num_graphs,), -1, dtype=torch.long, device=self.device)
-            for i, t in enumerate(targets_list):
-                if 'activation' in t:
-                    activation_targets[i] = t['activation']
-            
             # === VALUE LOSS (vectorized) ===
-            value_targets = torch.stack([t['value'].squeeze() if t['value'].dim() > 0 else t['value'] 
-                                         for t in targets_list], dim=0).to(self.device)
-            values_squeezed = values.squeeze(-1)
+            value_targets = torch.stack([t['value'].squeeze() if t['value'].dim() > 0 else t['value']
+                                        for t in targets_list], dim=0).to(self.device)
+            values_squeezed = predictions['value'].squeeze(-1)
             value_loss = F.mse_loss(values_squeezed, value_targets, reduction='none')  # [num_graphs]
-            
-            # === MCTS POLICY LOSSES (vectorized) ===
-            mcts_losses = torch.zeros(num_graphs, device=self.device)
-            num_mcts_targets_per_graph = torch.zeros(num_graphs, dtype=torch.long, device=self.device)
-            
-            # Process MCTS losses in batches
-            for mcts_head, logits_key, masked_logits_key in [
-                ('mcts_policy_action_type', 'action_type', 'masked_action_logits'),
-                ('mcts_policy_source', 'source_logits', 'masked_source_logits'),
-                ('mcts_policy_target', 'target_logits', 'masked_target_logits'),
-                ('mcts_policy_activation', 'activation_logits', 'masked_activation_logits'),
-            ]:
-                for graph_idx, targets in enumerate(targets_list):
-                    if mcts_head in targets and targets[mcts_head] is not None:
-                        try:
-                            mcts_target = targets[mcts_head].unsqueeze(0).to(self.device)
-                            logits = locals()[masked_logits_key][graph_idx:graph_idx+1]
-                            # Compute raw KL (unclamped) so we can detect pathological graphs
-                            kl_raw = F.kl_div(F.log_softmax(logits, dim=1), mcts_target, reduction='mean')
-                            # Track raw (unclamped) sums for later pathological detection
-                            if 'mcts_raw_sums' not in locals():
-                                mcts_raw_sums = torch.zeros(num_graphs, device=self.device)
-                            mcts_raw_sums[graph_idx] = mcts_raw_sums[graph_idx] + kl_raw.detach()
-                            # Clamp the per-head contribution to avoid numeric explosions
-                            kl_loss = torch.clamp(kl_raw, min=0.0, max=100.0)
-                            mcts_losses[graph_idx] = mcts_losses[graph_idx] + kl_loss
-                            num_mcts_targets_per_graph[graph_idx] = num_mcts_targets_per_graph[graph_idx] + 1
-                        except Exception as e:
-                            print(f"    [ERROR] Graph {graph_idx}: MCTS {mcts_head} KL exception: {e}")
-            
-            # Normalize MCTS losses
-            mcts_losses = torch.where(
-                num_mcts_targets_per_graph > 0,
-                mcts_losses / num_mcts_targets_per_graph.float(),
-                torch.zeros_like(mcts_losses)
-            )
 
-            # Mirror loop behavior: if raw unclamped per-graph KL sum exceeded threshold
-            # then zero out the MCTS loss for that graph to match historical code.
-            try:
-                if 'mcts_raw_sums' in locals():
-                    pathological_mask = mcts_raw_sums > 100.0
-                    if pathological_mask.any():
-                        mcts_losses[pathological_mask] = 0.0
-            except Exception:
-                # If anything goes wrong here, continue without zeroing (safe fallback)
-                pass
+            # === MCTS POLICY LOSS (AlphaZero style) ===
+            # The goal is to make the network's policy `p` match the MCTS-improved policy `π`.
+            # Loss is the cross-entropy between the network's predicted probabilities for the
+            # actions explored by MCTS and the MCTS visit distribution.
+            
+            mcts_policy_targets = []
+            network_policy_probs = []
+            valid_policy_indices = []
+
+            for i, exp in enumerate(valid_experiences):
+                if 'mcts_policy' in exp and exp['mcts_policy'] is not None and 'mcts_actions' in exp and exp['mcts_actions'] is not None:
+                    mcts_actions = exp['mcts_actions']
+                    mcts_distribution = torch.tensor(exp['mcts_policy'], dtype=torch.float32, device=self.device)
+
+                    if len(mcts_actions) == 0 or mcts_distribution.sum() < 1e-6:
+                        continue
+                    
+                    # Get the network's predicted probabilities for the same actions MCTS explored.
+                    # This requires using the ActionManager to correctly compute conditional probabilities.
+                    graph_predictions = {k: v[i] for k, v in predictions.items() if torch.is_tensor(v) and v.dim() > 0 and v.shape[0] == num_graphs}
+                    
+                    single_item_batch_preds = {
+                        'action_type': graph_predictions['action_type'].unsqueeze(0),
+                        'source_logits_dict': {k: v.unsqueeze(0) for k, v in predictions['source_logits_dict'].items()},
+                        'target_heads': predictions['target_heads'],
+                        'activation_heads': predictions['activation_heads'],
+                        'shared_features': graph_predictions['shared_features'].unsqueeze(0),
+                        'source_encoder': predictions['source_encoder'],
+                        'value': graph_predictions['value'].unsqueeze(0)
+                    }
+
+                    masks = self.action_manager.get_action_masks(exp['state'])
+                    
+                    net_probs = self.action_manager._compute_priors_vectorized(
+                        single_item_batch_preds, mcts_actions, masks
+                    )
+                    
+                    if net_probs.numel() > 0:
+                        mcts_policy_targets.append(mcts_distribution)
+                        network_policy_probs.append(net_probs)
+                        valid_policy_indices.append(i)
+
+            mcts_losses = torch.zeros(num_graphs, device=self.device)
+            if mcts_policy_targets:
+                # Use KL-Divergence loss: KL(π || p) = sum(π * log(π/p))
+                # It's often implemented as: sum(π * (log(π) - log(p)))
+                for i, target_dist, net_dist in zip(valid_policy_indices, mcts_policy_targets, network_policy_probs):
+                    log_net_dist = torch.log(net_dist.clamp(min=1e-9))
+                    log_target_dist = torch.log(target_dist.clamp(min=1e-9))
+                    kl_div = torch.sum(target_dist * (log_target_dist - log_net_dist))
+                    mcts_losses[i] = kl_div.clamp(min=0.0, max=100.0) # Clamp for stability
             
             # === COMBINE LOSSES ===
             # Apply sample weights
             weights_tensor = torch.tensor(weights_list, dtype=torch.float32, device=self.device)
-            # IMPORTANT: exclude the single-action CE from the optimization loss.
-            graph_losses = (mcts_losses + value_loss) * weights_tensor
-            
-            # Sum all losses
+            graph_losses = (mcts_policy_weight * mcts_losses + value_loss) * weights_tensor
             total_loss = graph_losses.sum()
             
             # Accumulate metrics (no .item() to avoid GPU sync)
@@ -1274,7 +1222,7 @@ class ArchitectureTrainer:
             print(f"    [ERROR] Vectorized loss computation failed: {e}")
             import traceback
             traceback.print_exc()
-            raise
+            return None
 
         
         # Priorities for replay buffer update: outcome + surprise (TD-error proxy)
@@ -1312,9 +1260,9 @@ class ArchitectureTrainer:
       
         return {
             'loss': total_loss,
-            'total_loss': total_loss.item(),                   # Raw (unweighted) supervised CE
+            'total_loss': total_loss.item(),
             'value_loss': value_loss_val,
-            'mcts_policy_loss': mcts_policy_loss_val,           # Raw (unweighted) MCTS KL
+            'mcts_policy_loss': mcts_policy_loss_val,
             'num_graphs': num_graphs,
             'valid_indices': valid_indices_list,
             'valid_rewards': valid_rewards,
