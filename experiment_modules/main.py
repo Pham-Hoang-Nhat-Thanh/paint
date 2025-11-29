@@ -13,6 +13,8 @@ if _ROOT not in sys.path:
 
 from experiment_modules.config import OverallConfig
 from experiment_modules.architecture_trainer import ArchitectureTrainer
+import logging
+import time
 
 # Global cache for data loaders to avoid reloading
 _data_cache = {}
@@ -59,7 +61,7 @@ def load_mnist_data(batch_size=64):
     _data_cache[cache_key] = (train_loader, test_loader)
     return train_loader, test_loader
 
-def find_latest_checkpoint(checkpoint_dir: str) -> str:
+def find_latest_checkpoint(checkpoint_dir: str) -> str | None:
     """Find the latest checkpoint file in the checkpoint directory"""
     if not os.path.exists(checkpoint_dir):
         return None
@@ -157,8 +159,21 @@ def main():
         batch_size=config.search.evaluation_batch_size
     )
 
+    # Set up logging
+    log_dir = config.log_dir
+    os.makedirs(log_dir, exist_ok=True)
+    log_file = os.path.join(log_dir, f"training_{time.strftime('%Y%m%d-%H%M%S')}.log")
+    
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s - %(levelname)s - %(message)s',
+                        handlers=[logging.FileHandler(log_file),
+                                  logging.StreamHandler(sys.stdout)])
+    
+    logger = logging.getLogger()
+    logger.info("Starting new training run.")
+    
     # Create trainer
-    trainer = ArchitectureTrainer(config, train_loader, test_loader)
+    trainer = ArchitectureTrainer(config, train_loader, test_loader, logger)
 
     # Check for existing checkpoints and resume if available
     latest_checkpoint = find_latest_checkpoint(config.checkpoint_dir)

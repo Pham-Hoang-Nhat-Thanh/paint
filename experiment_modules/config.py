@@ -10,7 +10,6 @@ class ModelConfig:
     num_heads: int = 16
     num_layers: int = 4
     dropout: float = 0.2  # Increased dropout for better regularization
-    use_edge_features: bool = True
     
     # Policy-Value Network
     max_neurons: int = 1000  # Accommodate MNIST inputs
@@ -21,7 +20,7 @@ class ModelConfig:
 class MCTSConfig:
     """Configuration for AlphaZero-style Neural MCTS"""
     # Search parameters
-    num_simulations: int = 250  # Increased for better search quality
+    num_simulations: int = 1024  # Increased for better search quality
     exploration_weight: float = 1.0
     dirichlet_alpha: float = 0.3
     dirichlet_epsilon: float = 0.25
@@ -29,7 +28,7 @@ class MCTSConfig:
     # Node expansion
     max_children: int = 30
     temperature: float = 1.0
-    temperature_decay: float = 0.99
+    mcts_batch_size: int = 128  # Increased for better GPU utilization
 
 @dataclass
 class ArchitectureSearchConfig:
@@ -37,7 +36,7 @@ class ArchitectureSearchConfig:
     # Search constraints
     max_neurons: int = 1000
     max_connections: int = 10000
-    max_steps_per_episode: int = 10000  # Increased to allow more complex architectures
+    max_steps_per_episode: int = 1000  # Increased to allow more complex architectures
     min_neurons: int = 25  # Minimum number of hidden neurons to prevent oversimplification
     min_connections: int = 250  # Minimum number of connections to prevent oversimplification
 
@@ -94,7 +93,7 @@ class OverallConfig:
     max_episodes: int = 300
     
     # System
-    device: str = "cuda:2"  # Options: "auto", "cpu", or "cuda:X"
+    device: str = "cuda:0"  # Options: "auto", "cpu", or "cuda:X"
     gpu_memory_fraction: float = 0.9
     enable_memory_monitoring: bool = True
     memory_check_threshold_mb: float = 5000

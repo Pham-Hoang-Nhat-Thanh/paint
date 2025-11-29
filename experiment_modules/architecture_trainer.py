@@ -33,10 +33,11 @@ from .config import OverallConfig
 class ArchitectureTrainer:
     """Main class that orchestrates the complete training process"""
     
-    def __init__(self, config: OverallConfig, train_loader, test_loader):
+    def __init__(self, config: OverallConfig, train_loader, test_loader, logger: logging.Logger):
         self.config = config
         self.device = torch.device(config.device)
-        
+        self.logger = logger
+
         # Data loaders
         self.train_loader = train_loader
         self.test_loader = test_loader
@@ -61,6 +62,7 @@ class ArchitectureTrainer:
             model_max_neurons=config.model.max_neurons
         )
         self.action_manager = ActionManager(
+            action_space=self.action_space,
             max_neurons=config.model.max_neurons,
             exploration_boost=config.search.action_exploration_boost
         )
@@ -70,12 +72,12 @@ class ArchitectureTrainer:
             policy_value_net=self.policy_value_net,
             device=self.device,
             exploration_weight=config.mcts.exploration_weight,
-            iso_weight=config.search.iso_weight if hasattr(config.search, 'iso_weight') else 0.01,
-            comp_weight=config.search.comp_weight if hasattr(config.search, 'comp_weight') else 0.0,
             early_stopping_patience=config.early_stopping_patience,
             early_stopping_min_delta=config.early_stopping_min_delta,
             max_children=config.mcts.max_children if hasattr(config.mcts, 'max_children') else 50,
-            max_neurons=config.model.max_neurons if hasattr(config.model, 'max_neurons') else 1000
+            mcts_batch_size=config.mcts.mcts_batch_size,
+            max_neurons=config.model.max_neurons if hasattr(config.model, 'max_neurons') else 1000,
+            logger=self.logger,
         )
         
         # QuickTrainer for final episode evaluation
@@ -106,26 +108,13 @@ class ArchitectureTrainer:
         # Create directories
         os.makedirs(config.log_dir, exist_ok=True)
         os.makedirs(config.checkpoint_dir, exist_ok=True)
-        # File logger + JSONL metrics (disabled for speed)
+
+        # File paths for logging
         self.log_path = os.path.join(config.log_dir, "training.log")
         self.metrics_path = os.path.join(config.log_dir, "training_metrics.jsonl")
 
-        # Configure logger for episode metrics
-        self.logger = logging.getLogger(f"ArchitectureTrainer_{self.episode}_{time.time()}")
-        self.logger.setLevel(logging.INFO)  # Log INFO and above (INFO, WARNING, ERROR)
-        self.logger.propagate = False  # Don't propagate to root logger to avoid duplicate logs
-        
-        # Add file handler for training logs
-        abs_log_path = os.path.abspath(self.log_path)
-        if not any(isinstance(h, logging.FileHandler) and os.path.abspath(getattr(h, 'baseFilename', '')) == abs_log_path
-                   for h in self.logger.handlers):
-            fh = logging.FileHandler(self.log_path, mode='a', encoding='utf-8')
-            fh.setLevel(logging.INFO)
-            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
-            self.logger.addHandler(fh)
-
-        print(f"ArchitectureTrainer initialized on {self.device}")
-        print(f"Starting AlphaZero-style MCTS training (no curriculum, pure self-play)")
+        self.logger.info(f"ArchitectureTrainer initialized on {self.device}")
+        self.logger.info(f"Starting AlphaZero-style MCTS training (no curriculum, pure self-play)")
     
     def cleanup(self):
         """Clean up trainer resources"""
@@ -144,11 +133,11 @@ class ArchitectureTrainer:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        print("Trainer cleanup completed")
+        self.logger.info("Trainer cleanup completed")
     
     def run_training_episode(self) -> Dict[str, Any]:
         """Run one complete training episode using AlphaZero-style MCTS."""
-        print(f"Starting episode {self.episode}")
+        self.logger.info(f"Starting episode {self.episode}")
         # Initialize architecture
         current_arch = NeuralArchitecture()
         
@@ -162,7 +151,7 @@ class ArchitectureTrainer:
         
         # Run MCTS-guided search until convergence or max steps
         for step in range(self.config.search.max_steps_per_episode):
-            print(f"Step {step + 1}/{self.config.search.max_steps_per_episode}:")
+            self.logger.info(f"Step {step + 1}/{self.config.search.max_steps_per_episode}:")
             step_start_time = time.time()
             
             # MCTS search (always, no policy_mix_ratio since we're pure AlphaZero now)
@@ -170,33 +159,34 @@ class ArchitectureTrainer:
                 current_arch,
                 iterations=self.config.mcts.num_simulations,
                 temperature=self.config.mcts.temperature,
-                reuse_root=mcts_root  # Reuse tree from previous step
+                reuse_root=mcts_root,  # Reuse tree from previous step
+                mcts_batch_size=self.config.mcts.mcts_batch_size
             )
             
             next_action = best_node.action if best_node else None
 
             if next_action is None:
-                print("No valid action found, terminating episode")
+                self.logger.warning("No valid action found, terminating episode")
                 break
             else:
-                print(f"Selected action: {next_action.action_type.name} | "
-                      f"Source: {next_action.source_neuron} | "
-                      f"Target: {next_action.target_neuron} | "
-                      f"Activation: {next_action.activation}")
+                self.logger.info(f"Selected action: {next_action.action_type.name} | "
+                                 f"Source: {next_action.source_neuron} | "
+                                 f"Target: {next_action.target_neuron} | "
+                                 f"Activation: {next_action.activation}")
 
             new_arch = best_node.architecture
             if new_arch is None:
                 # Debug: Print detailed information about the failure
-                print(f"ACTION FAILED: {next_action.action_type.name}")
-                print(f"  Source neuron: {next_action.source_neuron}")
-                print(f"  Target neuron: {next_action.target_neuron}")
-                print(f"  Activation: {next_action.activation}")
-                print(f"  Current arch neurons: {sorted(current_arch.neurons.keys())}")
-                print(f"  Current arch connections: {len(current_arch.connections)}")
+                self.logger.error(f"ACTION FAILED: {next_action.action_type.name}")
+                self.logger.error(f"  Source neuron: {next_action.source_neuron}")
+                self.logger.error(f"  Target neuron: {next_action.target_neuron}")
+                self.logger.error(f"  Activation: {next_action.activation}")
+                self.logger.error(f"  Current arch neurons: {sorted(current_arch.neurons.keys())}")
+                self.logger.error(f"  Current arch connections: {len(current_arch.connections)}")
                 if next_action.source_neuron is not None:
-                    print(f"  Source exists: {next_action.source_neuron in current_arch.neurons}")
+                    self.logger.error(f"  Source exists: {next_action.source_neuron in current_arch.neurons}")
                 if next_action.target_neuron is not None:
-                    print(f"  Target exists: {next_action.target_neuron in current_arch.neurons}")
+                    self.logger.error(f"  Target exists: {next_action.target_neuron in current_arch.neurons}")
                 
                 mcts_root = None  # Reset tree on failure
                 traceback.print_exc()
@@ -207,15 +197,12 @@ class ArchitectureTrainer:
                 self._draw_architecture_diagram(new_arch, step)
             reward = best_node.value / best_node.visits # Use average value as reward
 
-            ce_start = time.time()
             # Store experience with MCTS visit distribution
             experience = self._create_experience(
                 current_arch, next_action, reward, new_arch,
                 search_root=search_root  # Contains visit distribution from MCTS
             )
-            ce_end = time.time()
-            print(f"Experience creation took {ce_end - ce_start:.4f} seconds")
-
+            
             episode_experiences.append(experience)
             episode_rewards.append(reward)
             
@@ -235,10 +222,10 @@ class ArchitectureTrainer:
              # Check termination conditions
             terminate_check = self._should_terminate_episode(current_arch, step)
             if terminate_check == "max_steps" or terminate_check == "penalty":
-                print(f"Episode termination condition met at step {step}")
+                self.logger.info(f"Episode termination condition met at step {step}")
                 break
 
-            print(f"Step completed: Reward = {reward:.4f} | Step time: {step_duration:.2f}s")
+            self.logger.info(f"Step completed: Reward = {reward:.4f} | Step time: {step_duration:.2f}s")
 
         # Process episode results
         episode_metrics = self._process_episode_results(
@@ -250,7 +237,7 @@ class ArchitectureTrainer:
         else:
             # Evaluate final architecture with QuickTrainer to show true progress
             final_eval = self._evaluate_final_architecture(current_arch)
-            print(f"Final Architecture Evaluation: Accuracy={final_eval['final_accuracy']:.4f}, Loss={final_eval['final_loss']:.4f} ({final_eval['method']})")
+            self.logger.info(f"Final Architecture Evaluation: Accuracy={final_eval['final_accuracy']:.4f}, Loss={final_eval['final_loss']:.4f} ({final_eval['method']})")
             episode_metrics.update(final_eval)
             
             # =====CALCULATING FINAL REWARD=====
@@ -271,7 +258,7 @@ class ArchitectureTrainer:
                         - self.config.search.reward_loss_weight * loss_norm \
                         - self.config.search.reward_complexity_weight * complexity_norm
             final_reward = max(0.0, raw_reward)  # Ensure non-negative reward
-            print(f"Final Reward Calculation: Raw={raw_reward:.4f}, Final={final_reward:.4f} (Accuracy Dev={accuracy_deviation:.4f}, Loss Norm={loss_norm:.4f}, Complexity Norm={complexity_norm:.4f})")
+            self.logger.info(f"Final Reward Calculation: Raw={raw_reward:.4f}, Final={final_reward:.4f} (Accuracy Dev={accuracy_deviation:.4f}, Loss Norm={loss_norm:.4f}, Complexity Norm={complexity_norm:.4f})")
         for exp in episode_experiences:
             exp['value_target'] = final_reward
         
@@ -400,8 +387,8 @@ class ArchitectureTrainer:
                 value = policy_output['value'].item()
                 return value
         except Exception as e:
-            print(f"Evaluation error: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Evaluation error: {e}")
+            self.logger.error(traceback.format_exc())
             return 0.0
     
     def _evaluate_final_architecture(self, architecture: NeuralArchitecture) -> Dict[str, float]:
@@ -418,8 +405,8 @@ class ArchitectureTrainer:
                 'method': 'quick_trainer'
             }
         except Exception as e:
-            print(f"Final evaluation error: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Final evaluation error: {e}")
+            self.logger.error(traceback.format_exc())
             # Fallback to policy-value estimate
             estimated_value = self._evaluate_architecture(architecture)
             return {
@@ -641,7 +628,7 @@ class ArchitectureTrainer:
                         marginals['mcts_policy_activation'] = normalized
 
             except Exception as e:
-                print(f"    [Warning] Failed to precompute MCTS marginals (vectorized): {e}")
+                self.logger.warning(f"Failed to precompute MCTS marginals (vectorized): {e}")
 
             return marginals   
      
@@ -699,7 +686,7 @@ class ArchitectureTrainer:
                         marginals = self._precompute_mcts_marginals(visit_distribution, experience['mcts_actions'])
                         experience.update(marginals)  # Merge marginals into experience
                 except Exception as e:
-                    print(f"    [Warning] Failed to extract MCTS policy: {e}")
+                    self.logger.warning(f"Failed to extract MCTS policy: {e}")
                     # Continue without policy - will train only on value
             
             return experience   
@@ -961,8 +948,8 @@ class ArchitectureTrainer:
                 
                 # DIAGNOSTIC: Verify loss is on GPU before backward
                 if loss_tensor.device.type == 'cpu':
-                    print(f"  [CRITICAL ERROR] Loss tensor on CPU before backward! Device: {loss_tensor.device}")
-                    print(f"    Has gradients: {loss_tensor.requires_grad}")
+                    self.logger.critical(f"Loss tensor on CPU before backward! Device: {loss_tensor.device}")
+                    self.logger.critical(f"    Has gradients: {loss_tensor.requires_grad}")
                     
                 loss_tensor.backward()
                 
@@ -973,7 +960,7 @@ class ArchitectureTrainer:
                         has_gradients = True
                         break
                 if not has_gradients:
-                    print(f"  [WARNING] No gradients after backward pass")
+                    self.logger.warning("No gradients after backward pass")
                 
                 # Accumulate metrics (raw and weighted)
                 total_loss_accum += sub_result.get('total_loss', 0.0)
@@ -1009,8 +996,8 @@ class ArchitectureTrainer:
         if valid_indices_list:
             self.experience_buffer.update_priorities(valid_indices_list, valid_rewards_list)
 
-        print(f"  [Training] Processed {num_processed} graphs in batch of {batch_size} with sub-batch size {sub_batch_size}.", end='')
-        print(f"Total Loss: {total_loss_accum / num_processed:.4f}, Value Loss: {value_loss_accum / num_processed:.4f}, MCTS Policy Loss: {mcts_policy_loss_accum / num_processed:.4f}")
+        self.logger.info(f"  [Training] Processed {num_processed} graphs in batch of {batch_size} with sub-batch size {sub_batch_size}. "
+                         f"Total Loss: {total_loss_accum / num_processed:.4f}, Value Loss: {value_loss_accum / num_processed:.4f}, MCTS Policy Loss: {mcts_policy_loss_accum / num_processed:.4f}")
         
         # Return averaged metrics
         metrics = {
@@ -1111,7 +1098,7 @@ class ArchitectureTrainer:
         
         # Log cache diagnostics if we're using old experiences (for backward compat verification)
         if computed_masks_fallback > 0:
-            print(f"  [Cache] Legal action masks: {cached_masks_used} cached, {computed_masks_fallback} computed (fallback for old experiences)")
+            self.logger.info(f"  [Cache] Legal action masks: {cached_masks_used} cached, {computed_masks_fallback} computed (fallback for old experiences)")
         
         # === PHASE 2: BATCH GPU TRANSFERS (coordinated with CUDA streams) ===
         # Now batch all CPU graph representations for efficient parallel GPU transfer
@@ -1121,7 +1108,7 @@ class ArchitectureTrainer:
         
         # DIAGNOSTIC: Verify batched data is on GPU
         if batched_graph_data['node_features'].device.type == 'cpu':
-            print(f"  [CRITICAL ERROR] Batched node_features still on CPU! Device: {batched_graph_data['node_features'].device}")
+            self.logger.critical(f"Batched node_features still on CPU! Device: {batched_graph_data['node_features'].device}")
 
         # Forward pass on sub-batch through network
         # No internal sub-batching needed since sub-batch is already small
@@ -1135,9 +1122,9 @@ class ArchitectureTrainer:
         # DIAGNOSTIC: Check if predictions are on GPU
         pred_device = predictions['action_type'].device
         if str(pred_device) == 'cpu':
-            print(f"  [WARNING] Network predictions on CPU! Expected on {self.device}")
-            print(f"    Batched data node_features device: {batched_graph_data['node_features'].device}")
-            print(f"    Network device: {next(self.policy_value_net.parameters()).device}")
+            self.logger.warning(f"Network predictions on CPU! Expected on {self.device}")
+            self.logger.warning(f"    Batched data node_features device: {batched_graph_data['node_features'].device}")
+            self.logger.warning(f"    Network device: {next(self.policy_value_net.parameters()).device}")
             # Force predictions to GPU immediately
             for k, v in predictions.items():
                 if torch.is_tensor(v):
@@ -1219,9 +1206,8 @@ class ArchitectureTrainer:
             value_loss_sum = value_loss.sum().detach()
             mcts_policy_loss_sum = mcts_losses.sum().detach() 
         except Exception as e:
-            print(f"    [ERROR] Vectorized loss computation failed: {e}")
-            import traceback
-            traceback.print_exc()
+            self.logger.error(f"Vectorized loss computation failed: {e}")
+            self.logger.error(traceback.format_exc())
             return None
 
         
@@ -1421,13 +1407,13 @@ class ArchitectureTrainer:
                         targets['mcts_policy_activation'] = _normalize_clamp(activation_dist, activation_count)
                     
                 except Exception as e:
-                    print(f"    [Warning] Failed to create MCTS policy targets: {e}")
+                    self.logger.warning(f"Failed to create MCTS policy targets: {e}")
 
         return targets
     
     def run_training(self):
         """Run complete training process using AlphaZero-style MCTS + policy network"""
-        print("Starting architecture search training...")
+        self.logger.info("Starting architecture search training...")
         
         while self.episode < self.config.max_episodes:
             # Run training episode
@@ -1445,7 +1431,7 @@ class ArchitectureTrainer:
                 # measure. This preserves prioritized sampling while estimating when
                 # we've 'likely' seen most of the buffer.
                 buffer_size = len(self.experience_buffer)
-                print(f"  [Training] Starting with {buffer_size} total experiences in buffer")
+                self.logger.info(f"  [Training] Starting with {buffer_size} total experiences in buffer")
 
                 if buffer_size > 0:
                     # Get current priority-based sampling probabilities
@@ -1499,10 +1485,10 @@ class ArchitectureTrainer:
             
             # Early stopping if we found a good architecture
             if episode_metrics['final_accuracy'] >= self.config.search.target_accuracy:
-                print(f"Target accuracy reached! Stopping training.")
+                self.logger.info(f"Target accuracy reached! Stopping training.")
                 break
         
-        print("Training completed!")
+        self.logger.info("Training completed!")
         return self.training_history
     
     def _log_episode(self, metrics: Dict):
@@ -1563,7 +1549,7 @@ class ArchitectureTrainer:
         is_best = bool(_sanitize(metrics.get('is_best', False)))
 
         # Console output: richer summary
-        print(
+        self.logger.info(
             f"Episode {self.episode}: acc={accuracy:.4f}, avg_reward={avg_reward:.4f}, "
             f"steps={steps}, experiences={experiences}, neurons={neurons}, "
             f"conns={connections}, best={self.best_reward:.4f}, is_best={is_best}"
@@ -1614,7 +1600,7 @@ class ArchitectureTrainer:
 
         except Exception as e:
             # Fall back to direct file write if logger/metrics file fails
-            print(f"Logger/metrics write failed: {e}, attempting direct file write...")
+            self.logger.error(f"Logger/metrics write failed: {e}, attempting direct file write...")
             try:
                 with open(self.log_path, 'a', encoding='utf-8') as f:
                     f.write(f"{time.time()} INFO Episode {self.episode} final_acc={accuracy:.4f} "
@@ -1626,8 +1612,8 @@ class ArchitectureTrainer:
                     mf.write(json.dumps(log_dict) + "\n")
                     mf.flush()
             except Exception as e2:
-                print(f"Direct file write also failed: {e2}")
-                traceback.print_exc()
+                self.logger.error(f"Direct file write also failed: {e2}")
+                self.logger.error(traceback.format_exc())
     
     def _save_checkpoint(self, final_architecture=None):
         """Save training checkpoint (AlphaZero-style, no curriculum)
@@ -1652,7 +1638,7 @@ class ArchitectureTrainer:
         filepath = os.path.join(self.config.checkpoint_dir, filename)
         torch.save(checkpoint, filepath)
 
-        print(f"Checkpoint saved: {filepath}")
+        self.logger.info(f"Checkpoint saved: {filepath}")
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load training checkpoint"""
@@ -1670,7 +1656,7 @@ class ArchitectureTrainer:
         if 'final_architecture' in checkpoint and checkpoint['final_architecture'] is not None:
             self.final_architecture = NeuralArchitecture.from_serializable_dict(checkpoint['final_architecture'])
 
-        print(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
+        self.logger.info(f"Checkpoint loaded from episode {checkpoint['episode']}, resuming from episode {self.episode}")
 
     def _draw_architecture_diagram(self, architecture: NeuralArchitecture, step: int):
         """Draw a diagram using PIL (much faster than matplotlib, 10-100x speedup)
@@ -1784,10 +1770,10 @@ class ArchitectureTrainer:
             img.save(diagram_file, quality=70, optimize=True)
 
         except ImportError:
-            print("      PIL not available, skipping diagram")
+            self.logger.warning("PIL not available, skipping diagram")
         except Exception as e:
-            print(f"Failed to draw architecture diagram: {e}")
-            traceback.print_exc()
+            self.logger.error(f"Failed to draw architecture diagram: {e}")
+            self.logger.error(traceback.format_exc())
 
 
 # Normalize and clamp with epsilon guard

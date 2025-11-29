@@ -53,15 +53,18 @@ class UnifiedPolicyValueNetwork(nn.Module):
             'modify_activation': nn.Linear(hidden_dim // 2, max_neurons, bias=False)
         })
         
+        # Define dimension for features conditioned on a source neuron
+        conditioned_feature_dim = (hidden_dim // 2) + (hidden_dim // 8)
+        
         # Conditional target heads - conditioned on source features
         self.conditional_target_heads = nn.ModuleDict({
             'add_connection': nn.Sequential(
-                nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+                nn.Linear(conditioned_feature_dim, hidden_dim // 4, bias=False),
                 nn.ReLU(inplace=True),
                 nn.Linear(hidden_dim // 4, max_neurons, bias=False)
             ),
             'remove_connection': nn.Sequential(
-                nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+                nn.Linear(conditioned_feature_dim, hidden_dim // 4, bias=False),
                 nn.ReLU(inplace=True),
                 nn.Linear(hidden_dim // 4, max_neurons, bias=False)
             )
@@ -71,7 +74,7 @@ class UnifiedPolicyValueNetwork(nn.Module):
         self.conditional_activation_heads = nn.ModuleDict({
             'add_neuron': nn.Linear(hidden_dim // 2, num_activations, bias=False),
             'modify_activation': nn.Sequential(
-                nn.Linear(hidden_dim // 2, hidden_dim // 4, bias=False),
+                nn.Linear(conditioned_feature_dim, hidden_dim // 4, bias=False),
                 nn.ReLU(inplace=True),
                 nn.Linear(hidden_dim // 4, num_activations, bias=False)
             )
