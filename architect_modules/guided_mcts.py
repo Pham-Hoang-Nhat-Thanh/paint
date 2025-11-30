@@ -27,6 +27,10 @@ class NeuralMCTSNode(MCTSNode):
         self._dirichlet_applied = False
         # Cache action masks to avoid recomputation across _compute_action_prior calls
         self._cached_masks = None
+
+    def _copy_architecture(self) -> NeuralArchitecture:
+        """Create a deep copy of the node's architecture."""
+        return self.architecture.copy()
     
     def is_fully_expanded(self, max_children: int) -> bool:
         """Check if all valid actions have been expanded as children, respecting max_children.
@@ -89,8 +93,6 @@ class NeuralMCTS(MCTS):
         # Early stopping settings
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_min_delta = early_stopping_min_delta
-        # Cache for evaluations to avoid redundant computations
-        self.evaluation_cache = {}
         # Reusable ActionManager instance
         self.action_manager = ActionManager(action_space=self.action_space, max_neurons=max_neurons)
         self.max_children = max_children
@@ -102,6 +104,26 @@ class NeuralMCTS(MCTS):
         # Force garbage collection
         import gc
         gc.collect()
+
+    def _dismantle_tree(self, node: 'NeuralMCTSNode'):
+        """Recursively dismantle the MCTS tree to break circular references."""
+        if not node:
+            return
+        # Use a list copy for safe iteration while modifying children
+        for child in list(node.children):
+            self._dismantle_tree(child)
+        node.parent = None
+        node.children.clear()
+
+    def clear_episode_caches(self, roots: List['NeuralMCTSNode'] = None, preserve_roots: bool = False):
+        """Clear caches and dismantle the MCTS tree to prevent memory leaks."""
+        if roots:
+            for root in roots if isinstance(roots, list) else [roots]:
+                if not preserve_roots:
+                    self._dismantle_tree(root)
+        # Also clear the action manager's cache if it exists
+        if hasattr(self.action_manager, 'clear_cache'):
+            self.action_manager.clear_cache()
 
     def _prepare_graph_data(self, architecture: NeuralArchitecture) -> Dict:
         """Optimized: Convert architecture to graph data for neural network using cached sorted IDs"""

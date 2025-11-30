@@ -194,9 +194,6 @@ class ActionManager:
         self.max_neurons = max_neurons
         self.action_space = action_space
         self.exploration_boost = exploration_boost
-        # Cache for masks to avoid recomputation
-        self._mask_cache = {}
-        self._cache_key_size = 0
 
     def _get_action_type_name(self, action_type: int) -> str:
         """Convert action type index to string name"""
@@ -261,7 +258,7 @@ class ActionManager:
                     else:
                         src_mask_tensor = masks['source_neurons'].to(device)
 
-                    src_logits_prepped = self._prepare_logits(src_logits, tensor_size, src_mask_tensor).squeeze(0)
+                    src_logits_prepped = self._prepare_logits(src_logits, tensor_size, src_mask_tensor).squeeze()
                     log_src_probs = F.log_softmax(src_logits_prepped, dim=-1)
                     
                     valid_src_indices = at_src_vals.clamp(0, tensor_size - 1)
@@ -435,28 +432,34 @@ class ActionManager:
         }
     
     def _prepare_logits(self, logits_full: torch.Tensor, tensor_size: int, mask: torch.Tensor) -> torch.Tensor:
-        """Helper to pad/truncate logits and apply mask - optimized"""
+        """Helper to pad/truncate logits and apply mask - optimized and robust to N-dimensions."""
         device = logits_full.device
-        is_batched = logits_full.dim() > 1
         
-        if is_batched:
-            batch_size = logits_full.shape[0]
-            current_size = logits_full.shape[1]
-        else:
-            batch_size = 1
-            current_size = logits_full.shape[0]
+        # Get the size of the dimension that needs padding/truncating (assumed to be the last one)
+        current_size = logits_full.shape[-1]
         
         # Only pad if necessary
         if current_size < tensor_size:
             padding_size = tensor_size - current_size
-            if is_batched:
-                padding = torch.full((batch_size, padding_size), -1e9, device=device)
-                logits = torch.cat([logits_full, padding], dim=1)
-            else:
-                padding = torch.full((padding_size,), -1e9, device=device)
-                logits = torch.cat([logits_full, padding])
+            
+            # Create a padding shape that matches the input tensor's dimensions,
+            # except for the last dimension which is the padding size.
+            padding_shape = list(logits_full.shape)
+            padding_shape[-1] = padding_size
+            
+            padding = torch.full(tuple(padding_shape), -1e9, device=device)
+            logits = torch.cat([logits_full, padding], dim=-1)
         else:
-            logits = logits_full[:, :tensor_size] if is_batched else logits_full[:tensor_size]
-        
-        # Apply mask (broadcast over batch if needed)
-        return logits + (mask.unsqueeze(0) if is_batched else mask)
+            # Truncate the last dimension
+            # This uses slicing that works for any number of dimensions
+            slicer = [slice(None)] * logits_full.dim()
+            slicer[-1] = slice(0, tensor_size)
+            logits = logits_full[tuple(slicer)]
+
+        # Apply mask. The mask is 1D, so we need to make it broadcastable
+        # to the shape of the logits tensor.
+        # Example: if logits is (B, H, N) and mask is (N), we reshape mask to (1, 1, N)
+        while mask.dim() < logits.dim():
+            mask = mask.unsqueeze(0)
+            
+        return logits + mask

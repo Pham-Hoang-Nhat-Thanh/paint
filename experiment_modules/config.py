@@ -62,7 +62,7 @@ class ArchitectureSearchConfig:
     connection_candidate_multiplier: int = 3  # Multiplier for connection candidates (num_neurons * multiplier)
 
     # Action space
-    allowed_actions: List = None
+    allowed_actions: List = None # pyright: ignore[reportAssignmentType]
 
     def __post_init__(self):
         if self.allowed_actions is None:
@@ -83,7 +83,7 @@ class OverallConfig:
     mcts: MCTSConfig = field(default_factory=MCTSConfig)
 
     # Architecture search
-    search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig)
+    search: ArchitectureSearchConfig = field(default_factory=ArchitectureSearchConfig) # type: ignore
     
     # Training parameters 
     batch_size: int = 64

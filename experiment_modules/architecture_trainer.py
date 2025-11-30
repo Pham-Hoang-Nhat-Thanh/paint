@@ -222,7 +222,7 @@ class ArchitectureTrainer:
              # Check termination conditions
             terminate_check = self._should_terminate_episode(current_arch, step)
             if terminate_check == "max_steps" or terminate_check == "penalty":
-                self.logger.info(f"Episode termination condition met at step {step}")
+                self.logger.info(f"Episode termination condition met at step {step+1}")
                 break
 
             self.logger.info(f"Step completed: Reward = {reward:.4f} | Step time: {step_duration:.2f}s")
@@ -279,30 +279,21 @@ class ArchitectureTrainer:
         # reuse while ensuring episode boundaries free unnecessary memory.
         try:
             if hasattr(self, 'neural_mcts'):
-                try:
-                    # Pass the last root (if any). At episode boundary we fully clear
-                    # node-level policy tensors to free GPU memory. Experiences have
-                    # already been materialized to CPU above, so full clear is safe.
-                    roots = mcts_root if 'mcts_root' in locals() else None
-                    self.neural_mcts.clear_episode_caches(roots=roots, preserve_roots=False)
-                except Exception:
-                    pass
+                # Pass the last root (if any). At episode boundary we fully clear
+                # the tree to prevent memory leaks from reference cycles.
+                roots = mcts_root if 'mcts_root' in locals() else None
+                self.neural_mcts.clear_episode_caches(roots=roots, preserve_roots=False)
 
             # Clear ActionManager caches too
-            try:
-                if hasattr(self, 'action_manager') and hasattr(self.action_manager, 'clear_cache'):
-                    self.action_manager.clear_cache()
-            except Exception:
-                pass
+            if hasattr(self, 'action_manager') and hasattr(self.action_manager, 'clear_cache'):
+                self.action_manager.clear_cache()
 
             # Free device caches
-            try:
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            except Exception:
-                pass
-        except Exception:
-            pass
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception as e:
+            self.logger.error(f"Error during episode cleanup: {e}")
+            self.logger.error(traceback.format_exc())
         
         gc.collect()
 
@@ -1167,7 +1158,7 @@ class ArchitectureTrainer:
                     
                     single_item_batch_preds = {
                         'action_type': graph_predictions['action_type'].unsqueeze(0),
-                        'source_logits_dict': {k: v.unsqueeze(0) for k, v in predictions['source_logits_dict'].items()},
+                        'source_logits_dict': {k: v[i].unsqueeze(0) for k, v in predictions['source_logits_dict'].items()},
                         'target_heads': predictions['target_heads'],
                         'activation_heads': predictions['activation_heads'],
                         'shared_features': graph_predictions['shared_features'].unsqueeze(0),
@@ -1421,7 +1412,7 @@ class ArchitectureTrainer:
             
             # Train on batch(s) if we have enough experiences
             train_interval = getattr(self.config, 'train_interval', 10)
-            if (self.episode + 1) % train_interval == 0 or self.episode == 0:
+            if (self.episode + 1) % train_interval == 0:
                 
                 # We will sample batches from the replay buffer. The buffer.sample()
                 # method is prioritized and probabilistic, so multiple sample() calls

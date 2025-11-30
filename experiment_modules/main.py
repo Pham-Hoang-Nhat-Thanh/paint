@@ -46,7 +46,8 @@ def load_mnist_data(batch_size=64):
 
     # Use moderate number of workers, but disable persistent_workers to avoid multiprocessing issues
     # when loaders are passed to ProcessPoolExecutor workers
-    num_workers = 4  # Reduced from 8 for better multiprocessing compatibility
+    # Set to 0 to avoid CUDA initialization errors in forked processes.
+    num_workers = 0
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset, batch_size=batch_size, shuffle=True,

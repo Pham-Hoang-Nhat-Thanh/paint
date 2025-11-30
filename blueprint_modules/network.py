@@ -798,11 +798,11 @@ class NeuralArchitecture:
         new_arch.performance_metrics = copy.deepcopy(self.performance_metrics)
 
         # Copy caches (shallow copy is sufficient)
-        new_arch._sorted_neuron_ids = copy.deepcopy(self._sorted_neuron_ids)
-        new_arch._connectivity_cache = copy.deepcopy(self._connectivity_cache)
-        new_arch._topological_layers_cache = copy.deepcopy(self._topological_layers_cache)
+        new_arch._sorted_neuron_ids = copy.copy(self._sorted_neuron_ids)
+        new_arch._connectivity_cache = copy.copy(self._connectivity_cache)
+        new_arch._topological_layers_cache = copy.copy(self._topological_layers_cache)
         if hasattr(self, '_connection_set'):
-            new_arch._connection_set = copy.deepcopy(self._connection_set)
+            new_arch._connection_set = copy.copy(self._connection_set)
         else:
             new_arch._connection_set = set()
 

@@ -36,54 +36,6 @@ class QuickTrainer:
 
         # Initialize model as None - will be set when architecture is provided
         self.model = None
-
-    def _move_loader_dataset_to_device(self, loader) -> bool:
-        """Attempt to move an entire DataLoader.dataset to `self.device`.
-
-        Returns True if the dataset was moved (best-effort), False otherwise.
-
-        Handles common dataset types:
-        - torch.utils.data.TensorDataset (has `.tensors`)
-        - torchvision-like datasets with `.data` and `.targets` attributes
-        Falls back silently when it cannot move the underlying data.
-        """
-        dataset = getattr(loader, 'dataset', None)
-        if dataset is None:
-            return False
-
-        try:
-            # TensorDataset: .tensors is a tuple of tensors
-            if hasattr(dataset, 'tensors'):
-                try:
-                    dataset.tensors = tuple(
-                        t.to(self.device) if isinstance(t, torch.Tensor) else t
-                        for t in dataset.tensors
-                    )
-                    return True
-                except Exception:
-                    return False
-
-            # Common torchvision datasets (MNIST, etc.) often have .data and .targets
-            if hasattr(dataset, 'data') and hasattr(dataset, 'targets'):
-                moved_any = False
-                try:
-                    if isinstance(dataset.data, torch.Tensor):
-                        dataset.data = dataset.data.to(self.device)
-                        moved_any = True
-                except Exception:
-                    pass
-                try:
-                    if isinstance(dataset.targets, torch.Tensor):
-                        dataset.targets = dataset.targets.to(self.device)
-                        moved_any = True
-                except Exception:
-                    pass
-                return moved_any
-
-        except Exception:
-            return False
-
-        return False
     
     def train_and_evaluate(self, architecture: NeuralArchitecture) -> Tuple[float, float]:
         """Train the graph-based network and return (final_accuracy, last_epoch_avg_loss)
@@ -109,8 +61,7 @@ class QuickTrainer:
             optimizer = torch.optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
             criterion = nn.CrossEntropyLoss()
             
-            # Attempt to move the entire training dataset to device once.
-            train_dataset_moved = self._move_loader_dataset_to_device(self.train_loader)
+            train_dataset_moved = False
 
             # Training loop with fractional epoch support
             model.train()
@@ -222,9 +173,7 @@ class QuickTrainer:
         loss = 0.0
         criterion = nn.CrossEntropyLoss()
 
-        # Try to move the whole test dataset to device once. If that succeeds,
-        # we can skip per-batch `.to()` calls which reduces host->device transfers.
-        test_dataset_moved = self._move_loader_dataset_to_device(self.test_loader)
+        test_dataset_moved = False
 
         with torch.no_grad():
             batch_count = 0
